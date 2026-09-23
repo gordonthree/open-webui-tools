@@ -37,6 +37,11 @@ all three tools' valves). Full schema, design rationale, and current status:
 `src/SQLITE_JOB_DB_HANDOFF.md`. Read that file before touching job-DB code; don't duplicate its
 content here, and keep it updated when the job-DB scope changes.
 
+The tools create this database's schema lazily and automatically on first write, so nothing needs
+to be run ahead of time. `python scripts/init_job_db.py <path>` exists anyway, as a standalone,
+dependency-free way to pre-create/verify it directly on the Docker host — useful for checking a
+volume mount's permissions before the first real render.
+
 ## Testing
 
 Each tool has a matching `test_*.py` file that simulates ComfyUI's HTTP API with a fake `requests`

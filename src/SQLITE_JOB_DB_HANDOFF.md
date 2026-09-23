@@ -21,6 +21,14 @@ Run tests with (from the directory containing the files):
 python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve -v
 ```
 
+`scripts/init_job_db.py` (repo root) has a fourth copy of `JOB_DB_SCHEMA`/`PROMPTS_FTS_SCHEMA`,
+kept byte-identical to the three tools' own copies — a standalone, dependency-free script for
+creating/verifying the database file directly on the Docker host (no ComfyUI/OWUI/docker exec
+needed, since a bind-mounted sqlite file is just a regular file on the host). Not required for
+the tools to work — they create the schema lazily on first write regardless — but useful for
+checking a volume mount's permissions before the first real render, or for poking at an empty
+database with a host-side tool. Update it alongside the other three if the schema ever changes.
+
 ---
 
 ## Why this exists
