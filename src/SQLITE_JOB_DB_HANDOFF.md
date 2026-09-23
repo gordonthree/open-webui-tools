@@ -8,13 +8,28 @@ when editing schema or helper logic in one file, it needs the same edit in the o
 |---|---|---|
 | `comfy_sdxl_direct.py` | `generate_image` | **Done, tested** |
 | `comfy_sdxl_graph.py` | `run_workflow` (raw ComfyUI graph, e.g. ControlNet) | **Done, tested** |
-| `comfy_sdxl_retrieve.py` | `retrieve_image`, `search_jobs` | **Done, tested** |
+| `comfy_sdxl_retrieve.py` | `retrieve_image`, `search_jobs`, `list_jobs` | **Done, tested** |
 
 Matching test files: `test_comfy_sdxl_direct.py`, `test_comfy_sdxl_graph.py`,
 `test_comfy_sdxl_retrieve.py`. All simulate ComfyUI's HTTP API with a fake `requests` module — no
-real ComfyUI server needed. Currently **110 tests** (83 + 27 new), all passing except one
-pre-existing, unrelated failure on Windows only (`test_unreachable_syslog_falls_back_to_file` in
+real ComfyUI server needed. Currently **121 tests**, all passing except one pre-existing,
+unrelated failure on Windows only (`test_unreachable_syslog_falls_back_to_file` in
 `test_comfy_sdxl_direct.py` — a Windows syslog-socket quirk, not a job-DB issue).
+
+**`list_jobs`** is a browsing/display counterpart to `search_jobs`: instead of structured JSON,
+it returns a ready-to-paste Markdown table (`# | UUID | Job Timestamp | Information`, with
+filename/server/status/prompts/a best-effort thumbnail all folded into the one "Information"
+cell — narrow chat windows don't render wide tables well). It has a `data_source` argument picking
+between two independent code paths that get normalized into the same display-row shape before
+formatting:
+- **live** (default, or an explicit GPU server address) — reads a server's own `/history`
+  directly, the same data `retrieve_image`'s `history=<count>` mode uses. No search filters here
+  by design (explicit steer: "no need to do any searching... maintain existing functionality") —
+  just `job_count`/`skip_to` pagination over whatever that server currently retains.
+- **`data_source="database"`** — browses the persistent job log via `run_job_search` (now
+  extended with `job_search` and `offset`/`total_count` support, reused by `search_jobs` too, with
+  both new params optional/no-op for that existing caller), completed jobs only, with
+  `job_search` (matches a job's id or filename, substring) and `prompt_search` available.
 
 Run tests with (from the directory containing the files):
 ```

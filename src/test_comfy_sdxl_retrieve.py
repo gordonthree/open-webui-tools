@@ -4,6 +4,7 @@ Tests for comfy_sdxl_retrieve.py. Run with:  python -m unittest test_comfy_sdxl_
 """
 
 import json
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -580,6 +581,181 @@ class ReconciliationHelperTests(unittest.TestCase):
 
     def test_fts_phrase_query_escapes_quotes(self):
         self.assertEqual(mod.fts_phrase_query('a "quoted" word'), '"a ""quoted"" word"')
+
+
+class ListJobsTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        mod._job_db_schema_ready.clear()
+        self.tool = mod.Tools()
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = str(Path(self.tmpdir) / "jobs.sqlite3")
+        self.server = "http://s1:8188"
+        self.other_server = "http://s2:8188"
+        self.tool.valves.JOB_DB_PATH = self.db_path
+        self.tool.valves.GPU_SERVERS = [self.server, self.other_server]
+        self.tool.valves.DEFAULT_GPU_SERVER = self.server
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        mod._job_db_schema_ready.clear()
+
+    @staticmethod
+    def _live_entry(number, filename, positive="", negative="", start_ms=1_000):
+        graph = {
+            "10": {"class_type": "CLIPTextEncode", "inputs": {"text": positive}},
+            "11": {"class_type": "CLIPTextEncode", "inputs": {"text": negative}},
+            "12": {
+                "class_type": "KSampler",
+                "inputs": {"positive": ["10", 0], "negative": ["11", 0], "seed": 1, "steps": 20},
+            },
+        }
+        return {
+            "prompt": [number, f"prompt-{number}", graph, {}, ["7"]],
+            "status": {
+                "status_str": "success",
+                "completed": True,
+                "messages": [["execution_start", {"timestamp": start_ms}]],
+            },
+            "outputs": {"7": {"images": [{"filename": filename, "subfolder": "", "type": "output"}]}},
+        }
+
+    async def test_default_live_mode_reads_default_server(self):
+        fake = FakeMultiServerRetrieveComfy()
+        fake.seed_history(self.server, "prompt-1", self._live_entry(1, "a.png", "a cat"))
+        fake.seed_history(self.server, "prompt-2", self._live_entry(2, "b.png", "a dog"))
+        with patch.object(mod, "requests", fake):
+            res = await self.tool.list_jobs()
+
+        self.assertTrue(res["success"], res)
+        table = res["markdown_table"]
+        self.assertIn("Showing 1-2 of 2", table)
+        # newest (highest queue number) first
+        lines = [l for l in table.splitlines() if l.startswith("| 1 |") or l.startswith("| 2 |")]
+        self.assertIn("prompt-2", lines[0])
+        self.assertIn("prompt-1", lines[1])
+        self.assertIn(self.server, table)
+        self.assertIn("a cat", table)
+
+    async def test_live_mode_pagination_skip_to(self):
+        fake = FakeMultiServerRetrieveComfy()
+        for n in range(1, 6):
+            fake.seed_history(self.server, f"prompt-{n}", self._live_entry(n, f"{n}.png"))
+        with patch.object(mod, "requests", fake):
+            res = await self.tool.list_jobs(job_count=2, skip_to=2)
+
+        self.assertTrue(res["success"], res)
+        table = res["markdown_table"]
+        self.assertIn("Showing 3-4 of 5", table)
+        self.assertIn("prompt-3", table)
+        self.assertIn("prompt-2", table)
+        self.assertIn("| 3 |", table)
+        self.assertIn("| 4 |", table)
+
+    async def test_live_mode_explicit_server_address(self):
+        fake = FakeMultiServerRetrieveComfy()
+        fake.seed_history(self.other_server, "prompt-1", self._live_entry(1, "x.png"))
+        with patch.object(mod, "requests", fake):
+            res = await self.tool.list_jobs(data_source=self.other_server)
+
+        self.assertTrue(res["success"], res)
+        self.assertIn(self.other_server, res["markdown_table"])
+        self.assertNotIn(self.server, res["markdown_table"].replace(self.other_server, ""))
+
+    async def test_live_mode_thumbnail_included_by_default_and_omittable(self):
+        fake = FakeMultiServerRetrieveComfy()
+        fake.seed_history(self.server, "prompt-1", self._live_entry(1, "a.png"))
+        with patch.object(mod, "requests", fake):
+            with_thumb = await self.tool.list_jobs()
+            without_thumb = await self.tool.list_jobs(show_thumbnails=False)
+
+        self.assertIn("![thumbnail](", with_thumb["markdown_table"])
+        self.assertNotIn("![thumbnail](", without_thumb["markdown_table"])
+
+    async def test_live_mode_no_jobs_found(self):
+        fake = FakeMultiServerRetrieveComfy()
+        with patch.object(mod, "requests", fake):
+            res = await self.tool.list_jobs()
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["markdown_table"], "No jobs found.")
+
+    async def test_database_mode_shows_completed_only(self):
+        _seed_job(
+            self.db_path, server=self.server, status="completed",
+            positive_prompt="a lighthouse",
+            history_entry={"status": {}, "outputs": {"7": {"images": [{"filename": "done.png", "subfolder": "", "type": "output"}]}}},
+        )
+        _seed_job(self.db_path, server=self.server, status="built", positive_prompt="a cat")
+        _seed_job(self.db_path, server=self.server, status="failed", positive_prompt="a dog")
+
+        res = await self.tool.list_jobs(data_source="database")
+        self.assertTrue(res["success"], res)
+        table = res["markdown_table"]
+        self.assertIn("done.png", table)
+        self.assertIn("a lighthouse", table)
+        self.assertNotIn("a cat", table)
+        self.assertNotIn("a dog", table)
+        self.assertIn("Showing 1-1 of 1", table)
+
+    async def test_database_mode_job_search_matches_filename(self):
+        _seed_job(
+            self.db_path, server=self.server, status="completed", positive_prompt="match me",
+            history_entry={"status": {}, "outputs": {"7": {"images": [{"filename": "findable.png", "subfolder": "", "type": "output"}]}}},
+        )
+        _seed_job(
+            self.db_path, server=self.server, status="completed", positive_prompt="not this one",
+            history_entry={"status": {}, "outputs": {"7": {"images": [{"filename": "other.png", "subfolder": "", "type": "output"}]}}},
+        )
+
+        res = await self.tool.list_jobs(data_source="database", job_search="findable")
+        self.assertTrue(res["success"], res)
+        table = res["markdown_table"]
+        self.assertIn("findable.png", table)
+        self.assertNotIn("other.png", table)
+
+    async def test_database_mode_prompt_search(self):
+        _seed_job(
+            self.db_path, server=self.server, status="completed", positive_prompt="a lighthouse at dusk",
+            history_entry={"status": {}, "outputs": {"7": {"images": [{"filename": "a.png", "subfolder": "", "type": "output"}]}}},
+        )
+        _seed_job(
+            self.db_path, server=self.server, status="completed", positive_prompt="a cat on a windowsill",
+            history_entry={"status": {}, "outputs": {"7": {"images": [{"filename": "b.png", "subfolder": "", "type": "output"}]}}},
+        )
+
+        res = await self.tool.list_jobs(data_source="database", prompt_search="lighthouse")
+        self.assertTrue(res["success"], res)
+        table = res["markdown_table"]
+        self.assertIn("a.png", table)
+        self.assertNotIn("b.png", table)
+
+    async def test_database_mode_no_db_file_yet(self):
+        res = await self.tool.list_jobs(data_source="database")
+        self.assertTrue(res["success"], res)
+        self.assertIn("No job database found", res["markdown_table"])
+
+    async def test_database_mode_pagination_total_count(self):
+        for i in range(5):
+            _seed_job(
+                self.db_path, server=self.server, status="completed", positive_prompt=f"job {i}",
+                history_entry={"status": {}, "outputs": {"7": {"images": [{"filename": f"{i}.png", "subfolder": "", "type": "output"}]}}},
+            )
+        res = await self.tool.list_jobs(data_source="database", job_count=2, skip_to=2)
+        self.assertTrue(res["success"], res)
+        self.assertIn("Showing 3-4 of 5", res["markdown_table"])
+
+    async def test_pipe_and_newline_in_prompt_do_not_break_table(self):
+        _seed_job(
+            self.db_path, server=self.server, status="completed",
+            positive_prompt="a | vertical bar\nand a newline",
+            history_entry={"status": {}, "outputs": {"7": {"images": [{"filename": "weird.png", "subfolder": "", "type": "output"}]}}},
+        )
+        res = await self.tool.list_jobs(data_source="database")
+        self.assertTrue(res["success"], res)
+        table = res["markdown_table"]
+        # exactly 4 unescaped pipes on the data row (the table's own column separators)
+        data_line = [l for l in table.splitlines() if l.startswith("| 1 |")][0]
+        self.assertEqual(len(re.findall(r"(?<!\\)\|", data_line)), 5)  # 5 unescaped '|' delimit 4 columns
+        self.assertNotIn("\n", data_line)
 
 
 if __name__ == "__main__":

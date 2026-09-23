@@ -568,7 +568,9 @@ def run_job_search(
     status: Optional[List[str]] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    job_search: Optional[str] = None,
     limit: int = 20,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """Synchronous; call via asyncio.to_thread. Never raises - returns {'success': False, 'error': ...}."""
     try:
@@ -624,16 +626,27 @@ def run_job_search(
                     "positive_prompt LIKE ? ESCAPE '\\' OR negative_prompt LIKE ? ESCAPE '\\')"
                 )
                 params.extend([f"%{escaped}%", f"%{escaped}%"])
+        if job_search:
+            escaped = _like_escape(job_search)
+            conditions.append(
+                "(j.job_uuid LIKE ? ESCAPE '\\' OR j.comfy_prompt_id LIKE ? ESCAPE '\\' OR EXISTS ("
+                "SELECT 1 FROM results r WHERE r.job_uuid = j.job_uuid AND r.stage = 'history' "
+                "AND r.raw_json LIKE ? ESCAPE '\\'))"
+            )
+            params.extend([f"%{escaped}%", f"%{escaped}%", f"%{escaped}%"])
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        total_count = conn.execute(f"SELECT COUNT(*) FROM jobs j {where}", params).fetchone()[0]
+
         sql = (
             "SELECT j.job_uuid, j.comfy_prompt_id, j.tool, j.server, j.status, j.created_at, "
             "j.submitted_at, j.duration_s, p.positive_prompt, p.negative_prompt "
             "FROM jobs j LEFT JOIN prompts p ON p.job_uuid = j.job_uuid "
-            f"{where} ORDER BY j.created_at DESC LIMIT ?"
+            f"{where} ORDER BY j.created_at DESC LIMIT ? OFFSET ?"
         )
-        params.append(max(1, limit))
-        rows = conn.execute(sql, params).fetchall()
+        page_params = params + [max(1, limit), max(0, offset)]
+        rows = conn.execute(sql, page_params).fetchall()
 
         completed_uuids = [r["job_uuid"] for r in rows if r["status"] == "completed"]
         filenames_by_job: Dict[str, List[str]] = {}
@@ -668,7 +681,7 @@ def run_job_search(
                 item["filenames"] = filenames_by_job.get(r["job_uuid"], [])
             jobs.append(item)
 
-        return {"success": True, "count": len(jobs), "jobs": jobs}
+        return {"success": True, "count": len(jobs), "total_count": total_count, "jobs": jobs}
     except Exception as e:
         logger.exception("search_jobs query failed")
         return {"success": False, "error": f"Search failed: {e}"}
@@ -1293,6 +1306,137 @@ async def retrieve(
 
 
 # --------------------------------------------------------------------------- #
+# list_jobs - a browsable, formatted-for-display job library, distinct from search_jobs (which
+# returns structured JSON for filtering/chaining). Two data sources, normalized to the same
+# display-row shape so one table formatter covers both:
+#   - live (default, or an explicit GPU server address): reads straight from that server's own
+#     /history, same data retrieve_image's history=<count> mode uses. No search filters - "no
+#     need to do any searching, maintain existing functionality" was the explicit steer here.
+#   - database: browses the persistent job log via run_job_search, completed jobs only, with
+#     job_search/prompt_search available.
+# --------------------------------------------------------------------------- #
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _format_ts_for_display(value: Optional[str]) -> str:
+    if not value:
+        return "—"
+    try:
+        return datetime.datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        return value
+
+
+def _live_rows_from_history(raw: Dict[str, Any], server: str) -> List[Dict[str, Any]]:
+    """Normalize a server's raw /history dict into display rows, newest first."""
+    entries = [(job_id, entry) for job_id, entry in raw.items() if isinstance(entry, dict)]
+    entries.sort(key=lambda kv: _job_number(kv[1]), reverse=True)
+
+    rows = []
+    for job_id, entry in entries:
+        run_status = entry.get("status") or {}
+        images = [
+            img
+            for out in (entry.get("outputs") or {}).values()
+            for img in (out.get("images") or [])
+            if img.get("type", "output") == "output"
+        ]
+        first = images[0] if images else None
+        start_ts, _end_ts, _duration = _execution_timing(entry)
+        created_at = (
+            datetime.datetime.fromtimestamp(start_ts / 1000, tz=datetime.timezone.utc).isoformat()
+            if start_ts is not None
+            else None
+        )
+        graph = history_prompt_graph(entry)
+        params = extract_parameters(graph) if graph else {}
+        rows.append(
+            {
+                "id": job_id,
+                "created_at": created_at,
+                "server": server,
+                "status": "failed" if run_status.get("status_str") == "error" else "completed",
+                "filename": first.get("filename") if first else None,
+                "subfolder": first.get("subfolder", "") if first else "",
+                "positive_prompt": params.get("positive_prompt"),
+                "negative_prompt": params.get("negative_prompt"),
+            }
+        )
+    return rows
+
+
+def _db_rows_to_display_rows(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize run_job_search's job dicts (already completed-only, by construction here) into
+    the same display-row shape _live_rows_from_history produces."""
+    rows = []
+    for job in jobs:
+        filenames = job.get("filenames") or []
+        subfolder, filename = "", None
+        if filenames:
+            try:
+                subfolder, filename = parse_image_ref(filenames[0])
+            except ValueError:
+                filename = filenames[0]  # malformed ref (shouldn't happen); show it verbatim rather than drop the row
+        rows.append(
+            {
+                "id": job["job_uuid"],
+                "created_at": job.get("created_at"),
+                "server": job.get("server"),
+                "status": job.get("status"),
+                "filename": filename,
+                "subfolder": subfolder,
+                "positive_prompt": job.get("positive_prompt"),
+                "negative_prompt": job.get("negative_prompt"),
+            }
+        )
+    return rows
+
+
+def format_jobs_table(
+    rows: List[Dict[str, Any]], start_index: int, total_count: int, show_thumbnails: bool, request_timeout: int
+) -> str:
+    """
+    '# | UUID | Job Timestamp | Information' - everything else (filename, server, status,
+    prompts, and a best-effort thumbnail) lives inside one tall Information cell rather than
+    more columns, since chat windows are narrow and Markdown tables don't wrap gracefully.
+    """
+    if not rows:
+        return "No jobs found."
+
+    lines = [
+        f"Showing {start_index + 1}-{start_index + len(rows)} of {total_count}",
+        "",
+        "| # | UUID | Job Timestamp | Information |",
+        "|---|------|----------------|-------------|",
+    ]
+    for i, row in enumerate(rows):
+        parts: List[str] = []
+        if show_thumbnails and row.get("filename") and row.get("server"):
+            thumb_url = ComfyClient(row["server"], request_timeout).view_url(
+                {"filename": row["filename"], "subfolder": row.get("subfolder", ""), "type": "output"}
+            )
+            parts.append(f"![thumbnail]({thumb_url})")
+        parts.append(f"**File:** {row['filename']}" if row.get("filename") else "**File:** (none)")
+        parts.append(f"**Server:** {row.get('server') or '—'}")
+        parts.append(f"**Status:** {row.get('status') or 'unknown'}")
+        if row.get("positive_prompt"):
+            parts.append(f"**Positive:** {_truncate(row['positive_prompt'], 200)}")
+        if row.get("negative_prompt"):
+            parts.append(f"**Negative:** {_truncate(row['negative_prompt'], 200)}")
+
+        # A table cell can't contain a literal newline or an unescaped '|' without breaking the
+        # row, so both are neutralized here rather than relied on to never occur in prompt text.
+        information = "<br>".join(parts).replace("\n", " ").replace("|", "\\|")
+        uuid_cell = (row.get("id") or "—").replace("|", "\\|")
+        lines.append(f"| {start_index + i + 1} | {uuid_cell} | {_format_ts_for_display(row.get('created_at'))} | {information} |")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
 # Open WebUI tool
 # --------------------------------------------------------------------------- #
 
@@ -1369,14 +1513,15 @@ class Tools:
         """
         Retrieve an image rendered earlier on the ComfyUI server, or list recent jobs.
 
-        TOOLKIT: this is one of three related tools, all sharing the same GPU_SERVERS. Use
+        TOOLKIT: this is one of four related tools, all sharing the same GPU_SERVERS. Use
         generate_image for ordinary SDXL renders, or run_workflow for a fully custom graph
         (ControlNet, compositing, etc.); use THIS tool to fetch what either of them produced -
         by job id, by filename, or (with history=<count>) by listing a server's recent jobs when
         you don't have either. It's also how to check on a job either tool queued with
         queue_only=true. A result's 'server' can be passed as gpu_server to another call. To find
         a job or filename by prompt text, checkpoint, seed, date, or status instead, use
-        search_jobs first, then pass its job_uuid/comfy_prompt_id/filename here.
+        search_jobs first, then pass its job_uuid/comfy_prompt_id/filename here. For a quick,
+        human-readable browse instead of a single lookup, use list_jobs.
 
         Normal use: give the job id returned by generate_image(queue_only=true), or an image
         filename from the server's output folder. If the image exists it is shown to the user,
@@ -1439,7 +1584,8 @@ class Tools:
 
         TOOLKIT: this searches the durable SQLite log that generate_image and run_workflow write
         to (when their own LOG_TO_SQLITE valve is on), covering every attempt - including jobs
-        the server rejected or that timed out, not just completed renders.
+        the server rejected or that timed out, not just completed renders. For a quick,
+        human-readable browse instead (no filters needed), use list_jobs.
 
         :param prompt_text: Free-text search over positive/negative prompts, e.g. "lighthouse dusk". Omit to not filter by prompt text.
         :param checkpoint: Substring match (case-insensitive) against the checkpoint filename used, e.g. "epicrealism".
@@ -1500,4 +1646,97 @@ class Tools:
             result = {"success": False, "error": f"Unexpected error: {e}"}
 
         await status_cb(f"Found {result.get('count', 0)} job(s)" if result.get("success") else "Search failed", done=True)
+        return result
+
+    async def list_jobs(
+        self,
+        data_source: Optional[str] = None,
+        job_count: int = 10,
+        skip_to: int = 0,
+        job_search: Optional[str] = None,
+        prompt_search: Optional[str] = None,
+        show_thumbnails: bool = True,
+        __event_emitter__: Optional[Callable[[dict], Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Browse job history as a Markdown table meant to be shown to the user directly - a
+        librarian for past renders, not a fetcher. Use retrieve_image afterward, with a row's
+        UUID or filename, to actually display one image at full size.
+
+        TOOLKIT: this is one of four related tools sharing GPU_SERVERS. Unlike search_jobs (which
+        returns structured JSON for filtering/chaining), list_jobs returns a ready-to-paste table,
+        and needs no arguments at all for the common case - just call it to see the last 10 jobs.
+
+        :param data_source: Omit for the default: recent jobs read straight from a GPU server's
+            own live /history (the same data retrieve_image's history=<count> mode uses) - fast,
+            no setup needed, but limited to whatever that server currently retains (cleared on
+            restart, bounded retention) and no search filters apply there, just job_count/skip_to.
+            Pass "database" instead to browse the full persistent job log across all servers
+            (completed jobs only), where job_search/prompt_search work. Any other value is treated
+            as a specific GPU server address to read live history from, instead of the default
+            server.
+        :param job_count: How many rows to show.
+        :param skip_to: Skip this many jobs before listing (pagination - combine with job_count to
+            page through results).
+        :param job_search: database mode only. Matches a job's id (its own UUID or ComfyUI's own
+            prompt id) or filename, by substring.
+        :param prompt_search: database mode only. Free-text match over prompts.
+        :param show_thumbnails: Include a small embedded image per row, linked directly to the GPU
+            server. Best-effort - won't render if the file's since been deleted, or if your
+            browser can't reach that server directly.
+        """
+        v = self.valves
+
+        async def status_cb(text: str, done: bool = False):
+            await _emit(__event_emitter__, {"type": "status", "data": {"description": text, "done": done}})
+
+        job_count = max(1, job_count)
+        skip_to = max(0, skip_to)
+        ds = None if is_unset(data_source) else data_source.strip()
+        is_database = ds is not None and ds.lower() == "database"
+
+        await status_cb("Building the job library table...")
+        try:
+            if is_database:
+                if not Path(v.JOB_DB_PATH).exists():
+                    table = "No job database found yet at JOB_DB_PATH - nothing has been logged, or JOB_DB_PATH doesn't match generate_image's/run_workflow's valve."
+                else:
+                    found = await asyncio.to_thread(
+                        run_job_search,
+                        v.JOB_DB_PATH,
+                        prompt_text=None if is_unset(prompt_search) else prompt_search,
+                        job_search=None if is_unset(job_search) else job_search,
+                        status=["completed"],
+                        limit=job_count,
+                        offset=skip_to,
+                    )
+                    if not found.get("success"):
+                        raise ValueError(found.get("error") or "search failed")
+                    rows = _db_rows_to_display_rows(found["jobs"])
+                    table = format_jobs_table(
+                        rows, skip_to, found.get("total_count", len(rows)), show_thumbnails, v.REQUEST_TIMEOUT_SECONDS
+                    )
+            else:
+                allowed = list(dict.fromkeys(list(v.GPU_SERVERS) + [v.DEFAULT_GPU_SERVER]))
+                server = resolve_server(ds, v.DEFAULT_GPU_SERVER, allowed, v.ALLOW_UNLISTED_SERVERS)
+                client = ComfyClient(server, v.REQUEST_TIMEOUT_SECONDS)
+                raw = await asyncio.to_thread(client.get_history_list, v.MAX_HISTORY_ITEMS)
+                all_rows = _live_rows_from_history(raw, server)
+                page = all_rows[skip_to : skip_to + job_count]
+                table = format_jobs_table(page, skip_to, len(all_rows), show_thumbnails, v.REQUEST_TIMEOUT_SECONDS)
+
+            result: Dict[str, Any] = {
+                "success": True,
+                "markdown_table": table,
+                "note": "Paste markdown_table exactly as given into your reply so it renders as a table; don't reformat or summarize it.",
+            }
+        except ValueError as e:
+            result = {"success": False, "error": str(e)}
+        except ComfyError as e:
+            result = {"success": False, "error": f"Could not reach the GPU server: {e}"}
+        except Exception as e:  # keep the model from seeing a raw traceback
+            logger.exception("Unexpected error during list_jobs")
+            result = {"success": False, "error": f"Unexpected error: {e}"}
+
+        await status_cb("Done" if result.get("success") else "Failed", done=True)
         return result
