@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# Live credentials and per-instance tool ids - see secrets.example.md for the format.
+secrets.md

@@ -51,6 +51,15 @@ python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_
 `aiohttp` is used for live websocket progress and is optional — its tests are skipped, not failed,
 when it isn't installed.
 
+## Deploying a revision to OWUI
+
+`scripts/push_tool.py` pushes a tool's local `.py` source straight into a running OWUI instance
+via its Tools API (`POST /api/v1/tools/id/{id}/update`), so a revision doesn't need manually
+re-importing through the OWUI web UI. It reads connection details and per-tool ids from
+`secrets.md` at the repo root — gitignored, never committed; copy `secrets.example.md` to
+`secrets.md` and fill it in (once per machine, since it's not checked into git). Usage:
+`python scripts/push_tool.py <tool_name|all> [--dry-run]`.
+
 ## Status notes
 
 ### 2026-09-23
