@@ -9,6 +9,8 @@ secrets.md.
 
 Preserves each tool's existing name/meta/access_grants: this script fetches the tool's current
 record first and only replaces its 'content' field, rather than overwriting everything blind.
+That same fetch is also used to back up the tool's current (about-to-be-overwritten) source to
+tmp/ before every real push, timestamped, so a bad push is one file-copy away from undone.
 
 Usage:
     python scripts/push_tool.py comfy_sdxl_direct
@@ -17,6 +19,7 @@ Usage:
     python scripts/push_tool.py all --dry-run
 """
 import argparse
+import datetime
 import re
 import sys
 from pathlib import Path
@@ -26,6 +29,7 @@ import requests
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
 DEFAULT_SECRETS_FILE = REPO_ROOT / "secrets.md"
+BACKUP_DIR = REPO_ROOT / "tmp"
 
 TOOL_NAMES = ["comfy_sdxl_direct", "comfy_sdxl_graph", "comfy_sdxl_retrieve"]
 
@@ -58,6 +62,16 @@ def require(values: dict, key: str) -> str:
     return val
 
 
+def backup_current_content(tool_name: str, content: str) -> Path:
+    """Save the tool's current (pre-overwrite) source to tmp/, timestamped. tmp/ is gitignored -
+    these are local safety copies, not part of the repo's history."""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_path = BACKUP_DIR / f"{tool_name}_{timestamp}.py"
+    backup_path.write_text(content, encoding="utf-8")
+    return backup_path
+
+
 def push_one(tool_name: str, base_url: str, api_key: str, tool_id: str, dry_run: bool) -> None:
     local_path = SRC_DIR / f"{tool_name}.py"
     if not local_path.exists():
@@ -81,6 +95,13 @@ def push_one(tool_name: str, base_url: str, api_key: str, tool_id: str, dry_run:
             f"{len(new_content)} bytes (currently {len(old_content)} bytes)"
         )
         return
+
+    old_content = current.get("content")
+    if old_content:
+        backup_path = backup_current_content(tool_name, old_content)
+        print(f"[{tool_name}] backed up current content to {backup_path}")
+    else:
+        print(f"[{tool_name}] WARNING: current content wasn't readable (no write access?) - no backup written")
 
     # Only 'content' actually changes here - name/meta/access_grants are echoed back as-is so
     # this never clobbers settings made through the OWUI UI. The server itself recomputes

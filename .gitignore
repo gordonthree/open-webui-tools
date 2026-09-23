@@ -3,3 +3,6 @@ __pycache__/
 
 # Live credentials and per-instance tool ids - see secrets.example.md for the format.
 secrets.md
+
+# Local scratch space - includes scripts/push_tool.py's pre-overwrite backups.
+tmp/
