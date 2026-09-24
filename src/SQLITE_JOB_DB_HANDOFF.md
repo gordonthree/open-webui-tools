@@ -63,13 +63,31 @@ Run tests with (from the directory containing the files):
 python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve -v
 ```
 
-`scripts/init_job_db.py` (repo root) has a fourth copy of `JOB_DB_SCHEMA`/`PROMPTS_FTS_SCHEMA`,
-kept byte-identical to the three tools' own copies — a standalone, dependency-free script for
-creating/verifying the database file directly on the Docker host (no ComfyUI/OWUI/docker exec
-needed, since a bind-mounted sqlite file is just a regular file on the host). Not required for
-the tools to work — they create the schema lazily on first write regardless — but useful for
-checking a volume mount's permissions before the first real render, or for poking at an empty
-database with a host-side tool. Update it alongside the other three if the schema ever changes.
+`scripts/job_db_common.py` has a fourth copy of `JOB_DB_SCHEMA`/`PROMPTS_FTS_SCHEMA` (plus
+`extract_node_params`/`extract_prompts`/`classify_job_mode`/etc.), kept byte-identical/logically
+identical to the three tools' own copies. Unlike `src/*.py`, `scripts/*.py` has no OWUI
+cross-import restriction, so this is imported by every script that needs it rather than
+hand-duplicated a fifth/sixth time — still update it alongside the three tools if the schema ever
+changes, just in one place instead of per-script. Two scripts use it:
+- `scripts/init_job_db.py` — a standalone script for creating/verifying the database file
+  directly on the Docker host (no ComfyUI/OWUI/docker exec needed, since a bind-mounted sqlite
+  file is just a regular file on the host). Not required for the tools to work — they create the
+  schema lazily on first write regardless — but useful for checking a volume mount's permissions
+  before the first real render, or for poking at an empty database with a host-side tool.
+- `scripts/import_server_history.py` — sweeps a ComfyUI server's own `/history` directly (no OWUI
+  involved) and adds whatever completed jobs aren't already tracked: backfills an existing
+  unlinked job row where the graph matches (the exact same matching + closest-in-time tie-break
+  `comfy_sdxl_retrieve.py`'s reconciliation uses, ported rather than imported, so this script has
+  no `pydantic`/OWUI Tools-class dependency), or records a brand-new row (`tool='external'`) for
+  a job with no matching row at all — e.g. rendered directly through ComfyUI's own UI, or from
+  before job logging existed. `--dry-run` previews without writing (except: it still creates the
+  database's schema if the path doesn't exist yet, even under `--dry-run` — unlike `search_jobs`'s
+  read-only guard against this, this script's whole purpose is to manage that exact path, so the
+  side effect is expected here, not surprising). Its own test file,
+  `scripts/test_import_server_history.py` (11 tests, run from `scripts/`), caught a real bug
+  during development: the original "no history entries" early-return skipped schema creation
+  entirely, so an empty server response left the database file half-initialized (no tables) even
+  under `--dry-run` against a fresh path.
 
 ---
 

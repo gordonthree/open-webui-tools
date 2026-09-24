@@ -41,6 +41,15 @@ to be run ahead of time. `python scripts/init_job_db.py <path>` exists anyway, a
 dependency-free way to pre-create/verify it directly on the Docker host — useful for checking a
 volume mount's permissions before the first real render.
 
+`python scripts/import_server_history.py <server> <db_path>` sweeps a ComfyUI server's own
+`/history` directly (no OWUI involved) and adds whatever completed jobs the database doesn't
+already know about: backfilling an existing-but-unlinked job row where the graph matches (the
+same reconciliation `retrieve_image` does opportunistically for one file at a time), or recording
+a brand-new row (`tool='external'`) for anything with no matching row at all — e.g. rendered
+directly through ComfyUI's own UI, or from before job logging existed. `--dry-run` previews
+without writing. Bounded by the server's own history retention (cleared on restart), same as
+`retrieve_image`'s `history=<count>` mode.
+
 ## Testing
 
 Each tool has a matching `test_*.py` file that simulates ComfyUI's HTTP API with a fake `requests`
@@ -48,6 +57,12 @@ module — no live ComfyUI or Open WebUI server needed. Run all of them from `sr
 
 ```
 python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve -v
+```
+
+`scripts/import_server_history.py` has its own test file the same way — run from `scripts/`:
+
+```
+python -m unittest test_import_server_history -v
 ```
 
 `pydantic` and `requests` need to be installed in whatever Python environment runs the tests
@@ -78,6 +93,14 @@ and `search_jobs` read that database and opportunistically reconcile jobs that l
 fetches a job's submitted ComfyUI graph directly (live server or database). 134 tests across the
 three `test_*.py` files, 133 passing — the one failure is a pre-existing, Windows-only
 syslog-socket quirk unrelated to the job database (see `src/SQLITE_JOB_DB_HANDOFF.md`).
+
+Also added: `scripts/import_server_history.py`, a standalone offline sweep of a ComfyUI server's
+own `/history` that backfills or imports whatever the database doesn't already know about (own
+test file, `scripts/test_import_server_history.py`, 11 tests); `scripts/job_db_common.py`, shared
+stdlib-only job-DB helpers for `scripts/*.py` (no OWUI cross-import restriction there, so this one
+isn't hand-duplicated a third/fourth time the way the three tools are); `scripts/push_tool.py` to
+deploy a tool revision to a running OWUI instance without the manual web UI import, with a
+pre-overwrite backup to `tmp/`; documentation moved from `CLAUDE.md` into this file.
 
 **Left to do:** nothing currently planned for the job-DB scope itself. Possible future work (not
 started): richer parameter extraction in `search_jobs` results (seed/steps/cfg/sampler, currently
