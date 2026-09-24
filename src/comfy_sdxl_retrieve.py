@@ -1,8 +1,8 @@
 """
 title: ComfyUI SDXL Retrieve
 author: Gordon
-version: 1.0.0
-description: Companion to ComfyUI SDXL Direct. Given a job id (from queue_only) or an image filename, finds the result on the ComfyUI server and shows it in chat, or reports that the job is still queued/running, or that nothing was found.
+version: 1.1.0
+description: Companion to ComfyUI SDXL Direct. Given a job id (from queue_only) or an image filename, finds the result on the ComfyUI server and shows it in chat, or reports that the job is still queued/running, or that nothing was found. Also exposes search_jobs (structured search over the shared job database) and list_jobs (a browsable Markdown table of job history).
 """
 
 import asyncio
