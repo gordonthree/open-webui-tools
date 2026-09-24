@@ -85,6 +85,7 @@ complete detail, e.g. exact sampler/scheduler name lists).
 | Argument | Expected value |
 |---|---|
 | `prompt_text` | Free text; omit to not filter by prompt |
+| `job_search` | Matches a job's id (its own UUID or ComfyUI's own prompt id) or filename, by substring |
 | `checkpoint` | Substring of a checkpoint filename |
 | `seed` | Exact integer seed |
 | `gpu_server` | Omit to search all servers |

@@ -1,7 +1,7 @@
 """
 title: ComfyUI SDXL Retrieve
 author: Gordon
-version: 1.3.0
+version: 1.4.0
 description: Companion to ComfyUI SDXL Direct. Given a job id (from queue_only) or an image filename, finds the result on the ComfyUI server and shows it in chat, or reports that the job is still queued/running, or that nothing was found. Also exposes search_jobs (structured search over the shared job database), list_jobs (a browsable Markdown table of job history), and retrieve_graph (fetches the submitted ComfyUI graph itself for a job).
 """
 
@@ -1743,6 +1743,7 @@ class Tools:
     async def search_jobs(
         self,
         prompt_text: Optional[str] = None,
+        job_search: Optional[str] = None,
         checkpoint: Optional[str] = None,
         seed: Optional[int] = None,
         gpu_server: Optional[str] = None,
@@ -1764,6 +1765,7 @@ class Tools:
         human-readable browse instead (no filters needed), use list_jobs.
 
         :param prompt_text: Free-text search over positive/negative prompts, e.g. "lighthouse dusk". Omit to not filter by prompt text.
+        :param job_search: Matches a job's id (its own UUID or ComfyUI's own prompt id) or filename, by substring. Omit to not filter by id/filename.
         :param checkpoint: Substring match (case-insensitive) against the checkpoint filename used, e.g. "epicrealism".
         :param seed: Exact seed value used by the job's sampler.
         :param gpu_server: Restrict to one server (full URL or a configured short name). Omit to search all servers.
@@ -1801,6 +1803,7 @@ class Tools:
                     run_job_search,
                     v.JOB_DB_PATH,
                     prompt_text=None if is_unset(prompt_text) else prompt_text,
+                    job_search=None if is_unset(job_search) else job_search,
                     checkpoint=None if is_unset(checkpoint) else checkpoint,
                     seed=seed,
                     server=server,

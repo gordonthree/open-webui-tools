@@ -217,6 +217,27 @@ class SearchJobsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(res["jobs"]), 1)
         self.assertEqual(res["jobs"][0]["positive_prompt"], "a lighthouse at dusk")
 
+    async def test_filters_by_job_search_matching_filename(self):
+        _seed_job(
+            self.db_path, status="completed", positive_prompt="match me",
+            history_entry={"status": {}, "outputs": {"7": {"images": [{"filename": "findable.png", "subfolder": "", "type": "output"}]}}},
+        )
+        _seed_job(
+            self.db_path, status="completed", positive_prompt="not this one",
+            history_entry={"status": {}, "outputs": {"7": {"images": [{"filename": "other.png", "subfolder": "", "type": "output"}]}}},
+        )
+        res = await self.tool.search_jobs(job_search="findable")
+        self.assertTrue(res["success"], res)
+        self.assertEqual(len(res["jobs"]), 1)
+        self.assertIn("findable.png", res["jobs"][0]["filenames"])
+
+    async def test_filters_by_job_search_matching_job_uuid(self):
+        job_uuid = _seed_job(self.db_path, positive_prompt="find by id")
+        _seed_job(self.db_path, positive_prompt="not this one")
+        res = await self.tool.search_jobs(job_search=job_uuid)
+        self.assertTrue(res["success"], res)
+        self.assertEqual([j["job_uuid"] for j in res["jobs"]], [job_uuid])
+
     async def test_filters_by_checkpoint_substring_case_insensitive(self):
         _seed_job(
             self.db_path,

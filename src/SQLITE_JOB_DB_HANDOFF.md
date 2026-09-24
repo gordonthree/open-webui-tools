@@ -12,7 +12,7 @@ when editing schema or helper logic in one file, it needs the same edit in the o
 
 Matching test files: `test_comfy_sdxl_direct.py`, `test_comfy_sdxl_graph.py`,
 `test_comfy_sdxl_retrieve.py`. All simulate ComfyUI's HTTP API with a fake `requests` module — no
-real ComfyUI server needed. Currently **134 tests**, all passing except one pre-existing,
+real ComfyUI server needed. Currently **136 tests**, all passing except one pre-existing,
 unrelated failure on Windows only (`test_unreachable_syslog_falls_back_to_file` in
 `test_comfy_sdxl_direct.py` — a Windows syslog-socket quirk, not a job-DB issue).
 
@@ -31,10 +31,15 @@ formatting:
   directly, the same data `retrieve_image`'s `history=<count>` mode uses. No search filters here
   by design (explicit steer: "no need to do any searching... maintain existing functionality") —
   just `job_count`/`skip_to` pagination over whatever that server currently retains.
-- **`data_source="database"`** — browses the persistent job log via `run_job_search` (now
-  extended with `job_search` and `offset`/`total_count` support, reused by `search_jobs` too, with
-  both new params optional/no-op for that existing caller), completed jobs only, with
-  `job_search` (matches a job's id or filename, substring) and `prompt_search` available.
+- **`data_source="database"`** — browses the persistent job log via `run_job_search` (extended
+  with `job_search` and `offset`/`total_count` support), completed jobs only, with `job_search`
+  (matches a job's id or filename, substring) and `prompt_search` available.
+
+**Correction (2026-09-24):** `search_jobs` itself never actually exposed `job_search` as an
+argument, despite `run_job_search` supporting it since `list_jobs` was built — an oversight caught
+by the project owner reading the README's new argument table. Fixed: `search_jobs` now also takes
+`job_search`, wired straight through to the same `run_job_search` parameter. Bumped
+`comfy_sdxl_retrieve.py` to 1.4.0.
 
 Each row's Information cell also shows a **Type** (`txt2img`/`img2img`, from
 `extract_parameters(graph)`'s existing `mode` key) and **Mode** (`direct`/`graph` — which tool made
