@@ -8,11 +8,11 @@ when editing schema or helper logic in one file, it needs the same edit in the o
 |---|---|---|
 | `comfy_sdxl_direct.py` | `generate_image` | **Done, tested** |
 | `comfy_sdxl_graph.py` | `run_workflow` (raw ComfyUI graph, e.g. ControlNet) | **Done, tested** |
-| `comfy_sdxl_retrieve.py` | `retrieve_image`, `search_jobs`, `list_jobs` | **Done, tested** |
+| `comfy_sdxl_retrieve.py` | `retrieve_image`, `search_jobs`, `list_jobs`, `retrieve_graph` | **Done, tested** |
 
 Matching test files: `test_comfy_sdxl_direct.py`, `test_comfy_sdxl_graph.py`,
 `test_comfy_sdxl_retrieve.py`. All simulate ComfyUI's HTTP API with a fake `requests` module — no
-real ComfyUI server needed. Currently **121 tests**, all passing except one pre-existing,
+real ComfyUI server needed. Currently **134 tests**, all passing except one pre-existing,
 unrelated failure on Windows only (`test_unreachable_syslog_falls_back_to_file` in
 `test_comfy_sdxl_direct.py` — a Windows syslog-socket quirk, not a job-DB issue).
 
@@ -35,6 +35,28 @@ formatting:
   extended with `job_search` and `offset`/`total_count` support, reused by `search_jobs` too, with
   both new params optional/no-op for that existing caller), completed jobs only, with
   `job_search` (matches a job's id or filename, substring) and `prompt_search` available.
+
+Each row's Information cell also shows a **Type** (`txt2img`/`img2img`, from
+`extract_parameters(graph)`'s existing `mode` key) and **Mode** (`direct`/`graph` — which tool made
+it) line. Mode is detected purely from the graph's own shape: `run_workflow` injects a fixed
+reserved node id (`__comfy_tool_source_image__`, see `comfy_sdxl_graph.py`'s
+`SOURCE_IMAGE_NODE_ID`) into every graph it submits, and `generate_image`'s fixed graph never
+contains it — so `classify_job_mode()` works the same way regardless of data source, no DB `tool`
+column lookup needed. `run_job_search` now also batch-fetches each job's `outputs.raw_json` to
+compute `img_type`/`job_mode` server-side, but returns only those two small derived strings, not
+the graph itself — `search_jobs` stays a lean finder; `outputs.raw_json` was already being read
+for the checkpoint/seed `EXISTS` filters, so this doesn't add a new table read.
+
+**`retrieve_graph`** fetches the exact submitted graph (JSON) for a job — the input `run_workflow`
+was given, not the rendered image — most useful for `graph`-mode jobs, where the graph is bespoke
+and worth pulling back up to inspect or resubmit (optionally edited). Same `data_source` split as
+`list_jobs`: live (default, or an explicit server) reads a server's own `/history` **or queue**
+(a still-running/pending job has a graph too, via the already-existing `queue_item_graph()`), by
+job id or filename, mirroring `retrieve()`'s own lookup logic but returning the graph instead of
+delivering an image; `data_source="database"` matches on `job_uuid`, `comfy_prompt_id`, or a
+filename substring (via the same `results.raw_json LIKE` technique `list_jobs`'s `job_search`
+uses) against `outputs.raw_json`, and survives the server's own history being rotated/cleared,
+since the DB keeps it forever.
 
 Run tests with (from the directory containing the files):
 ```

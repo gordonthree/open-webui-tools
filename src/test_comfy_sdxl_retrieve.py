@@ -759,6 +759,147 @@ class ListJobsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(re.findall(r"(?<!\\)\|", data_line)), 5)  # 5 unescaped '|' delimit 4 columns
         self.assertNotIn("\n", data_line)
 
+    async def test_database_mode_type_and_mode_line(self):
+        direct_graph = {"15": {"class_type": "CheckpointLoaderSimple", "inputs": {}}, "12": {"class_type": "KSampler", "inputs": {"latent_image": ["13", 0]}}, "13": {"class_type": "EmptyLatentImage", "inputs": {}}}
+        graph_graph = {mod.GRAPH_TOOL_MARKER_NODE_ID: {"class_type": "LoadImageOutput", "inputs": {}}}
+        _seed_job(
+            self.db_path, job_uuid="direct-job", server=self.server, status="completed", graph=direct_graph,
+            history_entry={"status": {}, "outputs": {"7": {"images": [{"filename": "a.png", "subfolder": "", "type": "output"}]}}},
+        )
+        _seed_job(
+            self.db_path, job_uuid="graph-job", server=self.server, status="completed", graph=graph_graph,
+            history_entry={"status": {}, "outputs": {"7": {"images": [{"filename": "b.png", "subfolder": "", "type": "output"}]}}},
+        )
+        res = await self.tool.list_jobs(data_source="database")
+        self.assertTrue(res["success"], res)
+        table = res["markdown_table"]
+        self.assertIn("**Type:** txt2img, **Mode:** direct", table)
+        self.assertIn("**Type:** unknown, **Mode:** graph", table)
+
+    async def test_live_mode_type_and_mode_line(self):
+        entry = self._live_entry(1, "a.png")  # built via a KSampler+EmptyLatentImage-free graph in _live_entry
+        fake = FakeMultiServerRetrieveComfy()
+        fake.seed_history(self.server, "prompt-1", entry)
+        with patch.object(mod, "requests", fake):
+            res = await self.tool.list_jobs()
+        self.assertTrue(res["success"], res)
+        self.assertIn("**Mode:** direct", res["markdown_table"])  # _live_entry's graph has no marker node
+
+
+class RetrieveGraphTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        mod._job_db_schema_ready.clear()
+        self.tool = mod.Tools()
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = str(Path(self.tmpdir) / "jobs.sqlite3")
+        self.server = "http://s1:8188"
+        self.other_server = "http://s2:8188"
+        self.tool.valves.JOB_DB_PATH = self.db_path
+        self.tool.valves.GPU_SERVERS = [self.server, self.other_server]
+        self.tool.valves.DEFAULT_GPU_SERVER = self.server
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        mod._job_db_schema_ready.clear()
+
+    GRAPH = {mod.GRAPH_TOOL_MARKER_NODE_ID: {"class_type": "LoadImageOutput", "inputs": {}}, "1": {"class_type": "SaveImage", "inputs": {}}}
+    JOB_ID = str(uuid.uuid4())
+
+    async def test_live_mode_by_job_id_completed(self):
+        fake = FakeMultiServerRetrieveComfy()
+        fake.seed_history(self.server, self.JOB_ID, {
+            "prompt": [1, self.JOB_ID, self.GRAPH, {}, ["1"]],
+            "status": {"status_str": "success"},
+            "outputs": {},
+        })
+        with patch.object(mod, "requests", fake):
+            res = await self.tool.retrieve_graph(self.JOB_ID)
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["graph"], self.GRAPH)
+        self.assertEqual(res["job_mode"], "graph")
+        self.assertEqual(res["server"], self.server)
+        self.assertEqual(res["status"], "completed")
+
+    async def test_live_mode_by_job_id_still_queued(self):
+        fake = FakeMultiServerRetrieveComfy()
+        fake.set_queue(self.server, pending=[[5, self.JOB_ID, self.GRAPH, {}, []]])
+        with patch.object(mod, "requests", fake):
+            res = await self.tool.retrieve_graph(self.JOB_ID)
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["graph"], self.GRAPH)
+        self.assertEqual(res["status"], "pending")
+
+    async def test_live_mode_by_filename(self):
+        fake = FakeMultiServerRetrieveComfy()
+        fake.seed_history(self.server, "prompt-xyz", {
+            "prompt": [1, "prompt-xyz", self.GRAPH, {}, ["1"]],
+            "status": {"status_str": "success"},
+            "outputs": {"1": {"images": [{"filename": "found.png", "subfolder": "", "type": "output"}]}},
+        })
+        with patch.object(mod, "requests", fake):
+            res = await self.tool.retrieve_graph("found.png")
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["graph"], self.GRAPH)
+        self.assertEqual(res["comfy_prompt_id"], "prompt-xyz")
+
+    async def test_live_mode_not_found(self):
+        fake = FakeMultiServerRetrieveComfy()
+        with patch.object(mod, "requests", fake):
+            res = await self.tool.retrieve_graph("nope.png")
+        self.assertFalse(res["success"])
+        self.assertIn("error", res)
+
+    async def test_live_mode_explicit_server(self):
+        fake = FakeMultiServerRetrieveComfy()
+        fake.seed_history(self.other_server, self.JOB_ID, {
+            "prompt": [1, self.JOB_ID, self.GRAPH, {}, ["1"]],
+            "status": {"status_str": "success"},
+            "outputs": {},
+        })
+        with patch.object(mod, "requests", fake):
+            res = await self.tool.retrieve_graph(self.JOB_ID, gpu_server=self.other_server)
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["server"], self.other_server)
+
+    async def test_database_mode_by_job_uuid(self):
+        job_uuid = _seed_job(self.db_path, server=self.server, status="built", graph=self.GRAPH)
+        res = await self.tool.retrieve_graph(job_uuid, data_source="database")
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["graph"], self.GRAPH)
+        self.assertEqual(res["job_mode"], "graph")
+
+    async def test_database_mode_by_comfy_prompt_id(self):
+        _seed_job(self.db_path, server=self.server, status="completed", comfy_prompt_id="prompt-abc", graph=self.GRAPH)
+        res = await self.tool.retrieve_graph("prompt-abc", data_source="database")
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["graph"], self.GRAPH)
+
+    async def test_database_mode_by_filename(self):
+        _seed_job(
+            self.db_path, server=self.server, status="completed", graph=self.GRAPH,
+            history_entry={"status": {}, "outputs": {"1": {"images": [{"filename": "dbfound.png", "subfolder": "", "type": "output"}]}}},
+        )
+        res = await self.tool.retrieve_graph("dbfound.png", data_source="database")
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["graph"], self.GRAPH)
+
+    async def test_database_mode_no_db_file(self):
+        res = await self.tool.retrieve_graph("anything", data_source="database")
+        self.assertFalse(res["success"])
+        self.assertIn("No job database", res["error"])
+
+    async def test_database_mode_not_found(self):
+        _seed_job(self.db_path, server=self.server, status="completed", graph=self.GRAPH)
+        res = await self.tool.retrieve_graph("does-not-exist", data_source="database")
+        self.assertFalse(res["success"])
+
+    async def test_direct_mode_graph_classified_correctly(self):
+        direct_graph = {"15": {"class_type": "CheckpointLoaderSimple", "inputs": {}}}
+        job_uuid = _seed_job(self.db_path, server=self.server, status="built", graph=direct_graph)
+        res = await self.tool.retrieve_graph(job_uuid, data_source="database")
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["job_mode"], "direct")
+
 
 if __name__ == "__main__":
     unittest.main()

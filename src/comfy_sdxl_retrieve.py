@@ -1,8 +1,8 @@
 """
 title: ComfyUI SDXL Retrieve
 author: Gordon
-version: 1.2.0
-description: Companion to ComfyUI SDXL Direct. Given a job id (from queue_only) or an image filename, finds the result on the ComfyUI server and shows it in chat, or reports that the job is still queued/running, or that nothing was found. Also exposes search_jobs (structured search over the shared job database) and list_jobs (a browsable Markdown table of job history).
+version: 1.3.0
+description: Companion to ComfyUI SDXL Direct. Given a job id (from queue_only) or an image filename, finds the result on the ComfyUI server and shows it in chat, or reports that the job is still queued/running, or that nothing was found. Also exposes search_jobs (structured search over the shared job database), list_jobs (a browsable Markdown table of job history), and retrieve_graph (fetches the submitted ComfyUI graph itself for a job).
 """
 
 import asyncio
@@ -382,6 +382,22 @@ def _trace_latent(nodes: Dict[str, Any], link: Any, params: Dict[str, Any]) -> N
             return
 
 
+# Must match SOURCE_IMAGE_NODE_ID in comfy_sdxl_graph.py exactly. Every run_workflow submission
+# gets this reserved node id injected into its graph (see that file's prepare_graph()), and no
+# generate_image graph ever contains it, so its presence alone reliably tells "graph"-tool jobs
+# apart from "direct"-tool jobs from the graph itself - no DB lookup needed, works for a live
+# history entry's graph just as well as a stored one.
+GRAPH_TOOL_MARKER_NODE_ID = "__comfy_tool_source_image__"
+
+
+def classify_job_mode(graph: Optional[Dict[str, Any]]) -> Optional[str]:
+    """'direct' (comfy_sdxl_direct.py's fixed graph) or 'graph' (comfy_sdxl_graph.py's
+    model-authored graph); None if graph is missing/unreadable."""
+    if not isinstance(graph, dict):
+        return None
+    return "graph" if GRAPH_TOOL_MARKER_NODE_ID in graph else "direct"
+
+
 def extract_parameters(graph: Any) -> Dict[str, Any]:
     """
     Pull the generation settings out of a ComfyUI API-format graph: seed, steps,
@@ -663,8 +679,26 @@ def run_job_search(
                     continue
                 filenames_by_job[hr["job_uuid"]] = _filenames_from_history_entry(entry)
 
+        # img_type/job_mode are small derived strings, not the graph itself - keeping the full
+        # graph JSON out of search_jobs' response matters, it's meant to stay a lean finder (use
+        # retrieve_graph to actually fetch a graph).
+        all_uuids = [r["job_uuid"] for r in rows]
+        classification_by_job: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+        if all_uuids:
+            placeholders = ",".join("?" for _ in all_uuids)
+            out_rows = conn.execute(
+                f"SELECT job_uuid, raw_json FROM outputs WHERE job_uuid IN ({placeholders})", all_uuids
+            ).fetchall()
+            for orow in out_rows:
+                try:
+                    graph = json.loads(orow["raw_json"])
+                except ValueError:
+                    continue
+                classification_by_job[orow["job_uuid"]] = (extract_parameters(graph).get("mode"), classify_job_mode(graph))
+
         jobs = []
         for r in rows:
+            img_type, job_mode = classification_by_job.get(r["job_uuid"], (None, None))
             item = {
                 "job_uuid": r["job_uuid"],
                 "comfy_prompt_id": r["comfy_prompt_id"],
@@ -676,6 +710,8 @@ def run_job_search(
                 "duration_s": r["duration_s"],
                 "positive_prompt": r["positive_prompt"],
                 "negative_prompt": r["negative_prompt"],
+                "img_type": img_type,
+                "job_mode": job_mode,
             }
             if r["status"] == "completed":
                 item["filenames"] = filenames_by_job.get(r["job_uuid"], [])
@@ -1364,6 +1400,8 @@ def _live_rows_from_history(raw: Dict[str, Any], server: str) -> List[Dict[str, 
                 "subfolder": first.get("subfolder", "") if first else "",
                 "positive_prompt": params.get("positive_prompt"),
                 "negative_prompt": params.get("negative_prompt"),
+                "img_type": params.get("mode"),  # 'txt2img' / 'img2img' - extract_parameters' own "mode" key
+                "job_mode": classify_job_mode(graph),  # 'direct' / 'graph' - which tool made it
             }
         )
     return rows
@@ -1391,6 +1429,8 @@ def _db_rows_to_display_rows(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 "subfolder": subfolder,
                 "positive_prompt": job.get("positive_prompt"),
                 "negative_prompt": job.get("negative_prompt"),
+                "img_type": job.get("img_type"),
+                "job_mode": job.get("job_mode"),
             }
         )
     return rows
@@ -1431,6 +1471,7 @@ def format_jobs_table(
             parts.append(f"**File:** {filename}" if filename else "**File:** (none)")
         parts.append(f"**Server:** {row.get('server') or '—'}")
         parts.append(f"**Status:** {row.get('status') or 'unknown'}")
+        parts.append(f"**Type:** {row.get('img_type') or 'unknown'}, **Mode:** {row.get('job_mode') or 'unknown'}")
         if row.get("positive_prompt"):
             parts.append(f"**Positive:** {_truncate(row['positive_prompt'], 200)}")
         if row.get("negative_prompt"):
@@ -1442,6 +1483,131 @@ def format_jobs_table(
         uuid_cell = (row.get("id") or "—").replace("|", "\\|")
         lines.append(f"| {start_index + i + 1} | {uuid_cell} | {_format_ts_for_display(row.get('created_at'))} | {information} |")
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# retrieve_graph - fetches the submitted ComfyUI graph itself (the input to run_workflow), not
+# the rendered image. Most useful for "graph"-mode jobs, where the graph is bespoke and worth
+# pulling back up to inspect or resubmit (with edits); works for "direct"-mode jobs too, though
+# their fixed graph shape is already documented in comfy_sdxl_direct.py.
+# --------------------------------------------------------------------------- #
+
+
+async def find_graph_live(
+    v: Any, job_id_or_filename: str, gpu_server: Optional[str], status: Callable[..., Any]
+) -> Dict[str, Any]:
+    """Mirrors retrieve()'s by-job-id-or-filename server search, but returns the graph instead of
+    delivering an image. A job still queued/running has a graph too (queue_item_graph), so this
+    doesn't require the job to have finished."""
+    try:
+        text = job_id_or_filename.strip()
+        default = v.DEFAULT_GPU_SERVER.rstrip("/")
+        allowed = list(dict.fromkeys(list(v.GPU_SERVERS) + [v.DEFAULT_GPU_SERVER]))
+        if is_unset(gpu_server):
+            servers = [default] + [s.rstrip("/") for s in allowed if s.rstrip("/") != default]
+        else:
+            servers = [resolve_server(gpu_server, default, allowed, v.ALLOW_UNLISTED_SERVERS)]
+        by_job = bool(_UUID_RE.match(text))
+        subfolder, filename = ("", "") if by_job else parse_image_ref(text)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    unreachable: Dict[str, str] = {}
+
+    if by_job:
+        job_id = text.lower()
+        for server in servers:
+            client = ComfyClient(server, v.REQUEST_TIMEOUT_SECONDS)
+            await status(f"Looking up job {job_id[:8]} on {server}...")
+            try:
+                entry = await asyncio.to_thread(client.get_history, job_id)
+            except ComfyError as e:
+                unreachable[server] = str(e)
+                continue
+            if entry:
+                graph = history_prompt_graph(entry)
+                if graph:
+                    run_status = entry.get("status") or {}
+                    job_status = "failed" if run_status.get("status_str") == "error" else "completed"
+                    return {"success": True, "found": True, "graph": graph, "server": server, "comfy_prompt_id": job_id, "status": job_status}
+            try:
+                queue = await asyncio.to_thread(client.get_queue)
+            except ComfyError as e:
+                unreachable[server] = str(e)
+                continue
+            graph = queue_item_graph(queue, job_id)
+            if graph:
+                snap = queue_snapshot(queue, job_id) or {}
+                return {"success": True, "found": True, "graph": graph, "server": server, "comfy_prompt_id": job_id, "status": snap.get("state", "queued")}
+        return {
+            "success": False,
+            "found": False,
+            "error": f"Job {job_id} was not found: not in history or the queue on any configured server. "
+            + _servers_note(servers, unreachable),
+        }
+
+    for server in servers:
+        client = ComfyClient(server, v.REQUEST_TIMEOUT_SECONDS)
+        await status(f"Looking for the job that produced {filename} on {server}...")
+        try:
+            found = await asyncio.to_thread(find_history_entry_by_filename, client, subfolder, filename, v.MAX_HISTORY_ITEMS)
+        except ComfyError as e:
+            unreachable[server] = str(e)
+            continue
+        if found:
+            comfy_prompt_id, entry = found
+            graph = history_prompt_graph(entry)
+            if graph:
+                return {"success": True, "found": True, "graph": graph, "server": server, "comfy_prompt_id": comfy_prompt_id, "status": "completed"}
+
+    ref = f"{subfolder}/{filename}" if subfolder else filename
+    return {
+        "success": False,
+        "found": False,
+        "error": f"No history entry producing {ref!r} was found on any configured server. " + _servers_note(servers, unreachable),
+    }
+
+
+def find_graph_in_db(db_path: str, job_id_or_filename: str) -> Dict[str, Any]:
+    """job_uuid/comfy_prompt_id exact match, or filename substring within the stored history
+    JSON. Never raises."""
+    if not Path(db_path).exists():
+        return {"success": False, "error": "No job database found yet at JOB_DB_PATH - nothing has been logged, or JOB_DB_PATH doesn't match generate_image's/run_workflow's valve."}
+    try:
+        conn = job_db_connect(db_path)
+    except Exception as e:
+        return {"success": False, "error": f"Could not open job database at {db_path}: {e}"}
+    try:
+        conn.row_factory = sqlite3.Row
+        text = job_id_or_filename.strip()
+        escaped = _like_escape(text)
+        row = conn.execute(
+            "SELECT j.job_uuid, j.comfy_prompt_id, j.server, j.status, o.raw_json FROM jobs j "
+            "JOIN outputs o ON o.job_uuid = j.job_uuid WHERE j.job_uuid = ? OR j.comfy_prompt_id = ? "
+            "OR EXISTS (SELECT 1 FROM results r WHERE r.job_uuid = j.job_uuid AND r.stage = 'history' "
+            "AND r.raw_json LIKE ? ESCAPE '\\') ORDER BY j.created_at DESC LIMIT 1",
+            (text, text, f"%{escaped}%"),
+        ).fetchone()
+        if not row:
+            return {"success": False, "found": False, "error": f"No job matching {text!r} was found in the database."}
+        try:
+            graph = json.loads(row["raw_json"])
+        except ValueError:
+            return {"success": False, "error": "The stored graph JSON for this job was corrupt."}
+        return {
+            "success": True,
+            "found": True,
+            "graph": graph,
+            "server": row["server"],
+            "comfy_prompt_id": row["comfy_prompt_id"],
+            "status": row["status"],
+            "job_uuid": row["job_uuid"],
+        }
+    except Exception as e:
+        logger.exception("find_graph_in_db query failed")
+        return {"success": False, "error": f"Search failed: {e}"}
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -1521,7 +1687,7 @@ class Tools:
         """
         Retrieve an image rendered earlier on the ComfyUI server, or list recent jobs.
 
-        TOOLKIT: this is one of four related tools, all sharing the same GPU_SERVERS. Use
+        TOOLKIT: this is one of five related tools, all sharing the same GPU_SERVERS. Use
         generate_image for ordinary SDXL renders, or run_workflow for a fully custom graph
         (ControlNet, compositing, etc.); use THIS tool to fetch what either of them produced -
         by job id, by filename, or (with history=<count>) by listing a server's recent jobs when
@@ -1529,7 +1695,9 @@ class Tools:
         queue_only=true. A result's 'server' can be passed as gpu_server to another call. To find
         a job or filename by prompt text, checkpoint, seed, date, or status instead, use
         search_jobs first, then pass its job_uuid/comfy_prompt_id/filename here. For a quick,
-        human-readable browse instead of a single lookup, use list_jobs.
+        human-readable browse instead of a single lookup, use list_jobs. To get the submitted
+        GRAPH itself rather than the rendered image (most useful for run_workflow jobs), use
+        retrieve_graph.
 
         Normal use: give the job id returned by generate_image(queue_only=true), or an image
         filename from the server's output folder. If the image exists it is shown to the user,
@@ -1673,7 +1841,7 @@ class Tools:
         image smaller than full size; click through (or use retrieve_image with a row's UUID or
         filename) to actually see one.
 
-        TOOLKIT: this is one of four related tools sharing GPU_SERVERS. Unlike search_jobs (which
+        TOOLKIT: this is one of five related tools sharing GPU_SERVERS. Unlike search_jobs (which
         returns structured JSON for filtering/chaining), list_jobs returns a ready-to-paste table,
         and needs no arguments at all for the common case - just call it to see the last 10 jobs.
 
@@ -1749,4 +1917,69 @@ class Tools:
             result = {"success": False, "error": f"Unexpected error: {e}"}
 
         await status_cb("Done" if result.get("success") else "Failed", done=True)
+        return result
+
+    async def retrieve_graph(
+        self,
+        job_id_or_filename: str,
+        gpu_server: Optional[str] = None,
+        data_source: Optional[str] = None,
+        __event_emitter__: Optional[Callable[[dict], Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Fetch the exact ComfyUI graph (JSON) that produced a job - the input run_workflow was
+        given, not the rendered image. Most useful for "graph"-mode jobs (made with run_workflow's
+        custom graphs), where the graph is bespoke and worth pulling back up to inspect or
+        resubmit with edits; works for "direct"-mode jobs too, though their fixed graph shape is
+        already documented in generate_image.
+
+        TOOLKIT: this is one of five related tools sharing GPU_SERVERS. Unlike retrieve_image
+        (which fetches and displays the rendered image), this fetches the graph itself. Pass the
+        result's 'graph' straight to run_workflow's workflow argument to resubmit it, optionally
+        edited first.
+
+        :param job_id_or_filename: A job id (this tool's own UUID, or ComfyUI's own prompt id) or
+            an image filename the job produced.
+        :param gpu_server: Omit to search all configured servers (default server first, live mode
+            only - database mode already knows each job's server).
+        :param data_source: Omit for the default: read the graph from a GPU server's own live
+            /history or queue - fails if that job's since rotated out of the server's retention.
+            Pass "database" to read it from the persistent job log instead, which keeps it forever
+            (as long as LOG_TO_SQLITE was on for that job).
+        """
+        v = self.valves
+
+        async def status_cb(text: str, done: bool = False):
+            await _emit(__event_emitter__, {"type": "status", "data": {"description": text, "done": done}})
+
+        ds = None if is_unset(data_source) else data_source.strip()
+        is_database = ds is not None and ds.lower() == "database"
+
+        await status_cb("Looking up the submitted graph...")
+        try:
+            if is_database:
+                found = await asyncio.to_thread(find_graph_in_db, v.JOB_DB_PATH, job_id_or_filename)
+            else:
+                found = await find_graph_live(v, job_id_or_filename, gpu_server, status_cb)
+
+            if not found.get("success"):
+                result = {"success": False, "error": found.get("error") or "not found"}
+            else:
+                graph = found["graph"]
+                result = {
+                    "success": True,
+                    "found": True,
+                    "graph": graph,
+                    "server": found.get("server"),
+                    "comfy_prompt_id": found.get("comfy_prompt_id"),
+                    "status": found.get("status"),
+                    "job_mode": classify_job_mode(graph),
+                    "img_type": extract_parameters(graph).get("mode"),
+                    "note": "This is the exact ComfyUI graph that produced this job. To resubmit it (optionally edited), pass it as run_workflow's workflow argument.",
+                }
+        except Exception as e:  # keep the model from seeing a raw traceback
+            logger.exception("Unexpected error during retrieve_graph")
+            result = {"success": False, "error": f"Unexpected error: {e}"}
+
+        await status_cb("Done" if result.get("success") else "Not found", done=True)
         return result

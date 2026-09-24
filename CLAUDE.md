@@ -22,10 +22,12 @@ Current tools:
   LoRAs), a fixed ComfyUI graph built by the tool itself.
 - `comfy_sdxl_graph.py` → `run_workflow` — accepts a full model-authored ComfyUI API-format graph,
   for anything the fixed graph can't do (ControlNet, compositing, custom node combinations).
-- `comfy_sdxl_retrieve.py` → `retrieve_image`, `search_jobs`, `list_jobs` — fetches a rendered
-  image by job id or filename (or lists a server's recent jobs), searches the shared job history
-  (structured JSON, for filtering/chaining), and browses it as a formatted Markdown table (for
-  showing the user directly — a "librarian" view, not a fetcher).
+- `comfy_sdxl_retrieve.py` → `retrieve_image`, `search_jobs`, `list_jobs`, `retrieve_graph` —
+  fetches a rendered image by job id or filename (or lists a server's recent jobs), searches the
+  shared job history (structured JSON, for filtering/chaining), browses it as a formatted Markdown
+  table (for showing the user directly — a "librarian" view, not a fetcher), and fetches the
+  submitted ComfyUI graph itself for a job (most useful for run_workflow jobs, whose graphs are
+  bespoke — pass it back to run_workflow, optionally edited, to resubmit).
 
 All three files share a `GPU_SERVERS` valve list and a `resolve_server`/`resolve_checkpoint`-style
 matching approach, and are meant to be used together — see each tool's own `TOOLKIT` docstring
