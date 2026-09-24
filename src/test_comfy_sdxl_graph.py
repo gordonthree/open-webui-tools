@@ -409,5 +409,169 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submitted[mod.SOURCE_IMAGE_NODE_ID]["inputs"]["image"], "earlier.png [output]")
 
 
+class WorkflowTemplateTests(unittest.IsolatedAsyncioTestCase):
+    """save_workflow/list_workflows/get_workflow/delete_workflow, and run_workflow(workflow_id=...)."""
+
+    def setUp(self):
+        mod.POLL_INTERVAL_SECONDS = 0
+        mod._job_db_schema_ready.clear()
+        mod._placeholder_ready.clear()
+        self.tool = mod.Tools()
+        self.tool.valves.SHOW_PROGRESS = False
+        self.tool.valves.UPLOAD_TO_OPEN_WEBUI = False
+        self.tool.valves.GPU_SERVERS = ["http://gpu:8188"]
+        self.tool.valves.DEFAULT_GPU_SERVER = "http://gpu:8188"
+        self.tmpdir = tempfile.mkdtemp()
+        self.tool.valves.JOB_DB_PATH = str(Path(self.tmpdir) / "jobs.sqlite3")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        mod._job_db_schema_ready.clear()
+
+    async def _save(self, name="my_template", placeholders=None, tags=None, overwrite=False, graph=None):
+        return await self.tool.save_workflow(
+            name=name,
+            workflow=json.dumps(graph if graph is not None else MINIMAL_GRAPH),
+            description="A minimal test graph.",
+            placeholders=json.dumps(placeholders) if placeholders is not None else None,
+            tags=tags,
+            overwrite=overwrite,
+        )
+
+    async def test_save_and_get_workflow_roundtrip(self):
+        res = await self._save(placeholders={"positive_prompt": ["10", "text"], "seed": ["12", "seed"]}, tags="controlnet, Pose")
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["name"], "my_template")
+        self.assertEqual(res["version"], 1)
+        self.assertEqual(res["tags"], ["controlnet", "pose"])
+
+        got = await self.tool.get_workflow("my_template")
+        self.assertTrue(got["success"], got)
+        self.assertEqual(got["version"], 1)
+        self.assertEqual(got["placeholders"]["positive_prompt"], ["10", "text"])
+        self.assertEqual(got["workflow"]["10"]["inputs"]["text"], "cat")
+        self.assertEqual(set(got["workflow"].keys()), set(MINIMAL_GRAPH.keys()))
+
+    async def test_save_rejects_duplicate_without_overwrite(self):
+        await self._save()
+        res = await self._save()
+        self.assertFalse(res["success"])
+        self.assertIn("overwrite", res["error"])
+
+    async def test_save_overwrite_bumps_version_and_keeps_created_at(self):
+        await self._save()
+        first = await self.tool.get_workflow("my_template")
+        res = await self._save(overwrite=True)
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["version"], 2)
+        second = await self.tool.get_workflow("my_template")
+        self.assertEqual(second["version"], 2)
+        self.assertLessEqual(first["updated_at"], second["updated_at"])
+
+    async def test_save_rejects_invalid_name(self):
+        res = await self._save(name="Not A Valid Slug!")
+        self.assertFalse(res["success"])
+        self.assertIn("Invalid workflow template name", res["error"])
+
+    async def test_save_rejects_missing_save_image(self):
+        graph = fresh_graph()
+        del graph["7"]
+        res = await self._save(graph=graph)
+        self.assertFalse(res["success"])
+        self.assertIn("SaveImage", res["error"])
+
+    async def test_save_rejects_placeholder_pointing_at_a_link(self):
+        # "positive" on the KSampler node is wired to another node's output, not a literal value.
+        res = await self._save(placeholders={"positive_prompt": ["12", "positive"]})
+        self.assertFalse(res["success"])
+        self.assertIn("wired to another node", res["error"])
+
+    async def test_save_rejects_placeholder_on_unknown_node(self):
+        res = await self._save(placeholders={"seed": ["999", "seed"]})
+        self.assertFalse(res["success"])
+        self.assertIn("999", res["error"])
+
+    async def test_list_workflows_filters_by_tag_and_search(self):
+        await self._save(name="pose_a", tags="controlnet,pose")
+        await self._save(name="upscale_b", tags="upscale")
+        by_tag = await self.tool.list_workflows(tag="controlnet")
+        self.assertEqual(by_tag["count"], 1)
+        self.assertIn("pose_a", by_tag["table"])
+        by_search = await self.tool.list_workflows(search="upscale")
+        self.assertEqual(by_search["count"], 1)
+        self.assertIn("upscale_b", by_search["table"])
+        none_found = await self.tool.list_workflows(tag="nonexistent")
+        self.assertEqual(none_found["count"], 0)
+
+    async def test_list_workflows_empty_db_is_a_clean_message(self):
+        res = await self.tool.list_workflows()
+        self.assertEqual(res["count"], 0)
+        self.assertIn("No workflow templates", res["table"])
+
+    async def test_get_and_delete_not_found(self):
+        got = await self.tool.get_workflow("nope")
+        self.assertFalse(got["success"])
+        deleted = await self.tool.delete_workflow("nope")
+        self.assertFalse(deleted["success"])
+
+    async def test_delete_removes_template(self):
+        await self._save()
+        res = await self.tool.delete_workflow("my_template")
+        self.assertTrue(res["success"], res)
+        self.assertFalse((await self.tool.get_workflow("my_template"))["success"])
+
+    async def test_run_workflow_with_workflow_id_and_overrides(self):
+        await self._save(placeholders={"positive_prompt": ["10", "text"], "seed": ["12", "seed"]})
+        fake = FakeComfy(checkpoints=["epicrealismXL_pureFix.safetensors"])
+        with patch.object(mod, "requests", fake):
+            res = await self.tool.run_workflow(
+                workflow_id="my_template",
+                overrides=json.dumps({"positive_prompt": "a dragon", "seed": 999}),
+            )
+        self.assertTrue(res["success"], res)
+        submitted = fake.submitted[0]
+        self.assertEqual(submitted["10"]["inputs"]["text"], "a dragon")
+        self.assertEqual(submitted["12"]["inputs"]["seed"], 999)
+        self.assertEqual(submitted["11"]["inputs"]["text"], "dog")  # untouched
+
+        # the job DB's `inputs` row records the small reference, not the full graph
+        conn = sqlite3.connect(self.tool.valves.JOB_DB_PATH)
+        try:
+            raw = conn.execute("SELECT raw_json FROM inputs").fetchone()[0]
+        finally:
+            conn.close()
+        recorded = json.loads(raw)
+        self.assertEqual(recorded["workflow_id"], "my_template")
+        self.assertNotIn("workflow", recorded)
+        self.assertNotIn("CheckpointLoaderSimple", raw)
+
+    async def test_run_workflow_requires_exactly_one_of_workflow_or_workflow_id(self):
+        with patch.object(mod, "requests", FakeComfy()):
+            both = await self.tool.run_workflow(workflow=json.dumps(MINIMAL_GRAPH), workflow_id="x")
+            neither = await self.tool.run_workflow()
+        self.assertFalse(both["success"])
+        self.assertFalse(neither["success"])
+        self.assertIn("exactly one", both["error"])
+
+    async def test_run_workflow_unknown_workflow_id_is_a_clean_error(self):
+        with patch.object(mod, "requests", FakeComfy()):
+            res = await self.tool.run_workflow(workflow_id="does_not_exist")
+        self.assertFalse(res["success"])
+        self.assertIn("does_not_exist", res["error"])
+
+    async def test_run_workflow_unknown_override_key_is_a_clean_error(self):
+        await self._save(placeholders={"seed": ["12", "seed"]})
+        with patch.object(mod, "requests", FakeComfy(checkpoints=["epicrealismXL_pureFix.safetensors"])):
+            res = await self.tool.run_workflow(workflow_id="my_template", overrides=json.dumps({"cfg": 9}))
+        self.assertFalse(res["success"])
+        self.assertIn("cfg", res["error"])
+
+    async def test_run_workflow_overrides_without_workflow_id_is_a_clean_error(self):
+        with patch.object(mod, "requests", FakeComfy()):
+            res = await self.tool.run_workflow(workflow=json.dumps(MINIMAL_GRAPH), overrides=json.dumps({"seed": 1}))
+        self.assertFalse(res["success"])
+        self.assertIn("overrides", res["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

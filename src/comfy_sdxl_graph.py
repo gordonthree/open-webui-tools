@@ -1,11 +1,14 @@
 """
 title: ComfyUI SDXL Graph
 author: Gordon
-version: 1.0.0
+version: 1.1.0
 description: Companion to ComfyUI SDXL Direct. Submits a full, model-authored ComfyUI API-format
     workflow graph (ControlNet, compositing, anything the fixed generate_image graph can't reach).
     Requires a SaveImage node so an image is guaranteed to land in the server's output folder, and
     always makes a fixed-id LoadImageOutput node available in the graph for optional image injection.
+    Also lets a graph be saved as a named, reusable template (save_workflow/list_workflows/
+    get_workflow/delete_workflow) in the shared job database, so run_workflow can be called again
+    with workflow_id=<name> instead of resending the full graph JSON every time.
 """
 
 import asyncio
@@ -187,6 +190,26 @@ CREATE INDEX IF NOT EXISTS idx_node_params_lookup ON node_params(class_type, par
 """
 PROMPTS_FTS_SCHEMA = "CREATE VIRTUAL TABLE IF NOT EXISTS prompts_fts USING fts5(job_uuid UNINDEXED, positive_prompt, negative_prompt);"
 
+# Reusable named workflow graphs, keyed by a model-chosen slug (see "Workflow templates" section
+# below). Same database file as the jobs tables, but a template is not a job - it has no job_uuid
+# and isn't touched by the jobs/inputs/outputs/results/errors lifecycle above. This is the only one
+# of the three tool files that reads/writes this table; it exists so a model can call
+# run_workflow(workflow_id=...) instead of resending a full graph as JSON on every call.
+WORKFLOW_TEMPLATES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS workflow_templates (
+    name TEXT PRIMARY KEY,
+    description TEXT NOT NULL,
+    graph_json TEXT NOT NULL,
+    placeholders_json TEXT NOT NULL DEFAULT '{}',
+    tags TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    created_by TEXT,
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_templates_tags ON workflow_templates(tags);
+"""
+
 JOB_DB_BUSY_TIMEOUT_S = 5.0
 _job_db_schema_ready: set = set()  # db_path values confirmed (this process) to have the schema
 
@@ -200,6 +223,7 @@ def job_db_connect(db_path: str):
     conn.execute("PRAGMA journal_mode=WAL;")
     if db_path not in _job_db_schema_ready:
         conn.executescript(JOB_DB_SCHEMA)
+        conn.executescript(WORKFLOW_TEMPLATES_SCHEMA)
         try:
             conn.execute(PROMPTS_FTS_SCHEMA)
         except Exception:  # sqlite3.OperationalError if this build lacks FTS5; search falls back to LIKE
@@ -365,6 +389,91 @@ def record_job_failed(db_path: str, job_uuid: str, stage: str, message: str, raw
 
 
 # --------------------------------------------------------------------------- #
+# Workflow templates - save a model-authored graph once, reuse it by name.
+# Unlike the jobs tables above, a template is mutable (overwrite bumps `version`
+# in place) rather than an append-only log: past jobs that used it already have
+# their exact submitted graph preserved verbatim in `outputs`, so nothing about
+# provenance depends on keeping old template revisions around too.
+# --------------------------------------------------------------------------- #
+
+def save_workflow_template(
+    db_path: str,
+    name: str,
+    description: str,
+    graph: Dict[str, Any],
+    placeholders: Dict[str, List[str]],
+    tags: str,
+    created_by: str,
+) -> int:
+    """Insert or overwrite a template by name. Returns the resulting version number."""
+    conn = job_db_connect(db_path)
+    try:
+        now = _now_iso()
+        row = conn.execute("SELECT version, created_at FROM workflow_templates WHERE name = ?", (name,)).fetchone()
+        version = (row[0] + 1) if row else 1
+        created_at = row[1] if row else now
+        conn.execute(
+            "INSERT INTO workflow_templates "
+            "(name, description, graph_json, placeholders_json, tags, created_at, updated_at, created_by, version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET description=excluded.description, graph_json=excluded.graph_json, "
+            "placeholders_json=excluded.placeholders_json, tags=excluded.tags, updated_at=excluded.updated_at, "
+            "created_by=excluded.created_by, version=excluded.version",
+            (
+                name, description, json.dumps(graph, default=str), json.dumps(placeholders, default=str),
+                tags, created_at, now, created_by, version,
+            ),
+        )
+        conn.commit()
+        return version
+    finally:
+        conn.close()
+
+
+def load_workflow_template(db_path: str, name: str) -> Optional[Any]:
+    import sqlite3
+
+    conn = job_db_connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        return conn.execute("SELECT * FROM workflow_templates WHERE name = ?", (name,)).fetchone()
+    finally:
+        conn.close()
+
+
+def list_workflow_templates(db_path: str, tag: Optional[str] = None, search: Optional[str] = None, limit: int = 20) -> List[Any]:
+    import sqlite3
+
+    conn = job_db_connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        query = "SELECT name, description, tags, version, updated_at FROM workflow_templates WHERE 1=1"
+        params: List[Any] = []
+        if not is_unset(tag):
+            query += " AND (',' || tags || ',') LIKE ? ESCAPE '\\'"
+            params.append(f"%,{_like_escape(tag.strip().lower())},%")
+        if not is_unset(search):
+            query += " AND (name LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\')"
+            like = f"%{_like_escape(search)}%"
+            params += [like, like]
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        return conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+
+def delete_workflow_template(db_path: str, name: str) -> bool:
+    conn = job_db_connect(db_path)
+    try:
+        cur = conn.execute("DELETE FROM workflow_templates WHERE name = ?", (name,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
 # Small pure helpers
 # --------------------------------------------------------------------------- #
 
@@ -372,10 +481,70 @@ _UNSET_STRINGS = {"", "default", "auto", "none", "null", "undefined", "n/a"}
 _ANNOTATION_RE = re.compile(r"\s*\[(\w+)\]\s*$")
 _CKPT_LOADER_CLASSES = ("CheckpointLoaderSimple", "CheckpointLoader", "unCLIPCheckpointLoader")
 _CKPT_EXT_RE = re.compile(r"\.(safetensors|ckpt|pt|pth|bin|sft)$", re.I)
+_TEMPLATE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
 
 
 def is_unset(value: Any) -> bool:
     return value is None or (isinstance(value, str) and value.strip().lower() in _UNSET_STRINGS)
+
+
+def _like_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "\N{HORIZONTAL ELLIPSIS}"
+
+
+def validate_template_name(name: str) -> str:
+    normalized = (name or "").strip().lower()
+    if not _TEMPLATE_NAME_RE.match(normalized):
+        raise ValueError(
+            f"Invalid workflow template name {name!r}: use 2-64 lowercase letters, digits, "
+            "underscores or hyphens, starting with a letter or digit."
+        )
+    return normalized
+
+
+def validate_placeholders(graph: Dict[str, Any], placeholders: Dict[str, Any]) -> Dict[str, List[str]]:
+    """
+    placeholders: {param_name: [node_id, input_name]}. Every entry must point at a literal
+    (non-link) input that actually exists in this graph - the same shape apply_overrides() later
+    relies on to safely mutate a copy of the stored graph. Returns a normalized copy (string ids).
+    """
+    normalized: Dict[str, List[str]] = {}
+    for param_name, loc in placeholders.items():
+        if not (isinstance(loc, (list, tuple)) and len(loc) == 2):
+            raise ValueError(f"placeholders[{param_name!r}] must be a [node_id, input_name] pair.")
+        node_id, input_name = str(loc[0]), str(loc[1])
+        node = graph.get(node_id)
+        if node is None:
+            raise ValueError(f"placeholders[{param_name!r}] refers to node {node_id!r}, which isn't in this graph.")
+        inputs = node.get("inputs") or {}
+        if input_name not in inputs:
+            raise ValueError(f"placeholders[{param_name!r}] refers to input {input_name!r} on node {node_id!r}, which has no such input.")
+        if isinstance(inputs[input_name], list):
+            raise ValueError(f"placeholders[{param_name!r}] points at {node_id}.{input_name}, which is wired to another node's output, not a literal value.")
+        normalized[str(param_name)] = [node_id, input_name]
+    return normalized
+
+
+def apply_overrides(graph: Dict[str, Any], placeholders: Dict[str, List[str]], overrides: Dict[str, Any]) -> None:
+    """Mutates graph in place, setting each override's literal value at its registered placeholder."""
+    unknown = [k for k in overrides if k not in placeholders]
+    if unknown:
+        available = sorted(placeholders.keys()) or ["(this template has no overridable parameters)"]
+        raise ValueError(f"Unknown override(s) {unknown} for this template; available parameters are: {available}.")
+    for param_name, value in overrides.items():
+        node_id, input_name = placeholders[param_name]
+        node = graph.get(node_id)
+        if node is None or input_name not in (node.get("inputs") or {}):
+            raise ValueError(
+                f"Stored placeholder for {param_name!r} ({node_id}.{input_name}) no longer matches this "
+                "template's graph; re-save it with save_workflow."
+            )
+        node["inputs"][input_name] = value
 
 
 def resolve_server(
@@ -542,6 +711,21 @@ def parse_workflow(workflow: Any) -> Dict[str, Any]:
     return graph
 
 
+def validate_graph_shape(graph: Dict[str, Any]) -> None:
+    """The two structural checks every graph needs, whether it's about to be submitted
+    (prepare_graph) or saved as a template (save_workflow) for later reuse."""
+    if SOURCE_IMAGE_NODE_ID in graph:
+        raise ValueError(
+            f"Node id {SOURCE_IMAGE_NODE_ID!r} is reserved by this tool for the fixed source-image "
+            "node; use a different id for your own nodes."
+        )
+    if not any(n.get("class_type") == "SaveImage" for n in graph.values()):
+        raise ValueError(
+            "The graph has no SaveImage node, so nothing would land in the server's output folder. "
+            "Add a SaveImage node fed from your final IMAGE output."
+        )
+
+
 def prepare_graph(
     graph: Dict[str, Any], filename_prefix: str, source_image_ref: Optional[str]
 ) -> "tuple[Dict[str, Any], bool]":
@@ -549,18 +733,8 @@ def prepare_graph(
     Validate the graph and inject the fixed source-image node. Returns (graph, needs_placeholder).
     Raises ValueError for anything the model needs to fix before submission.
     """
-    if SOURCE_IMAGE_NODE_ID in graph:
-        raise ValueError(
-            f"Node id {SOURCE_IMAGE_NODE_ID!r} is reserved by this tool for the fixed source-image "
-            "node; use a different id for your own nodes."
-        )
-
+    validate_graph_shape(graph)
     save_nodes = [n for n in graph.values() if n.get("class_type") == "SaveImage"]
-    if not save_nodes:
-        raise ValueError(
-            "The graph has no SaveImage node, so nothing would land in the server's output folder. "
-            "Add a SaveImage node fed from your final IMAGE output."
-        )
     for node in save_nodes:
         node["inputs"].setdefault("filename_prefix", filename_prefix)
 
@@ -952,9 +1126,145 @@ class Tools:
         self.valves = self.Valves()
         self.citation = False
 
+    async def save_workflow(
+        self,
+        name: str,
+        workflow: str,
+        description: str,
+        placeholders: Optional[str] = None,
+        tags: Optional[str] = None,
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Save a ComfyUI workflow graph as a named, reusable template in the shared job database -
+        not in this chat's context. Once saved, run_workflow(workflow_id=<name>, ...) renders with
+        it without ever resending the graph JSON again. Save AFTER a run_workflow(workflow=...)
+        call has actually rendered successfully with this exact graph - don't save something
+        untested.
+
+        :param name: A short slug (2-64 chars: lowercase letters, digits, underscore, hyphen), e.g. "controlnet_openpose_sdxl". This becomes run_workflow's workflow_id.
+        :param workflow: The ComfyUI API-format graph as a JSON string - the same shape run_workflow's own `workflow` argument takes (no reserved source-image node; that's injected automatically at render time, same as always).
+        :param description: One or two plain-language sentences: what this graph does and when to use it. This is what list_workflows shows, so write it for a model deciding whether to reuse this template, not for yourself.
+        :param placeholders: Optional JSON object mapping a parameter name you choose (e.g. "positive_prompt", "seed", "denoise", "controlnet_strength") to [node_id, input_name] - the literal (non-link) input in this graph that parameter should overwrite. This is what makes run_workflow's `overrides` argument work later without resending the graph. Omit for a template with no adjustable parameters.
+        :param tags: Optional comma-separated tags (e.g. "controlnet,pose") to help list_workflows filtering.
+        :param overwrite: Must be true to replace an existing template with this name; otherwise a name collision is an error, to avoid silently clobbering someone else's saved graph.
+        """
+        try:
+            tname = validate_template_name(name)
+            graph = parse_workflow(workflow)
+            validate_graph_shape(graph)
+
+            placeholders_dict: Dict[str, Any] = {}
+            if not is_unset(placeholders):
+                try:
+                    placeholders_dict = json.loads(placeholders) if isinstance(placeholders, str) else placeholders
+                except ValueError as e:
+                    raise ValueError(f"placeholders is not valid JSON: {e}") from e
+                if not isinstance(placeholders_dict, dict):
+                    raise ValueError("placeholders must be a JSON object of parameter name -> [node_id, input_name].")
+            normalized_placeholders = validate_placeholders(graph, placeholders_dict)
+
+            if not description or not description.strip():
+                raise ValueError("description is required - it's how a model finds this template later without reading its JSON.")
+
+            tag_list = sorted({t.strip().lower() for t in (tags or "").split(",") if t.strip()})
+
+            existing = await asyncio.to_thread(load_workflow_template, self.valves.JOB_DB_PATH, tname)
+            if existing and not overwrite:
+                return {
+                    "success": False,
+                    "error": f"A template named {tname!r} already exists (version {existing['version']}: {existing['description']!r}). "
+                    "Pass overwrite=true to replace it, or choose a different name.",
+                }
+
+            version = await asyncio.to_thread(
+                save_workflow_template, self.valves.JOB_DB_PATH, tname, description.strip(), graph,
+                normalized_placeholders, ",".join(tag_list), "save_workflow",
+            )
+        except (ValueError, json.JSONDecodeError) as e:
+            return {"success": False, "error": str(e)}
+
+        return {
+            "success": True,
+            "name": tname,
+            "version": version,
+            "description": description.strip(),
+            "placeholders": normalized_placeholders,
+            "tags": tag_list,
+            "note": f"Saved. Render it with run_workflow(workflow_id={tname!r}, overrides=...) instead of resending this JSON.",
+        }
+
+    async def list_workflows(self, tag: Optional[str] = None, search: Optional[str] = None, limit: int = 20) -> Dict[str, Any]:
+        """
+        Browse saved workflow templates as a Markdown table (name, version, tags, description) -
+        find a reusable graph by what it does, without ever reading its JSON. Call get_workflow if
+        you actually need the full graph back (e.g. to inspect or build a variant); to just render
+        with one, pass its name straight to run_workflow's workflow_id.
+
+        :param tag: Optional. Only templates whose tags include this one, exactly.
+        :param search: Optional. Substring match over name and description.
+        :param limit: Maximum rows returned, default 20.
+        """
+        rows = await asyncio.to_thread(list_workflow_templates, self.valves.JOB_DB_PATH, tag, search, limit)
+        if not rows:
+            return {
+                "success": True,
+                "count": 0,
+                "table": "No saved workflow templates matched." if (tag or search) else "No workflow templates saved yet.",
+            }
+        lines = ["| Name | Version | Tags | Description |", "|---|---|---|---|"]
+        for r in rows:
+            lines.append(f"| {r['name']} | {r['version']} | {r['tags'] or ''} | {_truncate(r['description'], 140)} |")
+        return {"success": True, "count": len(rows), "table": "\n".join(lines)}
+
+    async def get_workflow(self, name: str) -> Dict[str, Any]:
+        """
+        Fetch a saved template's full graph JSON, placeholders, tags and description. Only call
+        this when you actually need the graph itself back - to inspect it or build an edited
+        variant. To just render with an existing template, pass its name as run_workflow's
+        workflow_id instead; that path never needs the JSON back in this chat.
+
+        :param name: The template's name, as shown by list_workflows.
+        """
+        try:
+            tname = validate_template_name(name)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+        row = await asyncio.to_thread(load_workflow_template, self.valves.JOB_DB_PATH, tname)
+        if not row:
+            return {"success": False, "error": f"No template named {tname!r}. Use list_workflows to see what's saved."}
+        return {
+            "success": True,
+            "name": row["name"],
+            "version": row["version"],
+            "description": row["description"],
+            "tags": [t for t in (row["tags"] or "").split(",") if t],
+            "placeholders": json.loads(row["placeholders_json"] or "{}"),
+            "workflow": json.loads(row["graph_json"]),
+            "updated_at": row["updated_at"],
+        }
+
+    async def delete_workflow(self, name: str) -> Dict[str, Any]:
+        """
+        Permanently remove a saved workflow template. Does not affect past renders that used it -
+        their exact submitted graph is preserved verbatim in the job database regardless.
+
+        :param name: The template's name, as shown by list_workflows.
+        """
+        try:
+            tname = validate_template_name(name)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+        removed = await asyncio.to_thread(delete_workflow_template, self.valves.JOB_DB_PATH, tname)
+        if not removed:
+            return {"success": False, "error": f"No template named {tname!r}."}
+        return {"success": True, "name": tname, "note": "Deleted."}
+
     async def run_workflow(
         self,
-        workflow: str,
+        workflow: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        overrides: Optional[str] = None,
         source_image: Optional[str] = None,
         source_server: Optional[str] = None,
         gpu_server: Optional[str] = None,
@@ -969,6 +1279,14 @@ class Tools:
         graph can't reach - ControlNet, IP-Adapter, upscaling, compositing, multi-stage pipelines,
         or any other node combination. You build the whole graph, including your own checkpoint
         loader, samplers, and conditioning.
+
+        Pass exactly one of `workflow` (a raw graph, for a new or one-off design) or `workflow_id`
+        (a name from list_workflows / save_workflow, to reuse a graph already proven to work,
+        without resending its JSON). With `workflow_id`, `overrides` lets you change whichever
+        parameters that template registered placeholders for - e.g.
+        overrides='{"positive_prompt": "...", "seed": 12345}' - without touching the rest of the
+        graph. Once a graph is working, call save_workflow to keep using it this cheaply instead of
+        rebuilding or resending it every time.
 
         TOOLKIT: this is one of three related tools, all sharing the same GPU_SERVERS. Prefer
         generate_image for ordinary SDXL renders (txt2img/img2img, LoRAs) - it's simpler and
@@ -992,7 +1310,9 @@ class Tools:
         list the same way generate_image does (exact, case/path-insensitive, or a unique match by
         filename), so folder or naming differences between servers don't need to be hard-coded.
 
-        :param workflow: The ComfyUI API-format graph as a JSON string.
+        :param workflow: The ComfyUI API-format graph as a JSON string. Omit if using workflow_id instead.
+        :param workflow_id: The name of a template saved with save_workflow, in place of `workflow`. See list_workflows/get_workflow.
+        :param overrides: Only with workflow_id. JSON object of parameter name -> new literal value, for whichever placeholders that template registered (see get_workflow's `placeholders`).
         :param source_image: Optional. A filename in the target server's output folder (e.g. an earlier generate_image or run_workflow result's 'use_as_source_image') to feed into the fixed LoadImageOutput node. Omit to leave that node pointed at the placeholder.
         :param source_server: Only needed when source_image lives on a DIFFERENT server than gpu_server; set it to the server the source image is on and the file is copied across first.
         :param gpu_server: Omit to use the default server. Otherwise a configured server, or (if allowed) any ComfyUI address.
@@ -1011,7 +1331,32 @@ class Tools:
             source_image = None if is_unset(source_image) else source_image.strip()
             source_server = None if is_unset(source_server) else source_server.strip()
 
-            graph = parse_workflow(workflow)
+            if is_unset(workflow) == is_unset(workflow_id):
+                raise ValueError("Pass exactly one of workflow (raw graph JSON) or workflow_id (a saved template's name).")
+
+            template_placeholders: Dict[str, List[str]] = {}
+            if not is_unset(workflow_id):
+                tname = validate_template_name(workflow_id)
+                template_row = await asyncio.to_thread(load_workflow_template, v.JOB_DB_PATH, tname)
+                if not template_row:
+                    raise ValueError(f"No saved workflow template named {tname!r}. Use list_workflows to see what's available.")
+                graph = json.loads(template_row["graph_json"])
+                template_placeholders = json.loads(template_row["placeholders_json"] or "{}")
+            else:
+                tname = None
+                graph = parse_workflow(workflow)
+
+            if not is_unset(overrides):
+                try:
+                    overrides_dict = json.loads(overrides) if isinstance(overrides, str) else overrides
+                except ValueError as e:
+                    raise ValueError(f"overrides is not valid JSON: {e}") from e
+                if not isinstance(overrides_dict, dict):
+                    raise ValueError("overrides must be a JSON object of parameter name -> value.")
+                if tname is None:
+                    raise ValueError("overrides only applies with workflow_id; edit a raw `workflow` graph directly instead.")
+                apply_overrides(graph, template_placeholders, overrides_dict)
+
             graph, needs_placeholder = prepare_graph(graph, v.FILENAME_PREFIX, source_image)
 
             client = ComfyClient(server, v.REQUEST_TIMEOUT_SECONDS)
@@ -1042,7 +1387,9 @@ class Tools:
             if job_uuid:
                 positive_prompt, negative_prompt = extract_prompts(graph)
                 input_json = {
-                    "tool": "run_workflow", "workflow": workflow, "source_image": source_image,
+                    "tool": "run_workflow",
+                    **({"workflow_id": tname, "overrides": overrides} if tname is not None else {"workflow": workflow}),
+                    "source_image": source_image,
                     "source_server": source_server, "gpu_server": gpu_server, "queue_only": queue_only,
                 }
                 await asyncio.to_thread(

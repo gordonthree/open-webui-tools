@@ -17,7 +17,10 @@ Current tools:
 - `comfy_sdxl_direct.py` → `generate_image` — the primary SDXL render tool (txt2img/img2img,
   LoRAs), a fixed ComfyUI graph built by the tool itself.
 - `comfy_sdxl_graph.py` → `run_workflow` — accepts a full model-authored ComfyUI API-format graph,
-  for anything the fixed graph can't do (ControlNet, compositing, custom node combinations).
+  for anything the fixed graph can't do (ControlNet, compositing, custom node combinations). Also
+  `save_workflow`/`list_workflows`/`get_workflow`/`delete_workflow` — once a graph works, save it
+  as a named template in the shared job database so later calls pass `workflow_id=<name>` (plus
+  small `overrides`) instead of resending the full graph JSON every time.
 - `comfy_sdxl_retrieve.py` → `retrieve_image`, `search_jobs`, `list_jobs`, `retrieve_graph` —
   fetches a rendered image by job id or filename (or lists a server's recent jobs), searches the
   shared job history (structured JSON, for filtering/chaining), browses it as a formatted Markdown
@@ -63,13 +66,46 @@ complete detail, e.g. exact sampler/scheduler name lists).
 
 | Argument | Expected value |
 |---|---|
-| `workflow` | Required. A ComfyUI API-format graph, as a JSON string (node-specific fields aren't listed here — see the tool's own docstring) |
+| `workflow` | A ComfyUI API-format graph, as a JSON string. Pass exactly one of `workflow` or `workflow_id` |
+| `workflow_id` | The name of a template saved with `save_workflow`, instead of resending `workflow` |
+| `overrides` | Only with `workflow_id`. JSON object of parameter name → new literal value, for that template's registered placeholders, e.g. `{"positive_prompt": "...", "seed": 12345}` |
 | `source_image` | Omit to leave the fixed source-image node pointed at a placeholder; otherwise an earlier result's `use_as_source_image` value |
 | `source_server` | Omit unless `source_image` is on a different server than `gpu_server` |
 | `gpu_server` | Omit for the default server |
 | `return_img_url` | Boolean, default `false` |
 | `queue_only` | Boolean, default `false` |
 | `verbose` | Boolean, default `false` — also return the prepared graph and server history |
+
+### `save_workflow` (comfy_sdxl_graph.py)
+
+| Argument | Expected value |
+|---|---|
+| `name` | Required. A slug (lowercase letters/digits/underscore/hyphen, 2–64 chars) — becomes `run_workflow`'s `workflow_id` |
+| `workflow` | Required. The ComfyUI API-format graph as a JSON string, already proven to render via `run_workflow` |
+| `description` | Required. What the graph does and when to use it — shown by `list_workflows`, not the JSON itself |
+| `placeholders` | Omit for none; otherwise a JSON object of parameter name → `[node_id, input_name]`, pointing at a literal (non-link) input in the graph |
+| `tags` | Omit for none; otherwise comma-separated, e.g. `"controlnet,pose"` |
+| `overwrite` | Boolean, default `false` — must be `true` to replace an existing name |
+
+### `list_workflows` (comfy_sdxl_graph.py)
+
+| Argument | Expected value |
+|---|---|
+| `tag` | Omit for all; otherwise an exact tag |
+| `search` | Omit for all; otherwise a substring match over name and description |
+| `limit` | Integer, default `20` |
+
+### `get_workflow` (comfy_sdxl_graph.py)
+
+| Argument | Expected value |
+|---|---|
+| `name` | Required. The template's name, as shown by `list_workflows` |
+
+### `delete_workflow` (comfy_sdxl_graph.py)
+
+| Argument | Expected value |
+|---|---|
+| `name` | Required. The template's name, as shown by `list_workflows` |
 
 ### `retrieve_image` (comfy_sdxl_retrieve.py)
 
@@ -118,8 +154,10 @@ complete detail, e.g. exact sampler/scheduler name lists).
 
 Every render attempt across all three tools — including ones ComfyUI rejected or that timed
 out — is durably logged to a **shared SQLite database** (one file, `JOB_DB_PATH`, identical across
-all three tools' valves). Full schema, design rationale, and current status:
-`src/SQLITE_JOB_DB_HANDOFF.md`. Read that file before touching job-DB code.
+all three tools' valves). The same file also holds `workflow_templates` (saved graphs for
+`run_workflow`'s `workflow_id`, see above) — a separate, mutable table, not part of the append-only
+job log. Full schema, design rationale, and current status: `src/SQLITE_JOB_DB_HANDOFF.md`. Read
+that file before touching job-DB code.
 
 The tools create this database's schema lazily and automatically on first write, so nothing needs
 to be run ahead of time. `python scripts/init_job_db.py <path>` exists anyway, as a standalone,
@@ -165,6 +203,33 @@ re-importing through the OWUI web UI. It reads connection details and per-tool i
 `python scripts/push_tool.py <tool_name|all> [--dry-run]`.
 
 ## Status notes
+
+### 2026-09-24
+Added a workflow-template store to `comfy_sdxl_graph.py`, closing a gap in `run_workflow`: a model
+had to resend a full graph as JSON on every single call, even to reuse one that already worked,
+which fills up chat context fast. New methods `save_workflow`, `list_workflows`, `get_workflow`,
+`delete_workflow`, storing graphs in a new `workflow_templates` table in the same shared SQLite
+database (`JOB_DB_PATH`). `run_workflow` now takes `workflow_id` as an alternative to `workflow`,
+plus `overrides` (a small JSON object) to change whichever parameters that template registered
+`placeholders` for — `[node_id, input_name]` pointing at a literal (non-link) input. A job run this
+way records `{"workflow_id": ..., "overrides": ...}` in the job DB's `inputs` table instead of the
+full graph (the full *prepared* graph is still recorded verbatim in `outputs`, as always, so
+provenance is unaffected). Bumped `comfy_sdxl_graph.py` to 1.1.0. 17 new tests in
+`test_comfy_sdxl_graph.py`'s `WorkflowTemplateTests`; full three-file suite still green (152 tests).
+
+Intended workflow: a "workflow builder" agent (a separate OWUI model/system-prompt, not yet built)
+iterates with `run_workflow(workflow=...)` on a raw graph until it renders correctly, then calls
+`save_workflow` once to name it. From then on, itself or any other agent renders with it via
+`workflow_id` alone — no JSON in the conversation at all unless `get_workflow` is explicitly called
+to inspect or edit one.
+
+Deliberately lean, matching this project's existing hobby-scale ethos (see
+`src/SQLITE_JOB_DB_HANDOFF.md`'s "Decisions made along the way"): templates are mutable in place
+(`overwrite=true` bumps `version`, no separate revision-history table) rather than an append-only
+log — an old version isn't needed for provenance, since any job that ever used it already has its
+exact submitted graph preserved verbatim in `outputs`. `retrieve_graph` (in
+`comfy_sdxl_retrieve.py`) is unchanged and still only reads *job* graphs, not templates; browsing
+templates from that tool too is possible future work, not done here.
 
 ### 2026-09-23
 First time this project's actual content (all three tools, their tests, and the job-DB handoff

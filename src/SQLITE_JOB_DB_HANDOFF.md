@@ -269,6 +269,17 @@ This was explicitly scoped as **lean, not exhaustive** — the project owner sai
 plan for every edge case we'll end up with a huge project that needs a team to support it... I'm
 fine if things get messy from time to time, this is a hobby project." Don't over-build this.
 
+## Workflow templates (added 2026-09-24, `comfy_sdxl_graph.py` only)
+
+A second, unrelated table in the same database file: `workflow_templates` (`name` PK, `description`,
+`graph_json`, `placeholders_json`, `tags`, `created_at`, `updated_at`, `created_by`, `version`).
+Not part of the jobs lifecycle above — no `job_uuid`, mutable in place rather than append-only
+(saving over an existing name bumps `version`; no revision history is kept, since a job that used a
+given version already has its exact graph in `outputs` regardless). Lets `run_workflow` take
+`workflow_id=<name>` instead of a full `workflow` JSON string, so a model doesn't have to resend a
+proven graph's JSON on every call. See README.md's 2026-09-24 status note for the full design and
+`save_workflow`/`list_workflows`/`get_workflow`/`delete_workflow` argument reference.
+
 ## What's left to do
 
 Nothing from the original job-DB scope. Possible future work, not currently planned:
