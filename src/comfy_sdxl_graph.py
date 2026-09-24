@@ -1,14 +1,16 @@
 """
 title: ComfyUI SDXL Graph
 author: Gordon
-version: 1.1.0
+version: 1.2.0
 description: Companion to ComfyUI SDXL Direct. Submits a full, model-authored ComfyUI API-format
     workflow graph (ControlNet, compositing, anything the fixed generate_image graph can't reach).
     Requires a SaveImage node so an image is guaranteed to land in the server's output folder, and
     always makes a fixed-id LoadImageOutput node available in the graph for optional image injection.
-    Also lets a graph be saved as a named, reusable template (save_workflow/list_workflows/
-    get_workflow/delete_workflow) in the shared job database, so run_workflow can be called again
-    with workflow_id=<name> instead of resending the full graph JSON every time.
+    list_node_types/get_node_info discover what's actually installed on a server (vanilla and
+    custom node packs) before you design a graph. save_workflow/list_workflows/get_workflow/
+    delete_workflow save a working graph as a named template in the shared job database, so
+    run_workflow can be called again with workflow_id=<name> instead of resending the full graph
+    JSON every time.
 """
 
 import asyncio
@@ -44,6 +46,7 @@ _PLACEHOLDER_PNG_B64 = (
 )
 
 _placeholder_ready: set = set()  # server URLs confirmed (this process) to have the placeholder
+_node_info_cache: Dict[str, Dict[str, Any]] = {}  # base_url -> full /object_info, cached per process
 
 
 # Everything below mirrors comfy_sdxl_direct.py / comfy_sdxl_retrieve.py. Open WebUI tools are
@@ -530,6 +533,48 @@ def validate_placeholders(graph: Dict[str, Any], placeholders: Dict[str, Any]) -
     return normalized
 
 
+def summarize_node_info(class_type: str, spec: Dict[str, Any]) -> Dict[str, str]:
+    """A node's identity only - enough for list_node_types to say what exists, not how to wire it."""
+    return {
+        "class_type": class_type,
+        "display_name": spec.get("display_name") or class_type,
+        "category": spec.get("category") or "",
+        "description": (spec.get("description") or "").strip(),
+    }
+
+
+def _input_field_summary(meta: Any) -> Dict[str, Any]:
+    """One required/optional input's type, and (for a COMBO) a capped list of valid options."""
+    if not (isinstance(meta, list) and meta):
+        return {"type": str(meta)}
+    type_spec, extra = meta[0], (meta[1] if len(meta) > 1 and isinstance(meta[1], dict) else {})
+    if isinstance(type_spec, list):  # COMBO: the literal list of valid choices
+        capped = [str(x) for x in type_spec[:40]]
+        entry: Dict[str, Any] = {"type": "COMBO", "options": capped}
+        if len(type_spec) > 40:
+            entry["options_truncated_from"] = len(type_spec)
+        return entry
+    entry = {"type": str(type_spec)}
+    for key in ("default", "min", "max", "step"):
+        if key in extra:
+            entry[key] = extra[key]
+    return entry
+
+
+def full_node_info(class_type: str, spec: Dict[str, Any]) -> Dict[str, Any]:
+    """A node's full input/output schema - call only for a node you're about to wire into a
+    graph, once list_node_types has confirmed it exists on the target server."""
+    inputs = spec.get("input") or {}
+    outputs = spec.get("output") or []
+    output_names = spec.get("output_name") or outputs
+    return {
+        **summarize_node_info(class_type, spec),
+        "required_inputs": {name: _input_field_summary(meta) for name, meta in (inputs.get("required") or {}).items()},
+        "optional_inputs": {name: _input_field_summary(meta) for name, meta in (inputs.get("optional") or {}).items()},
+        "outputs": [{"name": str(n), "type": str(t)} for n, t in zip(output_names, outputs)],
+    }
+
+
 def apply_overrides(graph: Dict[str, Any], placeholders: Dict[str, List[str]], overrides: Dict[str, Any]) -> None:
     """Mutates graph in place, setting each override's literal value at its registered placeholder."""
     unknown = [k for k in overrides if k not in placeholders]
@@ -874,6 +919,31 @@ class ComfyClient:
             logger.warning("Could not list checkpoints on %s: %s", self.base_url, e)
         return []
 
+    def list_all_node_info(self) -> Dict[str, Any]:
+        """The server's full node registry (every installed node type, vanilla and custom-pack).
+        Can be several MB of JSON - callers should cache this, not fetch it per request."""
+        try:
+            r = requests.get(f"{self.base_url}/object_info", timeout=self.timeout)
+            r.raise_for_status()
+            data = r.json()
+        except (RequestException, ValueError) as e:
+            raise ComfyError(f"Cannot read node info from {self.base_url}: {e}") from e
+        return data if isinstance(data, dict) else {}
+
+    def get_node_info_raw(self, class_type: str) -> Optional[Dict[str, Any]]:
+        try:
+            r = requests.get(f"{self.base_url}/object_info/{urllib.parse.quote(class_type, safe='')}", timeout=self.timeout)
+        except RequestException as e:
+            raise ComfyError(f"Cannot read node info from {self.base_url}: {e}") from e
+        if r.status_code == 404:
+            return None
+        try:
+            r.raise_for_status()
+            data = r.json()
+        except (RequestException, ValueError) as e:
+            raise ComfyError(f"Cannot read node info from {self.base_url}: {e}") from e
+        return data.get(class_type) if isinstance(data, dict) else None
+
     def view_url(self, image: Dict[str, Any]) -> str:
         query = urllib.parse.urlencode({"filename": image["filename"], "subfolder": image.get("subfolder", ""), "type": image.get("type", "output")})
         return f"{self.base_url}/view?{query}"
@@ -1020,6 +1090,14 @@ class ComfyClient:
         return {"prompt_id": prompt_id, "images": images, "history": entry}
 
 
+def get_all_node_info(client: "ComfyClient", refresh: bool = False) -> Dict[str, Any]:
+    """Cached per server for this process - a server's installed nodes don't change while it's
+    running, and /object_info is large enough to be worth not re-fetching on every call."""
+    if refresh or client.base_url not in _node_info_cache:
+        _node_info_cache[client.base_url] = client.list_all_node_info()
+    return _node_info_cache[client.base_url]
+
+
 async def ensure_placeholder(client: "ComfyClient", timeout: int) -> None:
     """Make sure the tiny placeholder PNG exists on this server's output folder. Cached per-process."""
     if client.base_url in _placeholder_ready:
@@ -1121,10 +1199,86 @@ class Tools:
             default="/app/backend/data/comfy_outputs/comfy_jobs.sqlite3",
             description="SQLite database file for the job index. Keep this identical to generate_image's and retrieve_image's JOB_DB_PATH valve so all three tools share one database.",
         )
+        MAX_NODE_LIST_RESULTS: int = Field(
+            default=60,
+            description="Caps list_node_types results, so an unfiltered or broad search still returns something chat-sized rather than the server's entire node registry.",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
         self.citation = False
+
+    async def list_node_types(self, search: Optional[str] = None, gpu_server: Optional[str] = None, refresh: bool = False) -> Dict[str, Any]:
+        """
+        Browse the ComfyUI node types actually installed on a server - what building blocks are
+        available before designing a graph. Installed custom node packs (ControlNet + its
+        preprocessors, rgthree's utility nodes, upscalers, etc.) vary between servers, so don't
+        assume a node exists just because it's common; check here first. Returns a compact list
+        (class_type, display name, category, short description) for whatever matches `search`, not
+        full schemas - call get_node_info next for the specific node you're about to wire in.
+
+        :param search: Substring match (case-insensitive) over class_type, display name, and category. Omit to list everything - a real search term (e.g. "controlnet", "lora", "rgthree", "pose") is strongly recommended, since an unfiltered list is capped by MAX_NODE_LIST_RESULTS and mostly unhelpful noise.
+        :param gpu_server: Omit for the default server.
+        :param refresh: Re-fetch the node registry from the server instead of using this process's cached copy. Only useful right after installing/removing a custom node pack there.
+        """
+        v = self.valves
+        try:
+            allowed = list(dict.fromkeys(list(v.GPU_SERVERS) + [v.DEFAULT_GPU_SERVER]))
+            server = resolve_server(gpu_server, v.DEFAULT_GPU_SERVER, allowed, v.ALLOW_UNLISTED_SERVERS)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+        client = ComfyClient(server, v.REQUEST_TIMEOUT_SECONDS)
+        try:
+            info = await asyncio.to_thread(get_all_node_info, client, refresh)
+        except ComfyError as e:
+            return {"success": False, "error": str(e), "server": server}
+
+        term = (search or "").strip().lower()
+        rows = []
+        for class_type, spec in info.items():
+            summary = summarize_node_info(class_type, spec)
+            haystack = f"{class_type} {summary['display_name']} {summary['category']}".lower()
+            if not term or term in haystack:
+                rows.append(summary)
+        rows.sort(key=lambda r: (r["category"], r["class_type"]))
+
+        truncated = len(rows) > v.MAX_NODE_LIST_RESULTS
+        if truncated:
+            rows = rows[: v.MAX_NODE_LIST_RESULTS]
+        out: Dict[str, Any] = {"success": True, "server": server, "count": len(rows), "nodes": rows}
+        if truncated:
+            out["note"] = f"Truncated to {v.MAX_NODE_LIST_RESULTS} matches - use a narrower `search` to see the rest."
+        elif not rows:
+            out["note"] = "No installed node types matched." if term else "This server reported no node types at all - is it reachable?"
+        return out
+
+    async def get_node_info(self, class_type: str, gpu_server: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Fetch one node type's full input/output schema: required and optional inputs with their
+        types, COMBO options (e.g. valid preprocessor or sampler names), numeric defaults/ranges,
+        and outputs. Call this right before wiring a specific node into a graph, once
+        list_node_types has confirmed it exists on this server - never guess a third-party node's
+        inputs from its name alone, especially a custom-pack one like rgthree's nodes.
+
+        :param class_type: The exact class_type, as returned by list_node_types.
+        :param gpu_server: Omit for the default server.
+        """
+        v = self.valves
+        try:
+            allowed = list(dict.fromkeys(list(v.GPU_SERVERS) + [v.DEFAULT_GPU_SERVER]))
+            server = resolve_server(gpu_server, v.DEFAULT_GPU_SERVER, allowed, v.ALLOW_UNLISTED_SERVERS)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+        client = ComfyClient(server, v.REQUEST_TIMEOUT_SECONDS)
+        try:
+            spec = await asyncio.to_thread(client.get_node_info_raw, class_type)
+        except ComfyError as e:
+            return {"success": False, "error": str(e), "server": server}
+        if spec is None:
+            return {"success": False, "error": f"No node type {class_type!r} on {server}. Use list_node_types to check spelling/availability.", "server": server}
+        return {"success": True, "server": server, **full_node_info(class_type, spec)}
 
     async def save_workflow(
         self,
@@ -1287,6 +1441,12 @@ class Tools:
         overrides='{"positive_prompt": "...", "seed": 12345}' - without touching the rest of the
         graph. Once a graph is working, call save_workflow to keep using it this cheaply instead of
         rebuilding or resending it every time.
+
+        Designing a new `workflow` from scratch? Don't guess node names or input schemas, especially
+        for custom-pack nodes (ControlNet preprocessors, rgthree's utility nodes, etc.) - call
+        list_node_types (optionally filtered by a search term) to see what's actually installed on
+        the target server, then get_node_info on the specific ones you plan to use for their exact
+        inputs/outputs, before building the graph.
 
         TOOLKIT: this is one of three related tools, all sharing the same GPU_SERVERS. Prefer
         generate_image for ordinary SDXL renders (txt2img/img2img, LoRAs) - it's simpler and

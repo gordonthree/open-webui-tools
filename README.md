@@ -17,10 +17,12 @@ Current tools:
 - `comfy_sdxl_direct.py` → `generate_image` — the primary SDXL render tool (txt2img/img2img,
   LoRAs), a fixed ComfyUI graph built by the tool itself.
 - `comfy_sdxl_graph.py` → `run_workflow` — accepts a full model-authored ComfyUI API-format graph,
-  for anything the fixed graph can't do (ControlNet, compositing, custom node combinations). Also
-  `save_workflow`/`list_workflows`/`get_workflow`/`delete_workflow` — once a graph works, save it
-  as a named template in the shared job database so later calls pass `workflow_id=<name>` (plus
-  small `overrides`) instead of resending the full graph JSON every time.
+  for anything the fixed graph can't do (ControlNet, compositing, custom node combinations).
+  `list_node_types`/`get_node_info` discover what's actually installed on a server (vanilla and
+  custom node packs) before designing a graph. `save_workflow`/`list_workflows`/`get_workflow`/
+  `delete_workflow` — once a graph works, save it as a named template in the shared job database so
+  later calls pass `workflow_id=<name>` (plus small `overrides`) instead of resending the full
+  graph JSON every time.
 - `comfy_sdxl_retrieve.py` → `retrieve_image`, `search_jobs`, `list_jobs`, `retrieve_graph` —
   fetches a rendered image by job id or filename (or lists a server's recent jobs), searches the
   shared job history (structured JSON, for filtering/chaining), browses it as a formatted Markdown
@@ -75,6 +77,21 @@ complete detail, e.g. exact sampler/scheduler name lists).
 | `return_img_url` | Boolean, default `false` |
 | `queue_only` | Boolean, default `false` |
 | `verbose` | Boolean, default `false` — also return the prepared graph and server history |
+
+### `list_node_types` (comfy_sdxl_graph.py)
+
+| Argument | Expected value |
+|---|---|
+| `search` | Omit to list everything (capped by `MAX_NODE_LIST_RESULTS`); otherwise a substring match over class_type, display name, and category |
+| `gpu_server` | Omit for the default server |
+| `refresh` | Boolean, default `false` — re-fetch instead of using this process's cached copy (only needed right after installing/removing a custom node pack) |
+
+### `get_node_info` (comfy_sdxl_graph.py)
+
+| Argument | Expected value |
+|---|---|
+| `class_type` | Required. Exact class_type, as returned by `list_node_types` |
+| `gpu_server` | Omit for the default server |
 
 ### `save_workflow` (comfy_sdxl_graph.py)
 
@@ -203,6 +220,17 @@ re-importing through the OWUI web UI. It reads connection details and per-tool i
 `python scripts/push_tool.py <tool_name|all> [--dry-run]`.
 
 ## Status notes
+
+### 2026-09-24 (2)
+Added node discovery to `comfy_sdxl_graph.py`: `list_node_types` (browse installed node types,
+filtered by a search term, cached per server per process since a server's node registry is large
+and doesn't change while it's running — `refresh=true` bypasses the cache) and `get_node_info`
+(one node's full input/output schema, only fetched when actually needed). Closes the other half of
+the gap the workflow-template store (below) started on: a model authoring a custom graph had no way
+to know what's actually installed on a given GPU server — vanilla nodes are a safe guess, but
+custom packs (ControlNet preprocessors, rgthree's utility nodes, upscalers) vary per host and
+shouldn't be assumed or guessed from a name. 12 new tests in `NodeDiscoveryTests`; full suite still
+green (159 tests). Bumped to 1.2.0.
 
 ### 2026-09-24
 Added a workflow-template store to `comfy_sdxl_graph.py`, closing a gap in `run_workflow`: a model

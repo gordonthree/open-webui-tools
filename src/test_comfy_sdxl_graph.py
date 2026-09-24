@@ -51,9 +51,10 @@ class FakeResponse:
 class FakeComfy:
     """One simulated ComfyUI server (single base_url), like the one in test_comfy_sdxl_direct.py."""
 
-    def __init__(self, checkpoints=None, reject_with=None):
+    def __init__(self, checkpoints=None, reject_with=None, node_registry=None):
         self.checkpoints = checkpoints
         self.reject_with = reject_with
+        self.node_registry = node_registry or {}
         self.submitted = []
         self.uploads = []
         self.files = set()  # (subfolder, filename)
@@ -66,6 +67,15 @@ class FakeComfy:
             if self.checkpoints is None:
                 return FakeResponse(404)
             return FakeResponse(200, {"CheckpointLoaderSimple": {"input": {"required": {"ckpt_name": [self.checkpoints, {}]}}}})
+        if parsed.path == "/object_info":
+            # A real HTTP round-trip re-parses fresh JSON each time; deep-copy so a caller that
+            # later mutates self.node_registry (e.g. to simulate a newly installed node pack)
+            # doesn't retroactively change a response object already handed back.
+            return FakeResponse(200, copy.deepcopy(self.node_registry))
+        if parsed.path.startswith("/object_info/"):
+            class_type = urllib.parse.unquote(parsed.path[len("/object_info/"):])
+            spec = self.node_registry.get(class_type)
+            return FakeResponse(200, {class_type: copy.deepcopy(spec)}) if spec is not None else FakeResponse(404)
         if parsed.path == "/view":
             key = (query.get("subfolder", [""])[0], query.get("filename", [""])[0])
             if key in self.files:
@@ -407,6 +417,124 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("", "earlier.png"), fake.files)  # landed on the target server
         submitted = fake.submitted[0]
         self.assertEqual(submitted[mod.SOURCE_IMAGE_NODE_ID]["inputs"]["image"], "earlier.png [output]")
+
+
+SAMPLE_NODE_REGISTRY = {
+    "ControlNetLoader": {
+        "display_name": "Load ControlNet Model",
+        "category": "loaders",
+        "description": "",
+        "input": {"required": {"control_net_name": [["control_v11p_sd15_openpose.pth"], {}]}},
+        "output": ["CONTROL_NET"],
+        "output_name": ["CONTROL_NET"],
+    },
+    "ControlNetApplyAdvanced": {
+        "display_name": "Apply ControlNet (Advanced)",
+        "category": "conditioning/controlnet",
+        "input": {
+            "required": {
+                "positive": ["CONDITIONING", {}],
+                "negative": ["CONDITIONING", {}],
+                "control_net": ["CONTROL_NET", {}],
+                "image": ["IMAGE", {}],
+                "strength": ["FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}],
+            }
+        },
+        "output": ["CONDITIONING", "CONDITIONING"],
+        "output_name": ["positive", "negative"],
+    },
+    "Power Lora Loader (rgthree)": {
+        "display_name": "Power Lora Loader (rgthree)",
+        "category": "rgthree",
+        "input": {"required": {"model": ["MODEL", {}], "clip": ["CLIP", {}]}},
+        "output": ["MODEL", "CLIP"],
+        "output_name": ["MODEL", "CLIP"],
+    },
+    "KSampler": {
+        "display_name": "KSampler",
+        "category": "sampling",
+        "input": {"required": {"seed": ["INT", {"default": 0}]}},
+        "output": ["LATENT"],
+        "output_name": ["LATENT"],
+    },
+}
+
+
+class NodeDiscoveryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        mod._node_info_cache.clear()
+        self.tool = mod.Tools()
+        self.tool.valves.GPU_SERVERS = ["http://gpu:8188"]
+        self.tool.valves.DEFAULT_GPU_SERVER = "http://gpu:8188"
+
+    def tearDown(self):
+        mod._node_info_cache.clear()
+
+    async def test_list_node_types_filters_by_search_across_fields(self):
+        fake = FakeComfy(node_registry=SAMPLE_NODE_REGISTRY)
+        with patch.object(mod, "requests", fake):
+            by_class = await self.tool.list_node_types(search="controlnet")
+            by_display = await self.tool.list_node_types(search="rgthree")
+            by_category = await self.tool.list_node_types(search="sampling")
+        self.assertEqual({n["class_type"] for n in by_class["nodes"]}, {"ControlNetLoader", "ControlNetApplyAdvanced"})
+        self.assertEqual({n["class_type"] for n in by_display["nodes"]}, {"Power Lora Loader (rgthree)"})
+        self.assertEqual({n["class_type"] for n in by_category["nodes"]}, {"KSampler"})
+
+    async def test_list_node_types_caches_across_calls(self):
+        fake = FakeComfy(node_registry=SAMPLE_NODE_REGISTRY)
+        object_info_hits = []
+        real_get = fake.get
+
+        def counting_get(url, timeout=None):
+            if urllib.parse.urlparse(url).path == "/object_info":
+                object_info_hits.append(url)
+            return real_get(url, timeout=timeout)
+
+        fake.get = counting_get
+        with patch.object(mod, "requests", fake):
+            await self.tool.list_node_types(search="lora")
+            await self.tool.list_node_types(search="controlnet")
+        self.assertEqual(len(object_info_hits), 1)  # second call served from the process cache
+
+    async def test_list_node_types_refresh_bypasses_cache(self):
+        fake = FakeComfy(node_registry=dict(SAMPLE_NODE_REGISTRY))
+        with patch.object(mod, "requests", fake):
+            await self.tool.list_node_types(search="rgthree")
+            fake.node_registry["NewNode"] = {"display_name": "NewNode", "category": "test", "input": {}, "output": [], "output_name": []}
+            stale = await self.tool.list_node_types(search="newnode")
+            fresh = await self.tool.list_node_types(search="newnode", refresh=True)
+        self.assertEqual(stale["count"], 0)
+        self.assertEqual(fresh["count"], 1)
+
+    async def test_list_node_types_truncates_to_max_results(self):
+        big_registry = {f"Node{i}": {"display_name": f"Node{i}", "category": "x", "input": {}, "output": [], "output_name": []} for i in range(5)}
+        self.tool.valves.MAX_NODE_LIST_RESULTS = 2
+        with patch.object(mod, "requests", FakeComfy(node_registry=big_registry)):
+            res = await self.tool.list_node_types()
+        self.assertEqual(res["count"], 2)
+        self.assertIn("note", res)
+
+    async def test_get_node_info_returns_full_schema(self):
+        with patch.object(mod, "requests", FakeComfy(node_registry=SAMPLE_NODE_REGISTRY)):
+            res = await self.tool.get_node_info("ControlNetApplyAdvanced")
+        self.assertTrue(res["success"], res)
+        self.assertIn("strength", res["required_inputs"])
+        self.assertEqual(res["required_inputs"]["strength"]["default"], 1.0)
+        self.assertEqual(res["required_inputs"]["image"]["type"], "IMAGE")
+        self.assertIn({"name": "positive", "type": "CONDITIONING"}, res["outputs"])
+
+    async def test_get_node_info_combo_options_are_capped(self):
+        registry = {"X": {"display_name": "X", "category": "c", "input": {"required": {"name": [[f"opt{i}" for i in range(50)], {}]}}, "output": [], "output_name": []}}
+        with patch.object(mod, "requests", FakeComfy(node_registry=registry)):
+            res = await self.tool.get_node_info("X")
+        self.assertEqual(len(res["required_inputs"]["name"]["options"]), 40)
+        self.assertEqual(res["required_inputs"]["name"]["options_truncated_from"], 50)
+
+    async def test_get_node_info_unknown_class_type_is_a_clean_error(self):
+        with patch.object(mod, "requests", FakeComfy(node_registry=SAMPLE_NODE_REGISTRY)):
+            res = await self.tool.get_node_info("DoesNotExist")
+        self.assertFalse(res["success"])
+        self.assertIn("DoesNotExist", res["error"])
 
 
 class WorkflowTemplateTests(unittest.IsolatedAsyncioTestCase):
