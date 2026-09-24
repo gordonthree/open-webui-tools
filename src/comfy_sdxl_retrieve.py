@@ -1,7 +1,7 @@
 """
 title: ComfyUI SDXL Retrieve
 author: Gordon
-version: 1.1.0
+version: 1.2.0
 description: Companion to ComfyUI SDXL Direct. Given a job id (from queue_only) or an image filename, finds the result on the ComfyUI server and shows it in chat, or reports that the job is still queued/running, or that nothing was found. Also exposes search_jobs (structured search over the shared job database) and list_jobs (a browsable Markdown table of job history).
 """
 
@@ -1397,12 +1397,18 @@ def _db_rows_to_display_rows(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 
 def format_jobs_table(
-    rows: List[Dict[str, Any]], start_index: int, total_count: int, show_thumbnails: bool, request_timeout: int
+    rows: List[Dict[str, Any]], start_index: int, total_count: int, link_images: bool, request_timeout: int
 ) -> str:
     """
     '# | UUID | Job Timestamp | Information' - everything else (filename, server, status,
-    prompts, and a best-effort thumbnail) lives inside one tall Information cell rather than
-    more columns, since chat windows are narrow and Markdown tables don't wrap gracefully.
+    prompts) lives inside one tall Information cell rather than more columns, since chat windows
+    are narrow and Markdown tables don't wrap gracefully.
+
+    Filenames are a plain Markdown link to the full image, not an embedded '![]()' image: OWUI
+    escapes raw HTML (so a width/style size hint on an <img> never survives to render) and plain
+    Markdown has no image-sizing syntax either, so an embedded image always shows at full size.
+    A link avoids dumping a full-size image inline for every row while still getting there in
+    one click - and unlike an image tag, link text/attributes aren't touched by that escaping.
     """
     if not rows:
         return "No jobs found."
@@ -1415,12 +1421,14 @@ def format_jobs_table(
     ]
     for i, row in enumerate(rows):
         parts: List[str] = []
-        if show_thumbnails and row.get("filename") and row.get("server"):
-            thumb_url = ComfyClient(row["server"], request_timeout).view_url(
-                {"filename": row["filename"], "subfolder": row.get("subfolder", ""), "type": "output"}
+        filename = row.get("filename")
+        if filename and link_images and row.get("server"):
+            image_url = ComfyClient(row["server"], request_timeout).view_url(
+                {"filename": filename, "subfolder": row.get("subfolder", ""), "type": "output"}
             )
-            parts.append(f"![thumbnail]({thumb_url})")
-        parts.append(f"**File:** {row['filename']}" if row.get("filename") else "**File:** (none)")
+            parts.append(f"**File:** [{filename}]({image_url})")
+        else:
+            parts.append(f"**File:** {filename}" if filename else "**File:** (none)")
         parts.append(f"**Server:** {row.get('server') or '—'}")
         parts.append(f"**Status:** {row.get('status') or 'unknown'}")
         if row.get("positive_prompt"):
@@ -1655,13 +1663,15 @@ class Tools:
         skip_to: int = 0,
         job_search: Optional[str] = None,
         prompt_search: Optional[str] = None,
-        show_thumbnails: bool = True,
+        link_images: bool = True,
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
     ) -> Dict[str, Any]:
         """
         Browse job history as a Markdown table meant to be shown to the user directly - a
-        librarian for past renders, not a fetcher. Use retrieve_image afterward, with a row's
-        UUID or filename, to actually display one image at full size.
+        librarian for past renders, not a fetcher. Each row's filename is a clickable link to the
+        full image rather than an embedded image, since OWUI has no way to display an embedded
+        image smaller than full size; click through (or use retrieve_image with a row's UUID or
+        filename) to actually see one.
 
         TOOLKIT: this is one of four related tools sharing GPU_SERVERS. Unlike search_jobs (which
         returns structured JSON for filtering/chaining), list_jobs returns a ready-to-paste table,
@@ -1681,9 +1691,9 @@ class Tools:
         :param job_search: database mode only. Matches a job's id (its own UUID or ComfyUI's own
             prompt id) or filename, by substring.
         :param prompt_search: database mode only. Free-text match over prompts.
-        :param show_thumbnails: Include a small embedded image per row, linked directly to the GPU
-            server. Best-effort - won't render if the file's since been deleted, or if your
-            browser can't reach that server directly.
+        :param link_images: Make each row's filename a clickable link straight to the image on the
+            GPU server, instead of plain text. Best-effort - the link may not open if the file's
+            since been deleted, or if your browser can't reach that server directly.
         """
         v = self.valves
 
@@ -1714,7 +1724,7 @@ class Tools:
                         raise ValueError(found.get("error") or "search failed")
                     rows = _db_rows_to_display_rows(found["jobs"])
                     table = format_jobs_table(
-                        rows, skip_to, found.get("total_count", len(rows)), show_thumbnails, v.REQUEST_TIMEOUT_SECONDS
+                        rows, skip_to, found.get("total_count", len(rows)), link_images, v.REQUEST_TIMEOUT_SECONDS
                     )
             else:
                 allowed = list(dict.fromkeys(list(v.GPU_SERVERS) + [v.DEFAULT_GPU_SERVER]))
@@ -1723,7 +1733,7 @@ class Tools:
                 raw = await asyncio.to_thread(client.get_history_list, v.MAX_HISTORY_ITEMS)
                 all_rows = _live_rows_from_history(raw, server)
                 page = all_rows[skip_to : skip_to + job_count]
-                table = format_jobs_table(page, skip_to, len(all_rows), show_thumbnails, v.REQUEST_TIMEOUT_SECONDS)
+                table = format_jobs_table(page, skip_to, len(all_rows), link_images, v.REQUEST_TIMEOUT_SECONDS)
 
             result: Dict[str, Any] = {
                 "success": True,

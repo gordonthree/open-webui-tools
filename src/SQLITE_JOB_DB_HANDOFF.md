@@ -18,8 +18,13 @@ unrelated failure on Windows only (`test_unreachable_syslog_falls_back_to_file` 
 
 **`list_jobs`** is a browsing/display counterpart to `search_jobs`: instead of structured JSON,
 it returns a ready-to-paste Markdown table (`# | UUID | Job Timestamp | Information`, with
-filename/server/status/prompts/a best-effort thumbnail all folded into the one "Information"
-cell — narrow chat windows don't render wide tables well). It has a `data_source` argument picking
+filename/server/status/prompts all folded into the one "Information" cell — narrow chat windows
+don't render wide tables well). Each filename is a plain Markdown *link* to the image
+(`link_images` valve/param, default on), not an embedded `![]()` image: OWUI's
+`sanitizeResponseContent` escapes raw HTML before Markdown parsing (so a `<img width=...>` size
+hint never survives to render), and plain Markdown has no image-sizing syntax either — an embedded
+image always shows at full size, which is unusable inline in a multi-row table. A link avoids that
+without losing one-click access to the image. It has a `data_source` argument picking
 between two independent code paths that get normalized into the same display-row shape before
 formatting:
 - **live** (default, or an explicit GPU server address) — reads a server's own `/history`

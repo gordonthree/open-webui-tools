@@ -661,15 +661,17 @@ class ListJobsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(self.other_server, res["markdown_table"])
         self.assertNotIn(self.server, res["markdown_table"].replace(self.other_server, ""))
 
-    async def test_live_mode_thumbnail_included_by_default_and_omittable(self):
+    async def test_live_mode_filename_is_linked_by_default_and_omittable(self):
         fake = FakeMultiServerRetrieveComfy()
         fake.seed_history(self.server, "prompt-1", self._live_entry(1, "a.png"))
         with patch.object(mod, "requests", fake):
-            with_thumb = await self.tool.list_jobs()
-            without_thumb = await self.tool.list_jobs(show_thumbnails=False)
+            linked = await self.tool.list_jobs()
+            unlinked = await self.tool.list_jobs(link_images=False)
 
-        self.assertIn("![thumbnail](", with_thumb["markdown_table"])
-        self.assertNotIn("![thumbnail](", without_thumb["markdown_table"])
+        self.assertIn(f"[a.png]({self.server}/view?filename=a.png", linked["markdown_table"])
+        self.assertNotIn("![", linked["markdown_table"])  # a link, never an embedded image
+        self.assertIn("**File:** a.png", unlinked["markdown_table"])
+        self.assertNotIn("[a.png](", unlinked["markdown_table"])
 
     async def test_live_mode_no_jobs_found(self):
         fake = FakeMultiServerRetrieveComfy()
