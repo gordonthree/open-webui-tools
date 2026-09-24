@@ -29,6 +29,90 @@ All three files share a `GPU_SERVERS` valve list and a `resolve_server`/`resolve
 matching approach, and are meant to be used together — see each tool's own `TOOLKIT` docstring
 paragraph for how they hand off to one another.
 
+## Tool arguments
+
+Quick reference for each tool method's arguments. This is the simple version — types and what
+each argument expects, not the full docstring (see each tool's own `:param:` lines in `src/` for
+complete detail, e.g. exact sampler/scheduler name lists).
+
+### `generate_image` (comfy_sdxl_direct.py)
+
+| Argument | Expected value |
+|---|---|
+| `positive_prompt` | Text, required |
+| `negative_prompt` | Text, required |
+| `batch_size` | Integer, default `1` |
+| `source_image` | Omit for txt2img; otherwise an earlier result's `use_as_source_image` value (switches to img2img) |
+| `source_server` | Omit unless `source_image` is on a different server than `gpu_server` |
+| `denoise` | Float 0.0–1.0; default `1.0` (txt2img) / `0.6` (img2img) |
+| `seed` | Integer; `-1` (default) picks a random seed |
+| `steps` | Integer, default `25` |
+| `cfg` | Float, default `5.0` |
+| `sampler_name` | KSampler sampler name, default `dpmpp_2m` |
+| `scheduler` | KSampler scheduler name, default `karras` |
+| `width` | Pixels, txt2img only, default `1216` |
+| `height` | Pixels, txt2img only, default `824` |
+| `checkpoint_name` | Omit for the default checkpoint; otherwise an exact filename on the server |
+| `loras` | Omit for none; otherwise a list like `[{"lora": "name.safetensors", "strength": 0.8}]` |
+| `gpu_server` | Omit for the default server; otherwise a configured server or address |
+| `return_img_url` | Boolean, default `false` |
+| `queue_only` | Boolean, default `false` — submit without waiting for the render |
+| `verbose` | Boolean, default `false` — also return the full submitted workflow and server history |
+
+### `run_workflow` (comfy_sdxl_graph.py)
+
+| Argument | Expected value |
+|---|---|
+| `workflow` | Required. A ComfyUI API-format graph, as a JSON string (node-specific fields aren't listed here — see the tool's own docstring) |
+| `source_image` | Omit to leave the fixed source-image node pointed at a placeholder; otherwise an earlier result's `use_as_source_image` value |
+| `source_server` | Omit unless `source_image` is on a different server than `gpu_server` |
+| `gpu_server` | Omit for the default server |
+| `return_img_url` | Boolean, default `false` |
+| `queue_only` | Boolean, default `false` |
+| `verbose` | Boolean, default `false` — also return the prepared graph and server history |
+
+### `retrieve_image` (comfy_sdxl_retrieve.py)
+
+| Argument | Expected value |
+|---|---|
+| `job_id_or_filename` | A job UUID or an image filename; omit only when using `history` |
+| `gpu_server` | Omit to search all configured servers; required when using `history` |
+| `return_img_url` | Boolean, default `false` |
+| `history` | Omit for a single lookup; otherwise a count of recent jobs to list on `gpu_server` |
+
+### `search_jobs` (comfy_sdxl_retrieve.py)
+
+| Argument | Expected value |
+|---|---|
+| `prompt_text` | Free text; omit to not filter by prompt |
+| `checkpoint` | Substring of a checkpoint filename |
+| `seed` | Exact integer seed |
+| `gpu_server` | Omit to search all servers |
+| `tool` | `"generate_image"` or `"run_workflow"`; omit for both |
+| `status` | One or more of `built`, `queued`, `completed`, `rejected`, `failed` |
+| `date_from` | ISO 8601 date/time (UTC), e.g. `2026-09-01` |
+| `date_to` | ISO 8601 date/time (UTC); a bare date includes that whole day |
+| `limit` | Integer, default `20`, capped by the `MAX_SEARCH_RESULTS` valve |
+
+### `list_jobs` (comfy_sdxl_retrieve.py)
+
+| Argument | Expected value |
+|---|---|
+| `data_source` | Omit for the default live server; `"database"` for the persistent job log; any other value is treated as a specific GPU server address (live) |
+| `job_count` | Integer, default `10` |
+| `skip_to` | Integer, default `0` — pagination offset |
+| `job_search` | Database mode only. Matches a job's id or filename, by substring |
+| `prompt_search` | Database mode only. Free-text match over prompts |
+| `link_images` | Boolean, default `true` — link each row's filename to the image instead of plain text |
+
+### `retrieve_graph` (comfy_sdxl_retrieve.py)
+
+| Argument | Expected value |
+|---|---|
+| `job_id_or_filename` | Required. A job id (UUID or ComfyUI's own prompt id) or an image filename |
+| `gpu_server` | Omit to search all configured servers (live mode only) |
+| `data_source` | Omit for the default live server/queue; `"database"` for the persistent job log |
+
 ## Job database
 
 Every render attempt across all three tools — including ones ComfyUI rejected or that timed
