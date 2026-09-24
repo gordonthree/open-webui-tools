@@ -17,6 +17,18 @@ ComfyUI's own history retention (cleared on restart, bounded size) caps how far 
 reach - it can only import what the server still has, same limitation retrieve_image's
 history=<count> mode has.
 
+Requirements:
+    - Python 3.9+.
+    - The third-party `requests` package - the only non-stdlib dependency. Install it with
+      `pip install requests` (a venv is recommended: `python -m venv venv && venv/bin/pip install
+      requests`, or `venv\\Scripts\\pip install requests` on Windows), or just `pip install
+      requests` directly on the system if you're not using one.
+    - job_db_common.py must stay in this same directory - it's a plain local sibling import (a
+      "python scripts/import_server_history.py ..." invocation resolves it correctly regardless
+      of your current working directory), not a pip package.
+    - No OWUI, ComfyUI SDK, or Open WebUI dependencies (pydantic, aiohttp, etc.) are needed at
+      all - this talks to the ComfyUI server's plain HTTP API directly.
+
 Usage:
     python scripts/import_server_history.py http://192.168.10.11:8188 /srv/owui/comfy_outputs/comfy_jobs.sqlite3
     python scripts/import_server_history.py <server> <db_path> --max-items 2000 --dry-run
@@ -30,13 +42,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import requests
+import requests  # third-party - see "Requirements" above; everything else imported here is stdlib
 
 from job_db_common import (
     execution_timing,
     extract_node_params,
     extract_prompts,
-    classify_job_mode,
     history_prompt_graph,
     job_db_connect,
     now_iso,
