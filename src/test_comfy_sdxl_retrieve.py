@@ -339,6 +339,27 @@ class SearchJobsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res["success"], res)
         self.assertEqual([j["job_uuid"] for j in res["jobs"]], [target])
 
+    async def test_empty_string_sentinels_mean_no_filter(self):
+        # A caller whose tool-calling format can't omit a declared parameter may send "" for every
+        # argument it doesn't want to set. Before the fix, seed="" reached a raw float(seed) call
+        # and failed with a cryptic conversion error, and limit="" or status="" could do the same -
+        # this locks in that they now behave exactly like omitting the argument instead.
+        _seed_job(self.db_path, node_params=[("12", "KSampler", "seed", "42", 42.0)])
+        res = await self.tool.search_jobs(
+            prompt_text="", job_search="", checkpoint="", seed="", gpu_server="", tool="",
+            status="", date_from="", date_to="", limit="",
+        )
+        self.assertTrue(res["success"], res)
+        self.assertEqual(len(res["jobs"]), 1)  # no filter excluded the one seeded job
+
+    async def test_status_accepts_a_json_string_list(self):
+        _seed_job(self.db_path, status="completed")
+        _seed_job(self.db_path, status="failed")
+        _seed_job(self.db_path, status="built")
+        res = await self.tool.search_jobs(status='["completed", "failed"]')
+        self.assertTrue(res["success"], res)
+        self.assertEqual({j["status"] for j in res["jobs"]}, {"completed", "failed"})
+
 
 class ReconciliationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -360,6 +381,15 @@ class ReconciliationTests(unittest.IsolatedAsyncioTestCase):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    async def test_retrieve_image_history_empty_string_sentinel_means_omitted(self):
+        # history="" (sent by a caller that can't omit a declared parameter) must behave exactly
+        # like not passing history at all - it should NOT be treated as "list mode with an invalid
+        # count", which would otherwise produce a confusing "history must be a positive integer"
+        # error instead of the correct "provide a job id" one.
+        res = await self.tool.retrieve_image(job_id_or_filename="", history="")
+        self.assertFalse(res["success"])
+        self.assertIn("Provide a job id", res["error"])
 
     @staticmethod
     def _history_entry(graph, comfy_prompt_id="prompt-abc", start_ms=1_000, end_ms=6_000, filename="img.png"):
@@ -656,6 +686,20 @@ class ListJobsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("prompt-1", lines[1])
         self.assertIn(self.server, table)
         self.assertIn("a cat", table)
+
+    async def test_empty_string_sentinels_mean_defaults(self):
+        # job_count/skip_to are computed via max(1, ...)/max(0, ...) before anything else in this
+        # method; before the fix, a "" sentinel for either (sent by a caller whose format can't
+        # omit a declared parameter) reached that max() call as a bare string and raised an
+        # unhandled TypeError rather than falling back to the normal default.
+        fake = FakeMultiServerRetrieveComfy()
+        fake.seed_history(self.server, "prompt-1", self._live_entry(1, "a.png"))
+        with patch.object(mod, "requests", fake):
+            res = await self.tool.list_jobs(
+                data_source="", job_count="", skip_to="", job_search="", prompt_search="",
+            )
+        self.assertTrue(res["success"], res)
+        self.assertIn("a.png", res["markdown_table"])
 
     async def test_live_mode_pagination_skip_to(self):
         fake = FakeMultiServerRetrieveComfy()

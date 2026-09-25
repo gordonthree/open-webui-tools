@@ -65,7 +65,7 @@ status note below for how this was found.
 | `width` | Pixels, txt2img only, default `1216` |
 | `height` | Pixels, txt2img only, default `824` |
 | `checkpoint_name` | Omit for the default checkpoint; otherwise an exact filename on the server |
-| `loras` | Omit for none; otherwise a list like `[{"lora": "name.safetensors", "strength": 0.8}]` |
+| `loras` | Omit (or `""`, `"{}"`, `"[]"`) for none; otherwise a list like `[{"lora": "name.safetensors", "strength": 0.8}]` |
 | `gpu_server` | Omit for the default server; otherwise a configured server or address |
 | `return_img_url` | Boolean, default `false` |
 | `queue_only` | Boolean, default `false` — submit without waiting for the render |
@@ -150,7 +150,7 @@ status note below for how this was found.
 | `seed` | Exact integer seed |
 | `gpu_server` | Omit to search all servers |
 | `tool` | `"generate_image"` or `"run_workflow"`; omit for both |
-| `status` | One or more of `built`, `queued`, `completed`, `rejected`, `failed` |
+| `status` | Omit (or `""`, `"[]"`) for all; otherwise one or more of `built`, `queued`, `completed`, `rejected`, `failed` (a JSON-string list is also fine) |
 | `date_from` | ISO 8601 date/time (UTC), e.g. `2026-09-01` |
 | `date_to` | ISO 8601 date/time (UTC); a bare date includes that whole day |
 | `limit` | Integer, default `20`, capped by the `MAX_SEARCH_RESULTS` valve |
@@ -228,6 +228,40 @@ re-importing through the OWUI web UI. It reads connection details and per-tool i
 
 ## Status notes
 
+### 2026-09-25 (2)
+Extended the previous entry's fix to `comfy_sdxl_direct.py` and `comfy_sdxl_retrieve.py`, per the
+project owner's explicit request: every optional parameter across all three tools now treats `""`
+(and, where the argument is a JSON list/object, `"{}"`/`"[]"` or a real empty dict/list) as
+equivalent to omitting it, in addition to continuing to work when the argument is left out
+entirely. This was a mix of documentation (already-correct behavior, just unstated) and **real
+bugs** found while auditing each optional parameter:
+
+- `generate_image`: `batch_size`, `seed`, `steps`, `cfg`, `denoise`, `sampler_name`, `scheduler`,
+  `width`, `height` are all typed with real (non-`None`) Python defaults, and none of them were
+  normalized - a `""` for any of them reached a numeric comparison as a bare string and raised an
+  **unhandled `TypeError`** (the method's own `except` clause only caught `ValueError`/
+  `json.JSONDecodeError`/`ComfyError`). Now normalized to their real defaults up front; `TypeError`
+  added to the `except` tuple as a backstop for any other malformed (non-empty, non-sentinel) value.
+  `loras` already handled `""`/`"{}"`/`"[]"`/real empty containers correctly by accident (falsy
+  checks downstream) - now documented as intentional, not just lucky.
+- `search_jobs`: `seed=""` reached a raw `float(seed)` call and failed with a confusing conversion
+  error (caught cleanly, but the wrong message - "no seed filter" was clearly intended, not an
+  error); `limit="none"`/`"null"` (not just `""`, which happened to be falsy already) hit a `min()`
+  call with a string, an `Unexpected error: '<' not supported...`. Both now normalized properly.
+  `status` now also accepts a JSON-string list (`'["completed","failed"]'`), matching the same
+  string-JSON convention `generate_image`'s `loras` and `run_workflow`'s `overrides` already use.
+- `list_jobs`: `job_count`/`skip_to` were run through `max(1, ...)`/`max(0, ...)` **before the
+  method's own `try` block even started** - a `""` for either was a genuine, unhandled crash risk,
+  not just a bad error message. Moved inside `try` and normalized.
+- `retrieve_image`: `history=""` fell through to "history must be a positive integer" instead of
+  the more correct "provide a job id" message, since only `None` (not `""`) skipped the count
+  check. Now normalized the same way as everywhere else.
+- `list_jobs`/`retrieve_graph`: `data_source.strip()` assumed a string; now `str(data_source)`
+  first, in case a stray non-string sneaks through despite the type hint.
+
+6 new tests covering these across all three test files (167 total, 1 unrelated skip). Bumped
+`comfy_sdxl_direct.py` to 2.2.0, `comfy_sdxl_retrieve.py` to 1.5.0.
+
 ### 2026-09-25
 A real-world test surfaced a bug in how a *different* frontier model (not this project's usual
 local one, tried out ad hoc by the project owner) called `run_workflow`: its tool-calling layer
@@ -248,14 +282,8 @@ other, `workflow_id`'s docstring now says outright it must name an *existing* te
 image filename or an invented name for a new graph), and `get_node_info`/`list_node_types` now
 warn explicitly that a node's `class_type` (not its cosmetic `display_name`) is what belongs in a
 graph. Two new tests lock in the `""`/`false`-as-omitted contract as tested behavior rather than an
-implicit accident. Bump to 1.3.0.
-
-**Not yet done, same class of bug likely present:** `comfy_sdxl_direct.py` and
-`comfy_sdxl_retrieve.py` use the identical "Optional, omit for default" docstring convention for
-their own optional parameters, so a strict-schema caller would hit the same confusion there. Worth
-the same documentation pass once there's evidence it actually causes trouble in practice for those
-two (their argument lists are shorter and simpler than `run_workflow`'s, so the failure mode may be
-less severe).
+implicit accident. Bump to 1.3.0. (The other two tools got the same treatment the same day - see
+the next, newer entry above.)
 
 ### 2026-09-24 (2)
 Added node discovery to `comfy_sdxl_graph.py`: `list_node_types` (browse installed node types,

@@ -756,6 +756,40 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.submitted[0]["15"]["inputs"]["ckpt_name"], self.tool.valves.DEFAULT_CHECKPOINT)
         self.assertNotIn("32", fake.submitted[0])
 
+    async def test_empty_string_sentinels_for_args_with_real_defaults(self):
+        # A caller whose tool-calling format can't omit a declared parameter (e.g. an OpenAI-style
+        # "strict" function schema) may send "" for every argument it doesn't actually want to
+        # set - including ones typed as plain int/float/str with a real (non-None) Python default,
+        # not just the Optional[str] ones. Before the fix, several of these reached a numeric
+        # comparison as a bare string and raised an unhandled TypeError instead of using their
+        # default; this locks in that they now behave exactly like omitting the argument.
+        fake = FakeComfy()
+        with patch.object(mod, "requests", fake):
+            res = await self.tool.generate_image(
+                "cat", "dog",
+                batch_size="", seed="", steps="", cfg="", denoise="",
+                sampler_name="", scheduler="", width="", height="",
+                checkpoint_name="", source_image="", source_server="", loras="", gpu_server="",
+            )
+        self.assertTrue(res["success"], res)
+        sent = fake.submitted[0]["12"]["inputs"]
+        self.assertEqual(sent["steps"], 25)
+        self.assertEqual(sent["cfg"], 5.0)
+        self.assertEqual(sent["sampler_name"], "dpmpp_2m")
+        self.assertEqual(sent["scheduler"], "karras")
+        self.assertEqual(sent["denoise"], mod.DEFAULT_TXT2IMG_DENOISE)
+        self.assertEqual(fake.submitted[0]["13"]["inputs"]["width"], 1216)
+        self.assertEqual(fake.submitted[0]["13"]["inputs"]["height"], 824)
+        self.assertNotIn("27", fake.submitted[0])  # no LoRA node built
+
+    async def test_loras_empty_json_container_forms_all_mean_no_loras(self):
+        for empty_loras in ("", "{}", "[]", [], {}):
+            fake = FakeComfy()
+            with patch.object(mod, "requests", fake):
+                res = await self.tool.generate_image("cat", "dog", loras=empty_loras)
+            self.assertTrue(res["success"], res)
+            self.assertNotIn("27", fake.submitted[0], f"loras={empty_loras!r} should mean no LoRAs")
+
     def test_resolve_server(self):
         allowed = ["http://100.64.219.107:8188", "http://100.95.85.50:8188"]
         d = "http://100.95.85.50:8188"

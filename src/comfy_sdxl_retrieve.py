@@ -1,7 +1,7 @@
 """
 title: ComfyUI SDXL Retrieve
 author: Gordon
-version: 1.4.0
+version: 1.5.0
 description: Companion to ComfyUI SDXL Direct. Given a job id (from queue_only) or an image filename, finds the result on the ComfyUI server and shows it in chat, or reports that the job is still queued/running, or that nothing was found. Also exposes search_jobs (structured search over the shared job database), list_jobs (a browsable Markdown table of job history), and retrieve_graph (fetches the submitted ComfyUI graph itself for a job).
 """
 
@@ -1164,6 +1164,7 @@ async def retrieve(
     # ---- interpret the input --------------------------------------------
     try:
         text = (job_id_or_filename or "").strip()
+        history = None if is_unset(history) else history
         default = v.DEFAULT_GPU_SERVER.rstrip("/")
         allowed = list(dict.fromkeys(list(v.GPU_SERVERS) + [v.DEFAULT_GPU_SERVER]))
 
@@ -1709,10 +1710,10 @@ class Tools:
         list of the last <count> jobs on that server (job ids and filenames), e.g. to find a job
         id when only the filename or nothing at all is known.
 
-        :param job_id_or_filename: A job id (UUID) or an image filename, e.g. "sdxl_simple_00076_.png" or "subfolder/name.png". Omit only when using history=<count> to list recent jobs instead.
-        :param gpu_server: Omit to search all configured servers (default server first). Only set this to look on one specific server (full URL or IP) - required when using history=<count>.
-        :param return_img_url: If true, include download URLs for each image in the result: 'comfy_url' (direct link on the GPU server), 'chat_url' (the copy shown in chat) and a ready-made 'link_markdown'. Off by default to keep results small.
-        :param history: List the last <count> jobs on gpu_server instead of looking up a single image. Requires gpu_server and no job_id_or_filename.
+        :param job_id_or_filename: A job id (UUID) or an image filename, e.g. "sdxl_simple_00076_.png" or "subfolder/name.png". Pass "" (or omit) only when using history=<count> to list recent jobs instead.
+        :param gpu_server: Pass "" (or omit) to search all configured servers (default server first). Only set this to look on one specific server (full URL or IP) - required when using history=<count>.
+        :param return_img_url: true to include download URLs for each image in the result: 'comfy_url' (direct link on the GPU server), 'chat_url' (the copy shown in chat) and a ready-made 'link_markdown'. false (the normal choice) keeps results small.
+        :param history: List the last <count> jobs on gpu_server instead of looking up a single image. Requires gpu_server and no job_id_or_filename. Pass "" (or omit) for a normal single lookup instead.
         """
 
         async def status(text: str, done: bool = False):
@@ -1764,16 +1765,20 @@ class Tools:
         the server rejected or that timed out, not just completed renders. For a quick,
         human-readable browse instead (no filters needed), use list_jobs.
 
-        :param prompt_text: Free-text search over positive/negative prompts, e.g. "lighthouse dusk". Omit to not filter by prompt text.
-        :param job_search: Matches a job's id (its own UUID or ComfyUI's own prompt id) or filename, by substring. Omit to not filter by id/filename.
-        :param checkpoint: Substring match (case-insensitive) against the checkpoint filename used, e.g. "epicrealism".
-        :param seed: Exact seed value used by the job's sampler.
-        :param gpu_server: Restrict to one server (full URL or a configured short name). Omit to search all servers.
-        :param tool: Restrict to jobs made by generate_image or run_workflow. Omit for both.
-        :param status: One or more of "built", "queued", "completed", "rejected", "failed". Omit for all statuses.
-        :param date_from: ISO 8601 date/time (UTC), e.g. "2026-09-01" or "2026-09-01T00:00:00Z". Jobs created on/after this.
-        :param date_to: ISO 8601 date/time (UTC). Jobs created on/before this (a bare date includes that whole day).
-        :param limit: Max rows to return (capped by the MAX_SEARCH_RESULTS valve).
+        Every parameter here is optional. Pass "" (or omit) for an unused text one, "[]" or "" for
+        status, and "" (or omit) for seed/limit to use their defaults - all treated the same as
+        not passing the argument at all.
+
+        :param prompt_text: Free-text search over positive/negative prompts, e.g. "lighthouse dusk". Pass "" (or omit) to not filter by prompt text.
+        :param job_search: Matches a job's id (its own UUID or ComfyUI's own prompt id) or filename, by substring. Pass "" (or omit) to not filter by id/filename.
+        :param checkpoint: Substring match (case-insensitive) against the checkpoint filename used, e.g. "epicrealism". Pass "" (or omit) to not filter by checkpoint.
+        :param seed: Exact seed value used by the job's sampler. Pass "" (or omit) to not filter by seed.
+        :param gpu_server: Restrict to one server (full URL or a configured short name). Pass "" (or omit) to search all servers.
+        :param tool: Restrict to jobs made by generate_image or run_workflow. Pass "" (or omit) for both.
+        :param status: One or more of "built", "queued", "completed", "rejected", "failed", as a JSON list (a JSON-string list is also fine). Pass "" or "[]" (or omit) for all statuses.
+        :param date_from: ISO 8601 date/time (UTC), e.g. "2026-09-01" or "2026-09-01T00:00:00Z". Jobs created on/after this. Pass "" (or omit) for no lower bound.
+        :param date_to: ISO 8601 date/time (UTC). Jobs created on/before this (a bare date includes that whole day). Pass "" (or omit) for no upper bound.
+        :param limit: Max rows to return (capped by the MAX_SEARCH_RESULTS valve). Pass "" (or omit) for the default, 20.
         """
         v = self.valves
 
@@ -1782,6 +1787,17 @@ class Tools:
 
         await status_cb("Searching job history...")
         try:
+            # Restore real defaults for any "skip this filter" sentinel a model might send for a
+            # parameter it can't actually omit (""/null/{}/etc.) - without this, e.g. seed=""
+            # would reach a raw float(seed) call below and fail with a cryptic conversion error
+            # instead of just... not filtering by seed.
+            seed = None if is_unset(seed) else seed
+            limit = 20 if is_unset(limit) else limit
+            if isinstance(status, str):
+                status = json.loads(status) if not is_unset(status) else None
+            elif is_unset(status):
+                status = None
+
             if not Path(v.JOB_DB_PATH).exists():
                 result: Dict[str, Any] = {
                     "success": True,
@@ -1808,7 +1824,7 @@ class Tools:
                     seed=seed,
                     server=server,
                     tool=None if is_unset(tool) else tool,
-                    status=status or None,
+                    status=status or None,  # status is already normalized above; `or None` just folds in an empty list
                     date_from=None if is_unset(date_from) else date_from,
                     date_to=None if is_unset(date_to) else date_to,
                     limit=min(limit, v.MAX_SEARCH_RESULTS) if limit else v.MAX_SEARCH_RESULTS,
@@ -1856,28 +1872,32 @@ class Tools:
             (completed jobs only), where job_search/prompt_search work. Any other value is treated
             as a specific GPU server address to read live history from, instead of the default
             server.
-        :param job_count: How many rows to show.
+        :param job_count: How many rows to show. Pass "" (or omit) for the default, 10.
         :param skip_to: Skip this many jobs before listing (pagination - combine with job_count to
-            page through results).
+            page through results). Pass "" (or omit) for the default, 0.
         :param job_search: database mode only. Matches a job's id (its own UUID or ComfyUI's own
-            prompt id) or filename, by substring.
-        :param prompt_search: database mode only. Free-text match over prompts.
+            prompt id) or filename, by substring. Pass "" (or omit) for no filter.
+        :param prompt_search: database mode only. Free-text match over prompts. Pass "" (or omit) for no filter.
         :param link_images: Make each row's filename a clickable link straight to the image on the
             GPU server, instead of plain text. Best-effort - the link may not open if the file's
-            since been deleted, or if your browser can't reach that server directly.
+            since been deleted, or if your browser can't reach that server directly. false to use plain text instead.
         """
         v = self.valves
 
         async def status_cb(text: str, done: bool = False):
             await _emit(__event_emitter__, {"type": "status", "data": {"description": text, "done": done}})
 
-        job_count = max(1, job_count)
-        skip_to = max(0, skip_to)
-        ds = None if is_unset(data_source) else data_source.strip()
-        is_database = ds is not None and ds.lower() == "database"
-
         await status_cb("Building the job library table...")
         try:
+            # Restore real defaults for any "skip"/unset sentinel before they reach max()/str(),
+            # which would otherwise raise an unhandled TypeError for e.g. job_count="".
+            job_count = 10 if is_unset(job_count) else job_count
+            skip_to = 0 if is_unset(skip_to) else skip_to
+            job_count = max(1, job_count)
+            skip_to = max(0, skip_to)
+            ds = None if is_unset(data_source) else str(data_source).strip()
+            is_database = ds is not None and ds.lower() == "database"
+
             if is_database:
                 if not Path(v.JOB_DB_PATH).exists():
                     table = "No job database found yet at JOB_DB_PATH - nothing has been logged, or JOB_DB_PATH doesn't match generate_image's/run_workflow's valve."
@@ -1943,23 +1963,23 @@ class Tools:
 
         :param job_id_or_filename: A job id (this tool's own UUID, or ComfyUI's own prompt id) or
             an image filename the job produced.
-        :param gpu_server: Omit to search all configured servers (default server first, live mode
-            only - database mode already knows each job's server).
-        :param data_source: Omit for the default: read the graph from a GPU server's own live
-            /history or queue - fails if that job's since rotated out of the server's retention.
-            Pass "database" to read it from the persistent job log instead, which keeps it forever
-            (as long as LOG_TO_SQLITE was on for that job).
+        :param gpu_server: Pass "" (or omit) to search all configured servers (default server
+            first, live mode only - database mode already knows each job's server).
+        :param data_source: Pass "" (or omit) for the default: read the graph from a GPU server's
+            own live /history or queue - fails if that job's since rotated out of the server's
+            retention. Pass "database" to read it from the persistent job log instead, which keeps
+            it forever (as long as LOG_TO_SQLITE was on for that job).
         """
         v = self.valves
 
         async def status_cb(text: str, done: bool = False):
             await _emit(__event_emitter__, {"type": "status", "data": {"description": text, "done": done}})
 
-        ds = None if is_unset(data_source) else data_source.strip()
-        is_database = ds is not None and ds.lower() == "database"
-
         await status_cb("Looking up the submitted graph...")
         try:
+            ds = None if is_unset(data_source) else str(data_source).strip()
+            is_database = ds is not None and ds.lower() == "database"
+
             if is_database:
                 found = await asyncio.to_thread(find_graph_in_db, v.JOB_DB_PATH, job_id_or_filename)
             else:

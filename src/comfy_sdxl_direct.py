@@ -1,7 +1,7 @@
 """
 title: ComfyUI SDXL Direct
 author: Gordon
-version: 2.1.0
+version: 2.2.0
 description: Sends prompt text and sampler settings straight to a local ComfyUI server's SDXL graph (txt2img, multi-pass img2img from earlier outputs, optional LoRAs), bypassing any paraphrasing step.
 """
 
@@ -1184,25 +1184,30 @@ class Tools:
         'use_as_source_image' can be passed as source_image, to chain across any of the three.
         already generated (multi-pass img2img).
 
+        Every parameter below except positive_prompt/negative_prompt is optional and has a normal
+        default. If your calling format requires a value for every parameter and won't let you
+        omit one, pass "" for an unused text parameter, "{}" or "[]" for loras, or the number/
+        boolean already shown as its default below - all are treated exactly like omitting it.
+
         :param positive_prompt: Positive prompt text, sent exactly as written.
         :param negative_prompt: Negative prompt text, sent exactly as written.
-        :param batch_size: Number of images to generate in one run.
-        :param source_image: Omit for normal text-to-image. To refine an earlier result, pass its 'use_as_source_image' value (and the same gpu_server). This switches to img2img; width/height are then taken from that image.
-        :param source_server: Only needed when source_image lives on a DIFFERENT server than gpu_server (e.g. moving a multi-pass job to another GPU). Set it to the server the source image was rendered on (its earlier result's 'server' value); the tool copies the file across before rendering. Omit when source_image is already on gpu_server.
-        :param denoise: Sampler denoise, 0.0-1.0. Default 1.0 for text-to-image and 0.6 for img2img. Lower values stay closer to source_image (about 0.3-0.5 for light refinement).
-        :param seed: Random seed. -1 picks a random one.
-        :param steps: Sampler steps.
-        :param cfg: CFG scale.
-        :param sampler_name: KSampler sampler, e.g. dpmpp_2m, dpmpp_2m_sde, dpmpp_sde, euler, euler_ancestral, ddim, uni_pc.
-        :param scheduler: KSampler scheduler, e.g. karras, normal, simple, exponential, sgm_uniform, beta.
-        :param width: Image width in pixels (text-to-image only, snapped to a multiple of 8).
-        :param height: Image height in pixels (text-to-image only, snapped to a multiple of 8).
-        :param checkpoint_name: Omit to use the configured default checkpoint. Only set this to an exact checkpoint filename as listed on the server.
-        :param loras: Omit for no LoRAs. Otherwise a list like [{"lora": "name.safetensors", "strength": 0.8}].
-        :param gpu_server: Omit to use the default server. Otherwise a configured server, or (if allowed) any ComfyUI address, full URL or bare IP.
-        :param return_img_url: If true, include download URLs for each image in the result: 'comfy_url' (direct link to the file on the GPU server) and 'chat_url' (the copy shown in the chat; an Open WebUI path when uploaded). Off by default to keep results small.
-        :param queue_only: If true, only submit the job and return immediately with its job id and queue position (or ComfyUI's error), without waiting for the render. Use when the server's queue is long. The image is saved to the GPU server's output folder but is NOT delivered to the chat in this mode.
-        :param verbose: Also return the full submitted workflow and server history.
+        :param batch_size: Number of images to generate in one run. Pass "" (or omit) for the default, 1.
+        :param source_image: Pass "" (or omit) for normal text-to-image. To refine an earlier result, pass its 'use_as_source_image' value (and the same gpu_server). This switches to img2img; width/height are then taken from that image.
+        :param source_server: Only needed when source_image lives on a DIFFERENT server than gpu_server (e.g. moving a multi-pass job to another GPU). Set it to the server the source image was rendered on (its earlier result's 'server' value); the tool copies the file across before rendering. Pass "" (or omit) when source_image is already on gpu_server.
+        :param denoise: Sampler denoise, 0.0-1.0. Pass "" (or omit) for the default: 1.0 for text-to-image, 0.6 for img2img. Lower values stay closer to source_image (about 0.3-0.5 for light refinement).
+        :param seed: Random seed. Pass "" (or omit), or -1, for a random one.
+        :param steps: Sampler steps. Pass "" (or omit) for the default, 25.
+        :param cfg: CFG scale. Pass "" (or omit) for the default, 5.0.
+        :param sampler_name: KSampler sampler, e.g. dpmpp_2m, dpmpp_2m_sde, dpmpp_sde, euler, euler_ancestral, ddim, uni_pc. Pass "" (or omit) for the default, dpmpp_2m.
+        :param scheduler: KSampler scheduler, e.g. karras, normal, simple, exponential, sgm_uniform, beta. Pass "" (or omit) for the default, karras.
+        :param width: Image width in pixels (text-to-image only, snapped to a multiple of 8). Pass "" (or omit) for the default, 1216.
+        :param height: Image height in pixels (text-to-image only, snapped to a multiple of 8). Pass "" (or omit) for the default, 824.
+        :param checkpoint_name: Pass "" (or omit) to use the configured default checkpoint. Only set this to an exact checkpoint filename as listed on the server.
+        :param loras: A list like [{"lora": "name.safetensors", "strength": 0.8}]. Pass "" (or omit), "{}", or "[]" for no LoRAs.
+        :param gpu_server: Pass "" (or omit) to use the default server. Otherwise a configured server, or (if allowed) any ComfyUI address, full URL or bare IP.
+        :param return_img_url: true to include download URLs for each image in the result: 'comfy_url' (direct link to the file on the GPU server) and 'chat_url' (the copy shown in the chat; an Open WebUI path when uploaded). false (the normal choice) keeps results small.
+        :param queue_only: true to only submit the job and return immediately with its job id and queue position (or ComfyUI's error), without waiting for the render - use when the server's queue is long; the image is saved to the GPU server's output folder but is NOT delivered to the chat in this mode. false (the normal choice) waits for the actual result.
+        :param verbose: true to also return the full submitted workflow and server history. false (the normal choice) otherwise.
         """
         v = self.valves
 
@@ -1214,12 +1219,36 @@ class Tools:
             allowed = list(dict.fromkeys(list(v.GPU_SERVERS) + [v.DEFAULT_GPU_SERVER]))
             server = resolve_server(gpu_server, v.DEFAULT_GPU_SERVER, allowed, v.ALLOW_UNLISTED_SERVERS)
 
-            # Models often send "default"/"null" for optional args they don't need.
+            # Models often send ""/"default"/"null"/None for an optional arg they don't need -
+            # including ones with a real (non-None) Python default, e.g. when a calling format's
+            # own schema won't let the model omit a declared parameter at all. Restore each one's
+            # real default before it's used, rather than letting a stray "" reach a numeric
+            # comparison below (which would raise an unhandled TypeError, not a clean error).
             checkpoint_name = None if is_unset(checkpoint_name) else checkpoint_name.strip()
             source_image = None if is_unset(source_image) else source_image.strip()
+            if is_unset(batch_size):
+                batch_size = 1
+            if is_unset(seed):
+                seed = -1
+            if is_unset(steps):
+                steps = 25
+            if is_unset(cfg):
+                cfg = 5.0
+            if is_unset(denoise):
+                denoise = None
+            if is_unset(sampler_name):
+                sampler_name = "dpmpp_2m"
+            if is_unset(scheduler):
+                scheduler = "karras"
+            if is_unset(width):
+                width = 1216
+            if is_unset(height):
+                height = 824
 
             if isinstance(loras, str):  # some models send JSON as a string
                 loras = json.loads(loras) if not is_unset(loras) else None
+            # An actual empty dict/list (not a string) already behaves like "no LoRAs" below,
+            # via `if loras:` here and `loras or None` where the workflow is built.
 
             if not 1 <= batch_size <= v.MAX_BATCH_SIZE:
                 raise ValueError(f"batch_size must be between 1 and {v.MAX_BATCH_SIZE}.")
@@ -1285,7 +1314,10 @@ class Tools:
                     record_job_built, v.JOB_DB_PATH, job_uuid, "generate_image", server,
                     input_json, workflow, positive_prompt, negative_prompt,
                 )
-        except (ValueError, json.JSONDecodeError, ComfyError) as e:
+        except (ValueError, TypeError, json.JSONDecodeError, ComfyError) as e:
+            # TypeError is here as a backstop for a genuinely malformed (not just "skipped") value
+            # slipping past the is_unset() normalization above - e.g. a non-numeric string for a
+            # numeric argument - so it becomes a clean error instead of an unhandled crash.
             return {"success": False, "error": str(e)}
 
         # ---- queue only: submit, report, don't wait -------------------------
