@@ -31,7 +31,7 @@ SRC_DIR = REPO_ROOT / "src"
 DEFAULT_SECRETS_FILE = REPO_ROOT / "secrets.md"
 BACKUP_DIR = REPO_ROOT / "tmp"
 
-TOOL_NAMES = ["comfy_sdxl_direct", "comfy_sdxl_graph", "comfy_sdxl_retrieve"]
+TOOL_NAMES = ["comfy_sdxl_direct", "comfy_sdxl_graph", "comfy_sdxl_retrieve", "comfy_sdxl_poses"]
 
 _KV_RE = re.compile(r"^([A-Za-z0-9_]+):\s*(.+?)\s*$")
 

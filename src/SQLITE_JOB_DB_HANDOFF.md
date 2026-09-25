@@ -280,6 +280,19 @@ given version already has its exact graph in `outputs` regardless). Lets `run_wo
 proven graph's JSON on every call. See README.md's 2026-09-24 status note for the full design and
 `save_workflow`/`list_workflows`/`get_workflow`/`delete_workflow` argument reference.
 
+## Pose catalog (added 2026-09-25, `comfy_sdxl_poses.py` only)
+
+A third, unrelated table in the same database file: `pose_references` (`pose_id` PK, `description`,
+`tags`, `kind`, `home_server`, `subfolder`, `filename`, `width`, `height`, `created_at`,
+`updated_at`, `created_by`). Not part of the jobs lifecycle above, and not mutable-with-a-version
+like `workflow_templates` — an `add_pose(overwrite=true)` just overwrites the row in place, since a
+pose reference has no meaningful revision history to preserve (unlike a workflow template, no past
+job result depends on which exact image a given `pose_id` pointed at). Each row just points at an
+image already sitting in some ComfyUI server's output folder (`home_server`/`subfolder`/
+`filename`) — the image bytes themselves are never stored in the database. See README.md's
+2026-09-25 (3) status note for the full design and `list_poses`/`get_pose`/`select_pose`/
+`add_pose`/`delete_pose` argument reference.
+
 ## What's left to do
 
 Nothing from the original job-DB scope. Possible future work, not currently planned:

@@ -29,8 +29,16 @@ Current tools:
   table (for showing the user directly — a "librarian" view, not a fetcher), and fetches the
   submitted ComfyUI graph itself for a job (most useful for run_workflow jobs, whose graphs are
   bespoke — pass it back to run_workflow, optionally edited, to resubmit).
+- `comfy_sdxl_poses.py` → `list_poses`, `get_pose`, `select_pose`, `add_pose`, `delete_pose` — a
+  catalog of reusable ControlNet pose reference images (pre-extracted skeleton/keypoint images
+  ready for `ControlNetApply`, or raw reference photos/drawings that still need a pose
+  preprocessor node), so a model can find a pose by description instead of a file path.
+  `select_pose` resolves a chosen pose to a ready-to-use `source_image` reference on whichever GPU
+  server you're about to render on (copying the file across servers first if needed), to pass
+  straight into `generate_image`'s or `run_workflow`'s own `source_image` argument. This tool never
+  renders anything itself — it's a catalog, same spirit as `run_workflow`'s workflow templates.
 
-All three files share a `GPU_SERVERS` valve list and a `resolve_server`/`resolve_checkpoint`-style
+All four files share a `GPU_SERVERS` valve list and a `resolve_server`/`resolve_checkpoint`-style
 matching approach, and are meant to be used together — see each tool's own `TOOLKIT` docstring
 paragraph for how they hand off to one another.
 
@@ -174,14 +182,56 @@ status note below for how this was found.
 | `gpu_server` | Omit to search all configured servers (live mode only) |
 | `data_source` | Omit for the default live server/queue; `"database"` for the persistent job log |
 
+### `list_poses` (comfy_sdxl_poses.py)
+
+| Argument | Expected value |
+|---|---|
+| `search` | Omit for all; otherwise a substring match over pose_id and description |
+| `tags` | Omit for all; otherwise an exact tag |
+| `kind` | Omit for both; otherwise `"skeleton"` or `"reference"` |
+| `limit` | Integer, default `20`, capped by the `MAX_POSE_LIST_RESULTS` valve |
+
+### `get_pose` (comfy_sdxl_poses.py)
+
+| Argument | Expected value |
+|---|---|
+| `pose_id` | Required. A pose's id, as shown by `list_poses` |
+
+### `select_pose` (comfy_sdxl_poses.py)
+
+| Argument | Expected value |
+|---|---|
+| `pose_id` | Required. A pose's id, as shown by `list_poses` |
+| `gpu_server` | Omit for the default server — the server you intend to render on |
+
+### `add_pose` (comfy_sdxl_poses.py)
+
+| Argument | Expected value |
+|---|---|
+| `pose_id` | Required. A slug (lowercase letters/digits/underscore/hyphen, 2–64 chars) — becomes `select_pose`'s/`get_pose`'s/`delete_pose`'s argument |
+| `description` | Required. Plain-language description of the pose — what `list_poses` searches |
+| `kind` | Required. `"skeleton"` (pre-extracted, ready for `ControlNetApply`) or `"reference"` (raw photo/drawing, needs a preprocessor first) |
+| `source_image` | An image already in a ComfyUI server's output folder. Give this XOR `openwebui_file` |
+| `openwebui_file` | An image already in Open WebUI's file storage — bare file id, or the `/api/v1/files/<id>/content` path/URL. Give this XOR `source_image` |
+| `gpu_server` | Omit for the default server — where `source_image` already lives, or where `openwebui_file`'s copy is uploaded |
+| `tags` | Omit for none; otherwise comma-separated, e.g. `"standing,action,openpose"` |
+| `overwrite` | Boolean, default `false` — must be `true` to replace an existing pose_id |
+
+### `delete_pose` (comfy_sdxl_poses.py)
+
+| Argument | Expected value |
+|---|---|
+| `pose_id` | Required. A pose's id, as shown by `list_poses` |
+
 ## Job database
 
-Every render attempt across all three tools — including ones ComfyUI rejected or that timed
-out — is durably logged to a **shared SQLite database** (one file, `JOB_DB_PATH`, identical across
-all three tools' valves). The same file also holds `workflow_templates` (saved graphs for
-`run_workflow`'s `workflow_id`, see above) — a separate, mutable table, not part of the append-only
-job log. Full schema, design rationale, and current status: `src/SQLITE_JOB_DB_HANDOFF.md`. Read
-that file before touching job-DB code.
+Every render attempt across `comfy_sdxl_direct.py`/`comfy_sdxl_graph.py` — including ones ComfyUI
+rejected or that timed out — is durably logged to a **shared SQLite database** (one file,
+`JOB_DB_PATH`, identical across all four tools' valves). The same file also holds
+`workflow_templates` (saved graphs for `run_workflow`'s `workflow_id`, see above) and
+`pose_references` (the pose catalog behind `comfy_sdxl_poses.py`, see above) — both separate,
+mutable tables, not part of the append-only job log. Full schema, design rationale, and current
+status: `src/SQLITE_JOB_DB_HANDOFF.md`. Read that file before touching job-DB code.
 
 The tools create this database's schema lazily and automatically on first write, so nothing needs
 to be run ahead of time. `python scripts/init_job_db.py <path>` exists anyway, as a standalone,
@@ -203,7 +253,7 @@ Each tool has a matching `test_*.py` file that simulates ComfyUI's HTTP API with
 module — no live ComfyUI or Open WebUI server needed. Run all of them from `src/`:
 
 ```
-python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve -v
+python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses -v
 ```
 
 `scripts/import_server_history.py` has its own test file the same way — run from `scripts/`:
@@ -226,7 +276,58 @@ re-importing through the OWUI web UI. It reads connection details and per-tool i
 `secrets.md` and fill it in (once per machine, since it's not checked into git). Usage:
 `python scripts/push_tool.py <tool_name|all> [--dry-run]`.
 
+**`push_tool.py` only updates a tool that already exists in OWUI — it can't create one.** For a
+brand-new tool (like `comfy_sdxl_poses` the first time), import it once through OWUI's web UI
+(Workspace → Tools → "+" → paste `src/<name>.py`'s content, or Import), copy the id OWUI assigns
+it into your local `secrets.md`, and `push_tool.py` can update it like the others from then on.
+
 ## Status notes
+
+### 2026-09-25 (3)
+Added `comfy_sdxl_poses.py` — a catalog for reusable ControlNet pose reference images, so a model
+can find a pose by description ("standing, hands on hips, facing camera") instead of needing a
+file path, in support of the project owner's request for a flexible, discoverable way to pose
+characters via ControlNet without needing to know what's available up front.
+
+Design, in line with the workflow-template pattern already established for `run_workflow`: this
+tool is a catalog only, and never renders anything itself.
+- `list_poses`/`get_pose` browse the catalog (stored in a new `pose_references` table in the same
+  shared SQLite database as everything else — see the Job database section).
+- `add_pose` registers an image already sitting somewhere reachable: either an existing ComfyUI
+  output-folder reference (`source_image`, e.g. a pose extraction the agent just rendered), or an
+  image already in Open WebUI's own file storage (`openwebui_file` — e.g. one the user attached in
+  chat), which gets downloaded and copied into the target GPU server's output folder automatically.
+  Every pose is tagged `kind="skeleton"` (a pre-extracted OpenPose/DWPose-style control image,
+  ready to feed a `ControlNetApply` node directly) or `kind="reference"` (a raw photo/drawing that
+  still needs a pose preprocessor node first) — this is the detail that determines how the graph
+  needs to be wired, so it's a required argument, not a guess.
+- `select_pose` is the actual integration point: given a `pose_id` and the `gpu_server` you're
+  about to render on, it copies the pose's image across servers if it isn't already there (reusing
+  the same cross-server copy logic `run_workflow`/`generate_image` use for `source_image`), and
+  returns a ready-to-use `source_image` string plus a kind-specific note on how to wire it. Pass
+  that straight into `generate_image`'s or `run_workflow`'s own `source_image` argument (same
+  `gpu_server`) — `run_workflow`'s fixed `LoadImageOutput` node
+  (`__comfy_tool_source_image__`) already exists for exactly this purpose, so no changes were
+  needed to `comfy_sdxl_graph.py` at all.
+- `add_pose(openwebui_file=...)` never trusts a model-supplied host when pulling the file — it
+  parses out just the file id (a UUID, or the last path segment) and always builds the request
+  against the tool's own `OPEN_WEBUI_BASE_URL` valve, so a crafted URL can't redirect the request
+  (carrying the `OPEN_WEBUI_API_KEY` bearer token) to an arbitrary host.
+- Width/height are captured best-effort via Pillow if it's importable, but are never required —
+  degrades gracefully to `None` if it isn't installed in the OWUI backend.
+
+`scripts/push_tool.py`'s `TOOL_NAMES` now includes `comfy_sdxl_poses`, and `secrets.example.md`
+documents it — but **push_tool.py can only update an existing tool, not create one**, so deploying
+this for the first time needs the project owner to import it once through OWUI's web UI and add
+its assigned id to their local `secrets.md` before `push_tool.py comfy_sdxl_poses` will work; see
+"Deploying a revision to OWUI" above. 21 new tests (`src/test_comfy_sdxl_poses.py`); full suite is
+188 tests passing (167 prior + 21 new), 1 pre-existing unrelated skip.
+
+**Not yet done / needs a real ComfyUI server:** the catalog is empty until something calls
+`add_pose` against an actual server — this still depends on the Workflow Builder agent's
+ControlNet-pose kickoff task (see `image-pipeline/prompts/agents/`) actually running, which needs
+the project owner to set up that OWUI model preset. Once it does, its first task should register
+whatever pose image(s) it produces via `add_pose`, not just save the workflow template.
 
 ### 2026-09-25 (2)
 Extended the previous entry's fix to `comfy_sdxl_direct.py` and `comfy_sdxl_retrieve.py`, per the
