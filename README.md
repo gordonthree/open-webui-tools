@@ -40,6 +40,13 @@ Quick reference for each tool method's arguments. This is the simple version —
 each argument expects, not the full docstring (see each tool's own `:param:` lines in `src/` for
 complete detail, e.g. exact sampler/scheduler name lists).
 
+**"Omit" always also means "or pass `\"\"` for text, `false` for booleans"** — every tool treats an
+empty string (and `null`/`none`/`default`/etc.) as equivalent to not passing the argument at all.
+This matters for a calling model whose own tool-calling format won't let it actually omit a
+declared parameter (e.g. some "strict" JSON-schema function-calling modes make every parameter
+`required` and express optionality only via a nullable type) — see `comfy_sdxl_graph.py`'s 2026-09-25
+status note below for how this was found.
+
 ### `generate_image` (comfy_sdxl_direct.py)
 
 | Argument | Expected value |
@@ -220,6 +227,35 @@ re-importing through the OWUI web UI. It reads connection details and per-tool i
 `python scripts/push_tool.py <tool_name|all> [--dry-run]`.
 
 ## Status notes
+
+### 2026-09-25
+A real-world test surfaced a bug in how a *different* frontier model (not this project's usual
+local one, tried out ad hoc by the project owner) called `run_workflow`: its tool-calling layer
+presented every parameter as `"required"` in the JSON schema regardless of the Python signature's
+own defaults — almost certainly OpenAI-style "strict" function-calling schema generation, which
+requires every property to be listed under `required` and expresses "optional" only by making a
+property's type nullable, not by actually omitting it. The model, told elsewhere to "omit unused
+arguments," got stuck for many turns reasoning in circles about what to pass for parameters it
+believed it couldn't leave out — at one point considering passing an existing image's filename as
+`workflow_id` (which names a *saved template*, not an image) as a workaround.
+
+The tool's runtime already treated `""`/`"none"`/`null`/etc. as equivalent to omission for every
+optional string parameter (`is_unset()` predates this fix) — this was a documentation gap, not a
+logic bug. Every optional parameter's docstring across `comfy_sdxl_graph.py` now says explicitly to
+pass `""` (or `false` for a boolean) when a caller's format won't allow omitting it, `run_workflow`
+spells out that `workflow`/`workflow_id` need exactly one real value and an empty string for the
+other, `workflow_id`'s docstring now says outright it must name an *existing* template (never an
+image filename or an invented name for a new graph), and `get_node_info`/`list_node_types` now
+warn explicitly that a node's `class_type` (not its cosmetic `display_name`) is what belongs in a
+graph. Two new tests lock in the `""`/`false`-as-omitted contract as tested behavior rather than an
+implicit accident. Bump to 1.3.0.
+
+**Not yet done, same class of bug likely present:** `comfy_sdxl_direct.py` and
+`comfy_sdxl_retrieve.py` use the identical "Optional, omit for default" docstring convention for
+their own optional parameters, so a strict-schema caller would hit the same confusion there. Worth
+the same documentation pass once there's evidence it actually causes trouble in practice for those
+two (their argument lists are shorter and simpler than `run_workflow`'s, so the failure mode may be
+less severe).
 
 ### 2026-09-24 (2)
 Added node discovery to `comfy_sdxl_graph.py`: `list_node_types` (browse installed node types,

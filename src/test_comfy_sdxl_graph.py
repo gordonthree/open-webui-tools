@@ -700,6 +700,37 @@ class WorkflowTemplateTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(res["success"])
         self.assertIn("overrides", res["error"])
 
+    async def test_run_workflow_treats_empty_string_sentinels_as_omitted(self):
+        # Some callers' tool-calling formats can't omit a declared parameter and must send
+        # something for every one of them (e.g. an OpenAI-style "strict" function schema, where
+        # every property lands in "required" regardless of the Python signature's own defaults).
+        # The docstrings now explicitly promise "" (and false) are safe stand-ins for omission;
+        # this locks that promise in as a real, tested contract rather than an implicit accident.
+        fake = FakeComfy(checkpoints=["epicrealismXL_pureFix.safetensors"])
+        with patch.object(mod, "requests", fake):
+            res = await self.tool.run_workflow(
+                workflow=json.dumps(MINIMAL_GRAPH),
+                workflow_id="",
+                overrides="",
+                source_image="",
+                source_server="",
+                gpu_server="",
+                return_img_url=False,
+                queue_only=False,
+                verbose=False,
+            )
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["server"], "http://gpu:8188")  # fell through to DEFAULT_GPU_SERVER
+
+    async def test_save_workflow_treats_empty_string_sentinels_as_omitted(self):
+        res = await self.tool.save_workflow(
+            name="my_template", workflow=json.dumps(MINIMAL_GRAPH), description="A minimal test graph.",
+            placeholders="", tags="", overwrite=False,
+        )
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["placeholders"], {})
+        self.assertEqual(res["tags"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

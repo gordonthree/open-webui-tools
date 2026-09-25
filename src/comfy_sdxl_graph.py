@@ -1,7 +1,7 @@
 """
 title: ComfyUI SDXL Graph
 author: Gordon
-version: 1.2.0
+version: 1.3.0
 description: Companion to ComfyUI SDXL Direct. Submits a full, model-authored ComfyUI API-format
     workflow graph (ControlNet, compositing, anything the fixed generate_image graph can't reach).
     Requires a SaveImage node so an image is guaranteed to land in the server's output folder, and
@@ -1217,9 +1217,9 @@ class Tools:
         (class_type, display name, category, short description) for whatever matches `search`, not
         full schemas - call get_node_info next for the specific node you're about to wire in.
 
-        :param search: Substring match (case-insensitive) over class_type, display name, and category. Omit to list everything - a real search term (e.g. "controlnet", "lora", "rgthree", "pose") is strongly recommended, since an unfiltered list is capped by MAX_NODE_LIST_RESULTS and mostly unhelpful noise.
-        :param gpu_server: Omit for the default server.
-        :param refresh: Re-fetch the node registry from the server instead of using this process's cached copy. Only useful right after installing/removing a custom node pack there.
+        :param search: Substring match (case-insensitive) over class_type, display name, and category. Pass "" (or omit) to list everything - a real search term (e.g. "controlnet", "lora", "rgthree", "pose") is strongly recommended, since an unfiltered list is capped by MAX_NODE_LIST_RESULTS and mostly unhelpful noise.
+        :param gpu_server: Pass "" (or omit) for the default server.
+        :param refresh: true to re-fetch the node registry from the server instead of using this process's cached copy - only useful right after installing/removing a custom node pack there. false (the normal choice) otherwise.
         """
         v = self.valves
         try:
@@ -1261,8 +1261,13 @@ class Tools:
         list_node_types has confirmed it exists on this server - never guess a third-party node's
         inputs from its name alone, especially a custom-pack one like rgthree's nodes.
 
-        :param class_type: The exact class_type, as returned by list_node_types.
-        :param gpu_server: Omit for the default server.
+        IMPORTANT: the result's own "class_type" field is the exact string to put in your graph's
+        node definition ({"class_type": ..., "inputs": {...}}) - that is what ComfyUI's API
+        actually reads. "display_name" is a cosmetic label shown in ComfyUI's UI only; putting a
+        display_name where class_type belongs will make the graph rejected or silently wrong.
+
+        :param class_type: The exact class_type, as returned by list_node_types (its "class_type" field, not "display_name").
+        :param gpu_server: Pass "" (or omit) for the default server.
         """
         v = self.valves
         try:
@@ -1299,9 +1304,9 @@ class Tools:
         :param name: A short slug (2-64 chars: lowercase letters, digits, underscore, hyphen), e.g. "controlnet_openpose_sdxl". This becomes run_workflow's workflow_id.
         :param workflow: The ComfyUI API-format graph as a JSON string - the same shape run_workflow's own `workflow` argument takes (no reserved source-image node; that's injected automatically at render time, same as always).
         :param description: One or two plain-language sentences: what this graph does and when to use it. This is what list_workflows shows, so write it for a model deciding whether to reuse this template, not for yourself.
-        :param placeholders: Optional JSON object mapping a parameter name you choose (e.g. "positive_prompt", "seed", "denoise", "controlnet_strength") to [node_id, input_name] - the literal (non-link) input in this graph that parameter should overwrite. This is what makes run_workflow's `overrides` argument work later without resending the graph. Omit for a template with no adjustable parameters.
-        :param tags: Optional comma-separated tags (e.g. "controlnet,pose") to help list_workflows filtering.
-        :param overwrite: Must be true to replace an existing template with this name; otherwise a name collision is an error, to avoid silently clobbering someone else's saved graph.
+        :param placeholders: JSON object mapping a parameter name you choose (e.g. "positive_prompt", "seed", "denoise", "controlnet_strength") to [node_id, input_name] - the literal (non-link) input in this graph that parameter should overwrite. This is what makes run_workflow's `overrides` argument work later without resending the graph. Pass "" (or omit) for a template with no adjustable parameters.
+        :param tags: Comma-separated tags (e.g. "controlnet,pose") to help list_workflows filtering. Pass "" (or omit) for none.
+        :param overwrite: true to replace an existing template with this name; false (the normal choice) makes a name collision an error instead, to avoid silently clobbering someone else's saved graph.
         """
         try:
             tname = validate_template_name(name)
@@ -1355,8 +1360,8 @@ class Tools:
         you actually need the full graph back (e.g. to inspect or build a variant); to just render
         with one, pass its name straight to run_workflow's workflow_id.
 
-        :param tag: Optional. Only templates whose tags include this one, exactly.
-        :param search: Optional. Substring match over name and description.
+        :param tag: Only templates whose tags include this one, exactly. Pass "" (or omit) for no tag filter.
+        :param search: Substring match over name and description. Pass "" (or omit) for no text filter.
         :param limit: Maximum rows returned, default 20.
         """
         rows = await asyncio.to_thread(list_workflow_templates, self.valves.JOB_DB_PATH, tag, search, limit)
@@ -1470,15 +1475,22 @@ class Tools:
         list the same way generate_image does (exact, case/path-insensitive, or a unique match by
         filename), so folder or naming differences between servers don't need to be hard-coded.
 
-        :param workflow: The ComfyUI API-format graph as a JSON string. Omit if using workflow_id instead.
-        :param workflow_id: The name of a template saved with save_workflow, in place of `workflow`. See list_workflows/get_workflow.
-        :param overrides: Only with workflow_id. JSON object of parameter name -> new literal value, for whichever placeholders that template registered (see get_workflow's `placeholders`).
-        :param source_image: Optional. A filename in the target server's output folder (e.g. an earlier generate_image or run_workflow result's 'use_as_source_image') to feed into the fixed LoadImageOutput node. Omit to leave that node pointed at the placeholder.
-        :param source_server: Only needed when source_image lives on a DIFFERENT server than gpu_server; set it to the server the source image is on and the file is copied across first.
-        :param gpu_server: Omit to use the default server. Otherwise a configured server, or (if allowed) any ComfyUI address.
-        :param return_img_url: If true, include download URLs for each image: 'comfy_url', 'chat_url', and a ready-made 'link_markdown'.
-        :param queue_only: If true, only submit the job and return its job id and queue position (or ComfyUI's error) without waiting for the render.
-        :param verbose: Also return the exact graph submitted (after SaveImage/LoadImageOutput preparation) and the server's history entry.
+        Every parameter below except `workflow`/`workflow_id` themselves is optional. If your
+        calling format requires a value for every parameter and won't let you omit one, pass an
+        empty string ("") for an unused text parameter, or false for an unused boolean one - both
+        are treated exactly the same as leaving it out. `workflow` and `workflow_id` are the one
+        pair where exactly one, not both, must be a real (non-empty) value; give the other one an
+        empty string.
+
+        :param workflow: The ComfyUI API-format graph as a JSON string, for a new or one-off design. Give this a real value XOR workflow_id - pass "" here when using workflow_id instead.
+        :param workflow_id: The name of an EXISTING template already returned by list_workflows or created by save_workflow - never a name you're inventing for a brand-new graph (build that with `workflow` instead, then save_workflow it afterward if you want to name it). Give this a real value XOR workflow - pass "" here when using workflow.
+        :param overrides: Only meaningful with workflow_id. JSON object of parameter name -> new literal value, for whichever placeholders that template registered (see get_workflow's `placeholders`). Pass "" (or omit) when not using workflow_id, or when reusing a template with no changes.
+        :param source_image: A filename in the target server's output folder (e.g. an earlier generate_image or run_workflow result's 'use_as_source_image') to feed into the fixed LoadImageOutput node. Pass "" (or omit) for no source image - that node then points at a harmless placeholder instead.
+        :param source_server: Only needed when source_image lives on a DIFFERENT server than gpu_server; set it to the server the source image is on and the file is copied across first. Pass "" (or omit) otherwise.
+        :param gpu_server: A configured server, or (if allowed) any ComfyUI address. Pass "" (or omit) to use the default server.
+        :param return_img_url: true to include download URLs for each image: 'comfy_url', 'chat_url', and a ready-made 'link_markdown'. false (the normal choice) otherwise.
+        :param queue_only: true to only submit the job and return its job id and queue position (or ComfyUI's error) without waiting for the render. false (the normal choice) to wait for the actual result.
+        :param verbose: true to also return the exact graph submitted (after SaveImage/LoadImageOutput preparation) and the server's history entry. false (the normal choice) otherwise.
         """
         v = self.valves
 
