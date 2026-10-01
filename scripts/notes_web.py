@@ -120,6 +120,13 @@ def render_note(db: str, name: str) -> str:
     if note["note_comment"]:
         body += f"<p>{e(note['note_comment'])}</p>"
     body += f"<p class='muted'>{result['total']} entries; started by {e(result['started_by'] or 'unknown')}, created {e(when(note['created_at']))}, updated {e(when(note['updated_at']))}</p>"
+    sm = result["summary"]
+    if sm:
+        flag = " &middot; <b>stale: the note changed since</b>" if sm["stale"] else ""
+        body += (
+            f"<div class='entry'><span class='muted'>Summary by {e(sm['author_name'] or 'unknown')} &middot; "
+            f"{e(when(sm['last_summarized']))}{flag}</span><pre>{e(sm['summary_text'])}</pre></div>"
+        )
     for r in entries:
         edited = f" &middot; edited {e(when(r['edited_at']))}" if r["edited_at"] else ""
         body += (

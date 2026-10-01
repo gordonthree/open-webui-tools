@@ -238,7 +238,7 @@ entry text 500 — enforced by the tool (with an actionable message) and by SQLi
 
 | Method | Arguments |
 |---|---|
-| `list_notes` | `limit` (default `20`, capped by `MAX_LIST_RESULTS`) |
+| `list_notes` | `limit` (default `20`, capped by `MAX_LIST_RESULTS`); `needs_summary=true` lists only notes with no summary or a stale one. The table has a Summary column: none/current/stale |
 | `read_note` | `name` (required); `limit` — most recent N entries, default/max `MAX_READ_ENTRIES` |
 | `create_note` | `name`, `text` (first entry) required; `comment` optional. Refuses if the name already exists — use `append_note` |
 | `append_note` | `name`, `text` required |
@@ -247,6 +247,9 @@ entry text 500 — enforced by the tool (with an actionable message) and by SQLi
 | `update_note` | `name` required; any of `new_name`, `comment`, or `clear_comment=true` (an empty `comment` means "unchanged", so clearing needs the flag) |
 | `delete_note` | `name` required. Removes the note and all its entries, no confirmation |
 | `search_notes` | `query` required; `limit` (default `10` per list, capped by `MAX_SEARCH_RESULTS`). Returns matching notes (name/comment) and matching entries |
+| `update_summary` | `name`, `summary` (≤500 chars, whitespace collapsed) required; `author_name` optional. Creates or replaces the note's one summary |
+| `search_summary` | `query` required; `limit` (default `10`, capped by `MAX_SEARCH_RESULTS`). Splits the query into words, any word can match a note name or summary, ranked by words matched; each result carries `stale` |
+| `delete_summary` | `name` required. Refuses if the note has no summary |
 
 Every delete is a real `DELETE` (no soft-delete/undo); deleting a note relies on SQLite's
 `ON DELETE CASCADE`, so the tool enables `PRAGMA foreign_keys` on every connection. Schema: `note_id`
@@ -266,7 +269,18 @@ newer ones despite its higher number.
 model name Open WebUI passes as `__model__` (name, else id), else `Unknown agent`. An existing
 database is upgraded in place on first connect (nullable `author_id` columns added, old rows set to
 #1) — back it up first if it matters. Nullable also means an older copy of the tool can still write
-to an upgraded database; its rows just show author `unknown`. `notes_web.py` attributes its writes
+to an upgraded database; its rows just show author `unknown`.
+
+Summaries (v1.3.0), for a scheduled sub agent to keep current so agents can search them RAG-style:
+`note_summary` has one row per note (`note_pk` primary key, so `update_summary` is an upsert; cascades
+on note delete, survives rename) with `summary_text` (≤500), `author_id`, `last_summarized`, and
+`source_updated_at` + `source_entries` — a snapshot of the note when it was summarized. A summary is
+**stale** when the note's `updated_at` or entry count no longer matches the snapshot (the count
+catches backdated appends, which don't move `updated_at`). Staleness is computed, never stored, and
+a note edited between the summarizer reading it and writing the summary is treated as current until
+its next change. Search is word-based `LIKE` over name + summary (no FTS5/embeddings) — fine for
+hundreds of notes. `read_note` includes the summary; `notes_web.py` shows it. New table only, so an
+older tool copy keeps working against the upgraded database. `notes_web.py` attributes its writes
 to `--author` (default `Gordon`).
 
 ## Job database

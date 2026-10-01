@@ -393,6 +393,117 @@ class TimestampTests(NotesTestCase):
         self.assertGreater(self.sql("SELECT created_at FROM note_author WHERE author_name = 'Claude'")[0][0], "2026")
 
 
+class SummaryTests(NotesTestCase):
+    def summarize(self, name="n", text="the dragon lives in a lair", **kw):
+        return self.run_async(self.tool.update_summary(name, text, **kw))
+
+    def test_update_creates_then_replaces(self):
+        self.create("n", "x")
+        first = self.summarize(author_name="Nightly")
+        self.assertTrue(first["success"] and first["created"])
+        second = self.summarize(text="revised summary")
+        self.assertTrue(second["success"] and not second["created"])
+        self.assertEqual(self.sql("SELECT COUNT(*), summary_text FROM note_summary"), [(1, "revised summary")])
+
+    def test_summary_requires_existing_note_and_valid_text(self):
+        self.assertFalse(self.summarize("nope")["success"])
+        self.create("n", "x")
+        self.assertFalse(self.summarize(text="")["success"])
+        long = self.summarize(text="y" * 501)
+        self.assertFalse(long["success"])
+        self.assertIn("limit is 500", long["error"])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM note_summary"), [(0,)])
+
+    def test_summary_whitespace_is_collapsed_and_database_enforces_limit(self):
+        self.create("n", "x")
+        self.summarize(text="line one\n\nline   two")
+        self.assertEqual(self.sql("SELECT summary_text FROM note_summary"), [("line one line two",)])
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn = sqlite3.connect(self.db)
+            try:
+                conn.execute("UPDATE note_summary SET summary_text = ?", ("z" * 501,))
+            finally:
+                conn.close()
+
+    def test_author_and_read_note_shows_summary_and_staleness(self):
+        self.create("n", "x")
+        self.summarize(author_name="Nightly")
+        got = self.run_async(self.tool.read_note("n"))["summary"]
+        self.assertEqual((got["summarized_by"], got["stale"]), ("Nightly", False))
+        self.run_async(self.tool.append_note("n", "more"))
+        self.assertTrue(self.run_async(self.tool.read_note("n"))["summary"]["stale"])
+
+    def test_edit_backdated_append_and_delete_entry_all_make_it_stale(self):
+        self.create("n", "x")
+        self.run_async(self.tool.append_note("n", "y"))
+        steps = [
+            lambda: self.tool.edit_entry("n", 1, "x2"),
+            lambda: self.tool.append_note("n", "old", created_at="2020-01-01"),  # leaves updated_at alone
+            lambda: self.tool.delete_entry("n", 2),
+        ]
+        for step in steps:
+            self.summarize()
+            self.assertFalse(self.run_async(self.tool.read_note("n"))["summary"]["stale"])
+            self.run_async(step())
+            self.assertTrue(self.run_async(self.tool.read_note("n"))["summary"]["stale"])
+
+    def test_rename_keeps_summary_and_delete_note_removes_it(self):
+        self.create("n", "x")
+        self.summarize()
+        self.run_async(self.tool.update_note("n", new_name="m"))
+        self.assertIn("summary", self.run_async(self.tool.read_note("m")))
+        self.run_async(self.tool.delete_note("m"))
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM note_summary"), [(0,)])
+
+    def test_list_notes_summary_column_and_needs_summary_filter(self):
+        self.create("none", "x")
+        self.create("stale", "x")
+        self.create("current", "x")
+        self.summarize("stale")
+        self.run_async(self.tool.append_note("stale", "changed"))
+        self.summarize("current")
+        table = self.run_async(self.tool.list_notes())["table"]
+        for name, state in [("none", "none"), ("stale", "stale"), ("current", "current")]:
+            self.assertRegex(table, rf"\| {name} \|.*\| {state} \|")
+        todo = self.run_async(self.tool.list_notes(needs_summary=True))
+        self.assertEqual(todo["count"], 2)
+        self.assertNotIn("\n| current |", todo["table"])
+        self.summarize("none")
+        self.summarize("stale")
+        self.assertIn("Every note", self.run_async(self.tool.list_notes(needs_summary=True))["table"])
+
+    def test_search_ranks_by_matched_words_and_matches_note_names(self):
+        for name, text in [("a", "dragon lair map"), ("b", "dragon only"), ("c", "unrelated tavern"), ("lair-notes", "misc")]:
+            self.create(name, "x")
+            self.summarize(name, text)
+        res = self.run_async(self.tool.search_summary("Dragon LAIR"))
+        self.assertEqual(res["results"][0]["note_name"], "a")  # both words; the other two match one each
+        self.assertEqual(res["results"][0]["matched_words"], "2 of 2")
+        self.assertEqual({r["note_name"] for r in res["results"]}, {"a", "b", "lair-notes"})
+        self.assertEqual(self.run_async(self.tool.search_summary("zzz"))["results"], [])
+
+    def test_search_wildcards_are_literal_limit_and_required_query(self):
+        self.create("n", "x")
+        self.summarize("n", "100% done")
+        self.assertEqual(self.run_async(self.tool.search_summary("%"))["count"], 1)
+        self.assertEqual(self.run_async(self.tool.search_summary("_"))["count"], 0)
+        self.assertFalse(self.run_async(self.tool.search_summary(" "))["success"])
+
+    def test_search_flags_stale_results(self):
+        self.create("n", "x")
+        self.summarize("n", "alpha")
+        self.run_async(self.tool.append_note("n", "y"))
+        self.assertTrue(self.run_async(self.tool.search_summary("alpha"))["results"][0]["stale"])
+
+    def test_delete_summary(self):
+        self.create("n", "x")
+        self.assertFalse(self.run_async(self.tool.delete_summary("n"))["success"])  # none yet
+        self.summarize()
+        self.assertTrue(self.run_async(self.tool.delete_summary("n"))["success"])
+        self.assertNotIn("summary", self.run_async(self.tool.read_note("n")))
+        self.assertEqual(self.run_async(self.tool.read_note("n"))["total_entries"], 1)
+
+
 class AuthorMigrationTests(NotesTestCase):
     OLD_SCHEMA = """
     CREATE TABLE note_id (

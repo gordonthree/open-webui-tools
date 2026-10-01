@@ -1,13 +1,17 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.2.0
+version: 1.3.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
     diffed. Notes are addressed by their plain-language name, entries by their number.
     list_notes/read_note/search_notes browse; create_note/append_note add; edit_entry/
     delete_entry/update_note/delete_note maintain. Every delete is permanent.
+
+    Each note can also carry one short summary (update_summary/search_summary/delete_summary),
+    meant to be kept current by a scheduled sub agent so other agents can find the right note by
+    searching summaries instead of reading everything.
 
     Every note and entry records its author: pass author_name when writing, or the tool uses the
     name of the model Open WebUI says is calling it. Entries are stamped with the current time
@@ -43,6 +47,7 @@ logger.setLevel(logging.INFO)
 NOTE_NAME_MAX = 60
 NOTE_COMMENT_MAX = 500
 NOTE_TEXT_MAX = 500
+SUMMARY_MAX = 500
 AUTHOR_NAME_MAX = 60
 LEGACY_AUTHOR = "Mara Voss"  # author #1: seeded into every notes database, and given every row that predates authors
 FALLBACK_AUTHOR = "Unknown agent"  # used only when the caller gave no author_name and Open WebUI named no model
@@ -74,6 +79,14 @@ CREATE TABLE IF NOT EXISTS note_data (
     PRIMARY KEY (note_pk, entry_no)
 );
 CREATE INDEX IF NOT EXISTS idx_note_data_time ON note_data(note_pk, created_at);
+CREATE TABLE IF NOT EXISTS note_summary (
+    note_pk INTEGER PRIMARY KEY REFERENCES note_id(note_pk) ON DELETE CASCADE,
+    summary_text TEXT NOT NULL CHECK (length(summary_text) BETWEEN 1 AND {SUMMARY_MAX}),
+    author_id INTEGER REFERENCES note_author(author_id),
+    last_summarized TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')),
+    source_updated_at TEXT NOT NULL,
+    source_entries INTEGER NOT NULL
+);
 """
 
 DB_BUSY_TIMEOUT_S = 5.0
@@ -216,6 +229,15 @@ def resolve_author(author_name: Any, model: Any) -> str:
     return FALLBACK_AUTHOR
 
 
+def validate_summary(text: Any) -> str:
+    cleaned = " ".join(str(text or "").split())  # a summary is one paragraph: collapse newlines and runs of spaces
+    if not cleaned:
+        raise NoteError("Summary text is required and can't be empty (use delete_summary to remove a summary).")
+    if len(cleaned) > SUMMARY_MAX:
+        raise NoteError(f"Summary is {len(cleaned)} characters; the limit is {SUMMARY_MAX} (over by {len(cleaned) - SUMMARY_MAX}). Tighten it.")
+    return cleaned
+
+
 def validate_timestamp(value: Any) -> Optional[str]:
     """None if unset; else a UTC ISO-8601 string. Accepts ISO-8601 text (a date alone, or with a time
     and optional offset/'Z'; no offset means UTC) or a Unix epoch in seconds, milliseconds,
@@ -303,6 +325,12 @@ def _name_taken_error(name: str) -> NoteError:
     return NoteError(f"A note named {name!r} already exists (names are matched ignoring case).")
 
 
+# "This summary no longer matches the note": the note changed (updated_at moved, which covers edits and
+# deletes) or has a different number of entries (which covers a backdated append, since that deliberately
+# leaves updated_at alone). Needs the note_summary row as `s` and the note_id row as `n`.
+_STALE_SQL = "(s.source_updated_at != n.updated_at OR s.source_entries != (SELECT COUNT(*) FROM note_data x WHERE x.note_pk = n.note_pk))"
+
+
 def create_note_db(db_path: str, name: str, text: str, comment: str, author: str, created_at: Optional[str] = None) -> Dict[str, Any]:
     conn = notes_db_connect(db_path)
     try:
@@ -355,6 +383,60 @@ def append_entry_db(db_path: str, name: str, text: str, author: str, created_at:
         conn.close()
 
 
+def update_summary_db(db_path: str, name: str, summary: str, author: str) -> Dict[str, Any]:
+    conn = notes_db_connect(db_path)
+    try:
+        with _write_txn(conn):
+            note = _get_note(conn, name)
+            now = _now_iso()
+            entries = conn.execute("SELECT COUNT(*) FROM note_data WHERE note_pk = ?", (note["note_pk"],)).fetchone()[0]
+            existed = conn.execute("SELECT 1 FROM note_summary WHERE note_pk = ?", (note["note_pk"],)).fetchone() is not None
+            conn.execute(
+                "INSERT INTO note_summary (note_pk, summary_text, author_id, last_summarized, source_updated_at, source_entries) "
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(note_pk) DO UPDATE SET summary_text = excluded.summary_text, "
+                "author_id = excluded.author_id, last_summarized = excluded.last_summarized, "
+                "source_updated_at = excluded.source_updated_at, source_entries = excluded.source_entries",
+                (note["note_pk"], summary, _author_id(conn, author, now), now, note["updated_at"], entries),
+            )
+        return {"note_name": note["note_name"], "created": not existed, "last_summarized": now, "author": author, "entries_covered": entries}
+    finally:
+        conn.close()
+
+
+def delete_summary_db(db_path: str, name: str) -> Dict[str, Any]:
+    conn = notes_db_connect(db_path)
+    try:
+        with _write_txn(conn):
+            note = _get_note(conn, name)
+            removed = conn.execute("DELETE FROM note_summary WHERE note_pk = ?", (note["note_pk"],)).rowcount
+        if not removed:
+            raise NoteError(f"Note {note['note_name']!r} has no summary to delete.")
+        return {"note_name": note["note_name"]}
+    finally:
+        conn.close()
+
+
+def search_summaries_db(db_path: str, query: str, limit: int) -> "tuple[List[Any], int]":
+    """Match any word of the query against note names and summaries; most matching words first."""
+    words = list(dict.fromkeys(query.lower().split()))[:8]
+    if not words:
+        raise NoteError("query is required.")
+    likes = [f"%{_like_escape(w)}%" for w in words]
+    score = " + ".join("(n.note_name LIKE ? ESCAPE '\\' OR s.summary_text LIKE ? ESCAPE '\\')" for _ in words)
+    params: List[Any] = [x for like in likes for x in (like, like)]
+    conn = notes_db_connect(db_path)
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM (SELECT n.note_name, s.summary_text, s.last_summarized, a.author_name, {_STALE_SQL} AS stale, ({score}) AS score "
+            "FROM note_summary s JOIN note_id n ON n.note_pk = s.note_pk LEFT JOIN note_author a ON a.author_id = s.author_id) "
+            "WHERE score > 0 ORDER BY score DESC, last_summarized DESC LIMIT ?",
+            params + [limit],
+        ).fetchall()
+        return rows, len(words)
+    finally:
+        conn.close()
+
+
 def read_note_db(db_path: str, name: str, limit: int) -> Dict[str, Any]:
     conn = notes_db_connect(db_path)
     try:
@@ -367,22 +449,34 @@ def read_note_db(db_path: str, name: str, limit: int) -> Dict[str, Any]:
             (note["note_pk"], limit),
         ).fetchall()
         starter = conn.execute("SELECT author_name FROM note_author WHERE author_id = ?", (note["author_id"],)).fetchone()
-        return {"note": note, "started_by": starter["author_name"] if starter else None, "total": total, "entries": list(reversed(rows))}
+        summary = conn.execute(
+            f"SELECT s.summary_text, s.last_summarized, a.author_name, {_STALE_SQL} AS stale "
+            "FROM note_summary s JOIN note_id n ON n.note_pk = s.note_pk LEFT JOIN note_author a ON a.author_id = s.author_id WHERE s.note_pk = ?",
+            (note["note_pk"],),
+        ).fetchone()
+        return {
+            "note": note,
+            "started_by": starter["author_name"] if starter else None,
+            "summary": summary,
+            "total": total,
+            "entries": list(reversed(rows)),
+        }
     finally:
         conn.close()
 
 
-def list_notes_db(db_path: str, limit: int) -> "tuple[int, List[Any]]":
+def list_notes_db(db_path: str, limit: int, needs_summary: bool = False) -> "tuple[int, List[Any]]":
     conn = notes_db_connect(db_path)
     try:
-        total = conn.execute("SELECT COUNT(*) FROM note_id").fetchone()[0]
         rows = conn.execute(
-            "SELECT n.note_name, n.note_comment, n.updated_at, COUNT(d.entry_no) AS entries, a.author_name "
+            "SELECT * FROM (SELECT n.note_pk, n.note_name, n.note_comment, n.updated_at, COUNT(d.entry_no) AS entries, a.author_name, "
+            f"CASE WHEN s.note_pk IS NULL THEN 'none' WHEN {_STALE_SQL} THEN 'stale' ELSE 'current' END AS summary_state "
             "FROM note_id n LEFT JOIN note_data d ON d.note_pk = n.note_pk LEFT JOIN note_author a ON a.author_id = n.author_id "
-            "GROUP BY n.note_pk ORDER BY n.updated_at DESC, n.note_pk DESC LIMIT ?",
-            (limit,),
+            "LEFT JOIN note_summary s ON s.note_pk = n.note_pk GROUP BY n.note_pk) "
+            "WHERE (? = 0 OR summary_state != 'current') ORDER BY updated_at DESC, note_pk DESC",
+            (1 if needs_summary else 0,),
         ).fetchall()
-        return total, rows
+        return len(rows), rows[:limit]
     finally:
         conn.close()
 
@@ -498,27 +592,32 @@ class Tools:
         self.valves = self.Valves()
         self.citation = False
 
-    async def list_notes(self, limit: Optional[int] = None) -> Dict[str, Any]:
+    async def list_notes(self, limit: Optional[int] = None, needs_summary: bool = False) -> Dict[str, Any]:
         """
         List the notes that exist, most recently changed first, as a Markdown table (name, number
         of entries, last updated, comment). Start here to see whether a note already exists
         before creating one. Call read_note to see a note's contents.
 
+        The Summary column says whether the note has a summary: none, current, or stale (the note
+        changed since it was summarized).
+
         :param limit: Maximum notes returned, default 20. Pass "" (or omit) for the default.
+        :param needs_summary: true to list only notes whose summary is missing or stale (a summarizing agent's to-do list). Pass false (the normal choice) otherwise.
         """
         v = self.valves
         try:
             cap = min(_to_int(limit, 20, "limit"), v.MAX_LIST_RESULTS)
-            total, rows = await asyncio.to_thread(list_notes_db, v.NOTES_DB_PATH, cap)
+            total, rows = await asyncio.to_thread(list_notes_db, v.NOTES_DB_PATH, cap, _to_bool(needs_summary))
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
         if not rows:
-            return {"success": True, "count": 0, "total_notes": 0, "table": "No notes yet - use create_note to start one."}
-        lines = ["| Note | Entries | Last updated (UTC) | Started by | Comment |", "|---|---|---|---|---|"]
+            empty = "Every note has a current summary." if _to_bool(needs_summary) else "No notes yet - use create_note to start one."
+            return {"success": True, "count": 0, "total_notes": 0, "table": empty}
+        lines = ["| Note | Entries | Last updated (UTC) | Started by | Summary | Comment |", "|---|---|---|---|---|---|"]
         for r in rows:
             lines.append(
                 f"| {_cell(r['note_name'], NOTE_NAME_MAX)} | {r['entries']} | {r['updated_at'][:16].replace('T', ' ')} "
-                f"| {_cell(r['author_name'] or 'unknown', AUTHOR_NAME_MAX)} | {_cell(r['note_comment'])} |"
+                f"| {_cell(r['author_name'] or 'unknown', AUTHOR_NAME_MAX)} | {r['summary_state']} | {_cell(r['note_comment'])} |"
             )
         out: Dict[str, Any] = {"success": True, "count": len(rows), "total_notes": total, "table": "\n".join(lines)}
         if total > len(rows):
@@ -554,6 +653,14 @@ class Tools:
             "total_entries": result["total"],
             "entries": entries,
         }
+        if result["summary"]:
+            sm = result["summary"]
+            out["summary"] = {
+                "text": sm["summary_text"],
+                "last_summarized": sm["last_summarized"],
+                "summarized_by": sm["author_name"] or "unknown",
+                "stale": bool(sm["stale"]),
+            }
         if result["total"] > len(entries):
             out["note"] = (
                 f"Showing the {len(entries)} most recent of {result['total']} entries. "
@@ -731,3 +838,80 @@ class Tools:
                 for r in entries
             ],
         }
+
+    async def update_summary(
+        self, name: str, summary: str, author_name: Optional[str] = None, __model__: Optional[dict] = None
+    ) -> Dict[str, Any]:
+        """
+        Write (or replace) a note's summary: a brief, searchable description of what the note
+        contains, so other agents can find it with search_summary without reading every note. Each
+        note has at most one summary; calling this again replaces it. Read the whole note first
+        (read_note) so the summary reflects all of it.
+
+        Write for retrieval: name the key people, places, decisions and topics in plain words, since
+        search_summary matches on the words used. LIMIT: 500 characters (a longer one is refused,
+        nothing is saved).
+
+        :param name: The note's name, as shown by list_notes (case doesn't matter).
+        :param summary: The summary, at most 500 characters, one paragraph.
+        :param author_name: Who wrote the summary, at most 60 characters. Pass "" (or omit) to be recorded under your model's name.
+        """
+        try:
+            result = await asyncio.to_thread(
+                update_summary_db,
+                self.valves.NOTES_DB_PATH,
+                validate_name(name),
+                validate_summary(summary),
+                resolve_author(author_name, __model__),
+            )
+        except (ValueError, sqlite3.Error) as e:
+            return _error(e)
+        return {"success": True, **result}
+
+    async def search_summary(self, query: str, limit: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Search the notes' summaries (and note names) for the words in a query, best match first.
+        Use this to find which note holds what you need, then read_note for the details. Any
+        word of the query can match; notes matching more of the words rank higher, so a few
+        distinctive keywords work better than a full sentence. A result marked stale means the
+        note changed after it was summarized, so confirm with read_note.
+
+        :param query: A few keywords, e.g. "dragon lair map".
+        :param limit: Maximum results, default 10. Pass "" (or omit) for the default.
+        """
+        v = self.valves
+        try:
+            if not query or not str(query).strip():
+                raise NoteError("query is required.")
+            cap = min(_to_int(limit, 10, "limit"), v.MAX_SEARCH_RESULTS)
+            rows, words = await asyncio.to_thread(search_summaries_db, v.NOTES_DB_PATH, str(query).strip(), cap)
+        except (ValueError, sqlite3.Error) as e:
+            return _error(e)
+        return {
+            "success": True,
+            "count": len(rows),
+            "results": [
+                {
+                    "note_name": r["note_name"],
+                    "summary": r["summary_text"],
+                    "matched_words": f"{r['score']} of {words}",
+                    "last_summarized": r["last_summarized"],
+                    "summarized_by": r["author_name"] or "unknown",
+                    "stale": bool(r["stale"]),
+                }
+                for r in rows
+            ],
+        }
+
+    async def delete_summary(self, name: str) -> Dict[str, Any]:
+        """
+        Permanently remove a note's summary. The note and its entries are untouched. Normally you
+        don't need this - update_summary replaces a summary - but it clears one that is wrong.
+
+        :param name: The note's name, as shown by list_notes (case doesn't matter).
+        """
+        try:
+            result = await asyncio.to_thread(delete_summary_db, self.valves.NOTES_DB_PATH, validate_name(name))
+        except (ValueError, sqlite3.Error) as e:
+            return _error(e)
+        return {"success": True, **result}

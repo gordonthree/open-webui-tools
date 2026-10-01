@@ -94,6 +94,17 @@ class HandlerTests(unittest.TestCase):
         self.assertIn("#2 &middot; Hand Typed", body)
         self.assertIn("<td>Gordon</td>", self.get("/")[2])
 
+    def test_summary_is_shown_with_stale_flag(self):
+        self.post("/create", name="n", text="x")
+        self.assertNotIn("Summary by", self.get("/note", name="n")[2])
+        web.notes.update_summary_db(self.db, "n", "the gist", "Nightly")
+        body = self.get("/note", name="n")[2]
+        self.assertIn("Summary by Nightly", body)
+        self.assertIn("the gist", body)
+        self.assertNotIn("stale", body)
+        self.post("/append", name="n", text="y")
+        self.assertIn("stale: the note changed since", self.get("/note", name="n")[2])
+
     def test_unknown_routes(self):
         self.assertEqual(self.get("/nope")[0], 404)
         self.assertEqual(self.post("/nope", name="x")[0], 404)
