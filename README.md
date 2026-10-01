@@ -38,7 +38,15 @@ Current tools:
   straight into `generate_image`'s or `run_workflow`'s own `source_image` argument. This tool never
   renders anything itself — it's a catalog, same spirit as `run_workflow`'s workflow templates.
 
-All four files share a `GPU_SERVERS` valve list and a `resolve_server`/`resolve_checkpoint`-style
+- `agent_notes.py` → `list_notes`, `read_note`, `create_note`, `append_note`, `edit_entry`,
+  `delete_entry`, `update_note`, `delete_note`, `search_notes` — a persistent notebook for agents,
+  an easier-to-drive alternative to Open WebUI's built-in `note` tool. Unrelated to ComfyUI. A note
+  is a name plus an append-only log of short numbered entries, in its **own** SQLite file
+  (`agent_notes.sqlite3`, `NOTES_DB_PATH` valve — not the job database, though it defaults to the
+  same folder). Notes are addressed by name (unique, case-insensitive) and entries by number; there
+  are no UUIDs, since a model reproduces a plain-language name more reliably than an opaque id.
+
+The four ComfyUI files share a `GPU_SERVERS` valve list and a `resolve_server`/`resolve_checkpoint`-style
 matching approach, and are meant to be used together — see each tool's own `TOOLKIT` docstring
 paragraph for how they hand off to one another.
 
@@ -223,6 +231,29 @@ status note below for how this was found.
 |---|---|
 | `pose_id` | Required. A pose's id, as shown by `list_poses` |
 
+### `agent_notes` tool arguments (agent_notes.py)
+
+Same `""`/`false` = omitted convention as above. Limits: note name 60 characters, note comment 500,
+entry text 500 — enforced by the tool (with an actionable message) and by SQLite `CHECK`s.
+
+| Method | Arguments |
+|---|---|
+| `list_notes` | `limit` (default `20`, capped by `MAX_LIST_RESULTS`) |
+| `read_note` | `name` (required); `limit` — most recent N entries, default/max `MAX_READ_ENTRIES` |
+| `create_note` | `name`, `text` (first entry) required; `comment` optional. Refuses if the name already exists — use `append_note` |
+| `append_note` | `name`, `text` required |
+| `edit_entry` | `name`, `entry_no` (e.g. `3` or `"#3"`), `text` — all required |
+| `delete_entry` | `name`, `entry_no` — both required. Other entries keep their numbers; numbers are never reused |
+| `update_note` | `name` required; any of `new_name`, `comment`, or `clear_comment=true` (an empty `comment` means "unchanged", so clearing needs the flag) |
+| `delete_note` | `name` required. Removes the note and all its entries, no confirmation |
+| `search_notes` | `query` required; `limit` (default `10` per list, capped by `MAX_SEARCH_RESULTS`). Returns matching notes (name/comment) and matching entries |
+
+Every delete is a real `DELETE` (no soft-delete/undo); deleting a note relies on SQLite's
+`ON DELETE CASCADE`, so the tool enables `PRAGMA foreign_keys` on every connection. Schema: `note_id`
+(internal integer key, `note_name` with a unique case-insensitive index, `note_comment`,
+`next_entry_no` counter, timestamps) and `note_data` (`note_pk`, `entry_no`, `note_text`,
+`created_at`, `edited_at`), entries ordered by `created_at`.
+
 ## Job database
 
 Every render attempt across `comfy_sdxl_direct.py`/`comfy_sdxl_graph.py` — including ones ComfyUI
@@ -253,7 +284,7 @@ Each tool has a matching `test_*.py` file that simulates ComfyUI's HTTP API with
 module — no live ComfyUI or Open WebUI server needed. Run all of them from `src/`:
 
 ```
-python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses -v
+python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes -v
 ```
 
 `scripts/import_server_history.py` has its own test file the same way — run from `scripts/`:
@@ -282,6 +313,24 @@ brand-new tool (like `comfy_sdxl_poses` the first time), import it once through 
 it into your local `secrets.md`, and `push_tool.py` can update it like the others from then on.
 
 ## Status notes
+
+### 2026-10-01
+Added `agent_notes.py` (v1.0.0), a notebook tool for agents, because Open WebUI's built-in `note`
+tool is built for a human and model co-editing one text blob in chat, and an agent can't easily
+update it. Here a note is a name plus an append-only log of numbered entries; adding to a note
+inserts a row instead of editing text. Design decisions made with the project owner:
+- Its own database file (`agent_notes.sqlite3`), not the job DB, in the same folder.
+- Single user, no per-user scoping.
+- Notes addressed by unique (case-insensitive) name, entries by per-note number — UUIDs were
+  considered and dropped. Names are the identity, so `create_note` refuses a duplicate and points at
+  `append_note`; the schema keeps a hidden integer key only so renames don't rewrite entry rows.
+- Agents can edit and delete entries and whole notes. Soft-delete (`deleted_flag`/`deleted_at` plus
+  a valve) was designed and then dropped: every delete is a plain row removal, no confirmation.
+- Length limits: name 60, comment 500, entry text 500.
+
+39 tests in `src/test_agent_notes.py`, all passing. Not yet deployed: needs a one-time import through
+OWUI's web UI and its id added to `secrets.md` (see "Deploying a revision to OWUI"). Not run against
+a live Open WebUI yet, so how a given model handles the tool-calling format is untested.
 
 ### 2026-09-25 (3)
 Added `comfy_sdxl_poses.py` — a catalog for reusable ControlNet pose reference images, so a model

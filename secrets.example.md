@@ -23,6 +23,7 @@ comfy_sdxl_direct: <tool-id>
 comfy_sdxl_graph: <tool-id>
 comfy_sdxl_retrieve: <tool-id>
 comfy_sdxl_poses: <tool-id>
+agent_notes: <tool-id>
 
 Note: push_tool.py only UPDATES a tool that already exists in OWUI - it can't create one. For a
 brand-new tool (e.g. comfy_sdxl_poses the first time), import it once through OWUI's web UI
