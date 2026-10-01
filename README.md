@@ -252,7 +252,22 @@ Every delete is a real `DELETE` (no soft-delete/undo); deleting a note relies on
 `ON DELETE CASCADE`, so the tool enables `PRAGMA foreign_keys` on every connection. Schema: `note_id`
 (internal integer key, `note_name` with a unique case-insensitive index, `note_comment`,
 `next_entry_no` counter, timestamps) and `note_data` (`note_pk`, `entry_no`, `note_text`,
-`created_at`, `edited_at`), entries ordered by `created_at`.
+`created_at`, `edited_at`, `author_id`), entries ordered by `created_at`. Authors (v1.1.0):
+`note_author` (`author_id` autonumber, `author_name` unique ignoring case, `created_at`); both other
+tables carry an `author_id` (the note's starter, the entry's writer; editing doesn't change it).
+Author #1 is `Mara Voss`, seeded into every database and given every row that predates authors.
+`create_note`/`append_note` also take an optional `created_at` (v1.2.0) so old notes can be moved in
+with their real dates: ISO 8601 (a bare date, or with time/offset/`Z`; no offset = UTC) or a Unix
+epoch in s/ms/µs/ns (Open WebUI's own notes use ns), stored as UTC ISO; unparseable, future (>1 day)
+or pre-1970 values are refused, and blank means now. A backdated append never moves the note's
+`updated_at` backwards, and entries read back in time order, so a backdated entry shows before
+newer ones despite its higher number.
+`create_note`/`append_note` take an optional `author_name` (max 60); if blank the tool uses the
+model name Open WebUI passes as `__model__` (name, else id), else `Unknown agent`. An existing
+database is upgraded in place on first connect (nullable `author_id` columns added, old rows set to
+#1) — back it up first if it matters. Nullable also means an older copy of the tool can still write
+to an upgraded database; its rows just show author `unknown`. `notes_web.py` attributes its writes
+to `--author` (default `Gordon`).
 
 ## Job database
 
@@ -277,6 +292,15 @@ a brand-new row (`tool='external'`) for anything with no matching row at all —
 directly through ComfyUI's own UI, or from before job logging existed. `--dry-run` previews
 without writing. Bounded by the server's own history retention (cleared on restart), same as
 `retrieve_image`'s `history=<count>` mode.
+
+### Notes web interface (scripts/notes_web.py)
+
+A standalone LAN web UI for the `agent_notes` database, run from the docker host with no OWUI
+involved: `python3 scripts/notes_web.py --db /path/to/agent_notes.sqlite3 [--host 0.0.0.0] [--port 8765]`.
+Browse, search, create, append, edit/delete entries, rename/re-comment and delete notes, all through
+`agent_notes.py`'s own `*_db` functions (same limits and transactions as the tool). Server-rendered
+HTML, stdlib only apart from the `pydantic` that importing `agent_notes` needs. No auth and no CSRF
+protection by design — trusted LAN only. Tests: `cd scripts && python3 -m unittest test_notes_web -v`.
 
 ## Testing
 

@@ -301,5 +301,144 @@ class ListAndSearchTests(NotesTestCase):
         self.assertFalse(self.run_async(self.tool.search_notes(""))["success"])
 
 
+class AuthorTests(NotesTestCase):
+    def authors(self):
+        return self.sql("SELECT author_id, author_name, created_at FROM note_author ORDER BY author_id")
+
+    def test_fresh_database_has_mara_voss_as_author_one_with_a_timestamp(self):
+        self.create()
+        first = self.authors()[0]
+        self.assertEqual(first[:2], (1, "Mara Voss"))
+        self.assertTrue(first[2])
+
+    def test_explicit_author_name_is_recorded_on_note_and_entries(self):
+        self.run_async(self.tool.create_note("n", "one", "", "Claude"))
+        self.run_async(self.tool.append_note("n", "two", "Gemma"))
+        res = self.run_async(self.tool.read_note("n"))
+        self.assertEqual(res["started_by"], "Claude")
+        self.assertEqual([e["author"] for e in res["entries"]], ["Claude", "Gemma"])
+        self.assertEqual([a[1] for a in self.authors()], ["Mara Voss", "Claude", "Gemma"])
+
+    def test_model_name_from_open_webui_is_the_default(self):
+        self.run_async(self.tool.create_note("n", "one", __model__={"id": "qwen3:32b", "name": "Qwen 3"}))
+        self.run_async(self.tool.append_note("n", "two", author_name="", __model__={"id": "only-an-id"}))
+        self.assertEqual([e["author"] for e in self.run_async(self.tool.read_note("n"))["entries"]], ["Qwen 3", "only-an-id"])
+
+    def test_explicit_name_beats_model_and_blank_everything_falls_back(self):
+        self.run_async(self.tool.create_note("n", "one", author_name="Me", __model__={"name": "Qwen 3"}))
+        self.run_async(self.tool.append_note("n", "two"))
+        self.assertEqual([e["author"] for e in self.run_async(self.tool.read_note("n"))["entries"]], ["Me", mod.FALLBACK_AUTHOR])
+
+    def test_authors_are_reused_ignoring_case_and_whitespace(self):
+        self.run_async(self.tool.create_note("n", "one", author_name="Claude"))
+        self.run_async(self.tool.append_note("n", "two", "  claude "))
+        self.run_async(self.tool.append_note("n", "three", "mara voss"))
+        self.assertEqual([a[1] for a in self.authors()], ["Mara Voss", "Claude"])
+        self.assertEqual(self.sql("SELECT author_id FROM note_data ORDER BY entry_no"), [(2,), (2,), (1,)])
+
+    def test_author_name_limit(self):
+        res = self.run_async(self.tool.create_note("n", "one", author_name="x" * 61))
+        self.assertFalse(res["success"])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM note_id") if Path(self.db).exists() else [(0,)], [(0,)])
+
+    def test_list_and_search_show_authors(self):
+        self.run_async(self.tool.create_note("n", "needle", author_name="Claude"))
+        self.assertIn("| Claude |", self.run_async(self.tool.list_notes())["table"])
+        self.assertEqual(self.run_async(self.tool.search_notes("needle"))["matching_entries"][0]["author"], "Claude")
+
+
+class TimestampTests(NotesTestCase):
+    def test_create_with_created_at_dates_note_and_first_entry(self):
+        res = self.run_async(self.tool.create_note("old", "x", created_at="2026-03-01T14:30:00Z"))
+        self.assertEqual(res["created_at"], "2026-03-01T14:30:00+00:00")
+        self.assertEqual(self.sql("SELECT created_at, updated_at FROM note_id"), [("2026-03-01T14:30:00+00:00",) * 2])
+        self.assertEqual(self.sql("SELECT created_at FROM note_data"), [("2026-03-01T14:30:00+00:00",)])
+
+    def test_backdated_append_sorts_by_time_and_keeps_updated_at(self):
+        self.create("n", "now-ish")
+        before = self.sql("SELECT updated_at FROM note_id")
+        self.run_async(self.tool.append_note("n", "from last year", created_at="2025-01-02"))
+        self.assertEqual(self.sql("SELECT updated_at FROM note_id"), before)
+        entries = self.run_async(self.tool.read_note("n"))["entries"]
+        self.assertEqual([(e["entry_no"], e["created_at"][:10]) for e in entries][0], (2, "2025-01-02"))
+        self.assertEqual(entries[1]["entry_no"], 1)
+
+    def test_newer_than_note_timestamp_advances_updated_at(self):
+        self.run_async(self.tool.create_note("n", "a", created_at="2025-01-01"))
+        self.run_async(self.tool.append_note("n", "b", created_at="2025-06-01T00:00:00+00:00"))
+        self.assertEqual(self.sql("SELECT updated_at FROM note_id"), [("2025-06-01T00:00:00+00:00",)])
+
+    def test_accepted_formats_normalize_to_utc(self):
+        for value, expected in [
+            ("2026-03-01", "2026-03-01T00:00:00+00:00"),
+            ("2026-03-01T14:30:00", "2026-03-01T14:30:00+00:00"),
+            ("2026-03-01T09:30:00-05:00", "2026-03-01T14:30:00+00:00"),
+            (1772375400, "2026-03-01T14:30:00+00:00"),  # seconds
+            ("1772375400000", "2026-03-01T14:30:00+00:00"),  # milliseconds
+            (1772375400000000000, "2026-03-01T14:30:00+00:00"),  # nanoseconds (Open WebUI's own notes)
+        ]:
+            self.assertEqual(mod.validate_timestamp(value), expected, value)
+
+    def test_blank_means_now_and_bad_values_are_refused_without_writing(self):
+        self.assertIsNone(mod.validate_timestamp(""))
+        before = self.create("n", "x")["created_at"]
+        for bad in ["yesterday", "2999-01-01", "1960-01-01"]:
+            res = self.run_async(self.tool.append_note("n", "y", created_at=bad))
+            self.assertFalse(res["success"], bad)
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM note_data"), [(1,)])
+        self.assertGreaterEqual(self.run_async(self.tool.append_note("n", "z"))["created_at"], before)
+
+    def test_author_row_keeps_real_time_when_entry_is_backdated(self):
+        self.run_async(self.tool.create_note("n", "x", author_name="Claude", created_at="2020-01-01"))
+        self.assertGreater(self.sql("SELECT created_at FROM note_author WHERE author_name = 'Claude'")[0][0], "2026")
+
+
+class AuthorMigrationTests(NotesTestCase):
+    OLD_SCHEMA = """
+    CREATE TABLE note_id (
+        note_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+        note_name TEXT NOT NULL, note_comment TEXT NOT NULL DEFAULT '', next_entry_no INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE UNIQUE INDEX idx_note_name ON note_id(lower(note_name));
+    CREATE TABLE note_data (
+        note_pk INTEGER NOT NULL REFERENCES note_id(note_pk) ON DELETE CASCADE, entry_no INTEGER NOT NULL,
+        note_text TEXT NOT NULL, created_at TEXT NOT NULL, edited_at TEXT, PRIMARY KEY (note_pk, entry_no));
+    INSERT INTO note_id VALUES (1, 'old', '', 3, '2026-09-30T00:00:00+00:00', '2026-09-30T00:00:00+00:00');
+    INSERT INTO note_data VALUES (1, 1, 'a', '2026-09-30T00:00:00+00:00', NULL), (1, 2, 'b', '2026-09-30T00:01:00+00:00', NULL);
+    """
+
+    def exec_raw(self, script):
+        Path(self.db).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.db)
+        conn.executescript(script)
+        conn.close()
+
+    def make_old_db(self):
+        self.exec_raw(self.OLD_SCHEMA)
+
+    def test_existing_rows_are_attributed_to_author_one(self):
+        self.make_old_db()
+        res = self.run_async(self.tool.read_note("old"))
+        self.assertEqual(res["started_by"], "Mara Voss")
+        self.assertEqual([e["author"] for e in res["entries"]], ["Mara Voss", "Mara Voss"])
+        self.assertEqual(self.sql("SELECT author_id, author_name FROM note_author"), [(1, "Mara Voss")])
+
+    def test_new_writes_after_migration_get_their_own_author(self):
+        self.make_old_db()
+        self.run_async(self.tool.append_note("old", "c", "Claude"))
+        authors = [e["author"] for e in self.run_async(self.tool.read_note("old"))["entries"]]
+        self.assertEqual(authors, ["Mara Voss", "Mara Voss", "Claude"])
+
+    def test_migration_is_idempotent_and_does_not_reattribute_later_unattributed_rows(self):
+        self.make_old_db()
+        self.run_async(self.tool.list_notes())
+        # a row written by an older copy of the tool, after the upgrade, has no author...
+        self.exec_raw("INSERT INTO note_data (note_pk, entry_no, note_text, created_at) VALUES (1, 3, 'late', 'x')")
+        mod._schema_ready.discard(self.db)  # ...and stays that way when another process migrates again
+        res = self.run_async(self.tool.read_note("old"))
+        self.assertEqual(res["entries"][-1]["author"], "unknown")
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM note_author"), [(1,)])
+
+
 if __name__ == "__main__":
     unittest.main()
