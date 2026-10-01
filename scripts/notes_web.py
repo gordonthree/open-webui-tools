@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import agent_notes as notes  # noqa: E402
 
 DEFAULT_AUTHOR = "Gordon"  # who notes/entries made through this page are attributed to (--author)
-DEFAULT_DB = "/app/backend/data/comfy_outputs/agent_notes.sqlite3"
+DEFAULT_DB = "/home/gordon/docker/open-webui/data/comfy_outputs/agent_notes.sqlite3"
 ALL = 10**9  # "no limit" for the *_db functions
 MAX_BODY = 64 * 1024
 
