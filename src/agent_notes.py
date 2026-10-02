@@ -352,7 +352,7 @@ def _get_note(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
     return row
 
 
-def _get_entry(conn: sqlite3.Connection, note: sqlite3.Row, entry_no: int) -> sqlite3.Row:
+def _get_entry(conn: sqlite3.Connection, note: sqlite3.Row, entry_no: str) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM note_data WHERE note_pk = ? AND entry_no = ?", (note["note_pk"], entry_no)).fetchone()
     if row is None:
         have = [r["entry_no"] for r in conn.execute("SELECT entry_no FROM note_data WHERE note_pk = ? ORDER BY entry_no", (note["note_pk"],))]
@@ -554,7 +554,7 @@ def search_notes_db(db_path: str, query: str, limit: int) -> "tuple[List[Any], L
         conn.close()
 
 
-def edit_entry_db(db_path: str, name: str, entry_no: int, text: str) -> Dict[str, Any]:
+def edit_entry_db(db_path: str, name: str, entry_no: str, text: str) -> Dict[str, Any]:
     conn = notes_db_connect(db_path)
     try:
         with _write_txn(conn):
@@ -568,7 +568,7 @@ def edit_entry_db(db_path: str, name: str, entry_no: int, text: str) -> Dict[str
         conn.close()
 
 
-def delete_entry_db(db_path: str, name: str, entry_no: int) -> Dict[str, Any]:
+def delete_entry_db(db_path: str, name: str, entry_no: str) -> Dict[str, Any]:
     conn = notes_db_connect(db_path)
     try:
         with _write_txn(conn):
@@ -764,6 +764,10 @@ def _error(e: Exception) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 class Tools:
+    # Number parameters are annotated str on purpose: Open WebUI runs int() on a string given for an
+    # int/Optional[int] parameter *before* the method sees it, so the "" the docstrings tell models to
+    # pass for "default" (or "#3" for an entry) would fail there. It converts a number to str for a
+    # str parameter, and _to_int() does the parsing, so 5, "5", "" and "#3" all work.
     class Valves(BaseModel):
         NOTES_DB_PATH: str = Field(
             default="/app/backend/data/comfy_outputs/agent_notes.sqlite3",
@@ -777,7 +781,7 @@ class Tools:
         self.valves = self.Valves()
         self.citation = False
 
-    async def agent_notes_list(self, limit: Optional[int] = None, needs_summary: bool = False, tag: Optional[str] = None) -> Dict[str, Any]:
+    async def agent_notes_list(self, limit: Optional[str] = None, needs_summary: bool = False, tag: Optional[str] = None) -> Dict[str, Any]:
         """
         List the notes that exist, most recently changed first, as a Markdown table (name, number
         of entries, last updated, comment). Start here to see whether a note already exists
@@ -818,7 +822,7 @@ class Tools:
             out["note"] = f"Showing {len(rows)} of {total} notes; pass a larger limit (max {v.MAX_LIST_RESULTS}) for more."
         return out
 
-    async def agent_notes_read(self, name: str, limit: Optional[int] = None) -> Dict[str, Any]:
+    async def agent_notes_read(self, name: str, limit: Optional[str] = None) -> Dict[str, Any]:
         """
         Read a note: its comment and its entries in chronological order, each with its entry
         number. If the note has more entries than fit, you get the most recent ones and the
@@ -924,7 +928,7 @@ class Tools:
             return _error(e)
         return {"success": True, **result}
 
-    async def agent_notes_edit_entry(self, name: str, entry_no: int, text: str) -> Dict[str, Any]:
+    async def agent_notes_edit_entry(self, name: str, entry_no: str, text: str) -> Dict[str, Any]:
         """
         Replace the text of one existing entry, keeping its number and its place in the note.
 
@@ -944,7 +948,7 @@ class Tools:
             return _error(e)
         return {"success": True, **result}
 
-    async def agent_notes_delete_entry(self, name: str, entry_no: int) -> Dict[str, Any]:
+    async def agent_notes_delete_entry(self, name: str, entry_no: str) -> Dict[str, Any]:
         """
         Permanently delete one entry from a note. The other entries keep their numbers (numbers
         are never reused).
@@ -1070,7 +1074,7 @@ class Tools:
             return _error(e)
         return {"success": True, **result}
 
-    async def agent_notes_search(self, query: str, limit: Optional[int] = None) -> Dict[str, Any]:
+    async def agent_notes_search(self, query: str, limit: Optional[str] = None) -> Dict[str, Any]:
         """
         Search every note for some text (case-insensitive substring). Matches note names and
         comments, and the text of individual entries; returns both lists so you can find which
@@ -1125,7 +1129,7 @@ class Tools:
             return _error(e)
         return {"success": True, **result}
 
-    async def agent_notes_search_summary(self, query: str, limit: Optional[int] = None) -> Dict[str, Any]:
+    async def agent_notes_search_summary(self, query: str, limit: Optional[str] = None) -> Dict[str, Any]:
         """
         Search the notes' summaries (and note names) for the words in a query, best match first.
         Use this to find which note holds what you need, then agent_notes_read for the details. Any

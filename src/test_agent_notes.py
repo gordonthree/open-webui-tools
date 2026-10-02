@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from typing import Optional
 from pathlib import Path
 
 import agent_notes as mod
@@ -667,6 +668,15 @@ class TagTests(NotesTestCase):
         conn.close()
         mod._schema_ready.discard(self.db)
         self.assertTrue(self.tag("old", "fresh")["success"])
+
+
+class OpenWebUICoercionTests(unittest.TestCase):
+    def test_no_method_is_annotated_int(self):
+        """Open WebUI int()s a string for an int-annotated parameter before our code runs (so "" or "#3" would fail)."""
+        import inspect
+        for name, fn in inspect.getmembers(mod.Tools, inspect.iscoroutinefunction):
+            for pname, param in inspect.signature(fn).parameters.items():
+                self.assertNotIn(param.annotation, (int, Optional[int]), f"{name}({pname})")
 
 
 if __name__ == "__main__":
