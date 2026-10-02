@@ -605,8 +605,14 @@ class TagTests(NotesTestCase):
     def test_tag_validation(self):
         self.assertFalse(self.tag("alpha", "")["success"])
         self.assertFalse(self.tag("alpha", "x" * 41)["success"])
-        self.assertFalse(self.tag("alpha", "bad/tag!")["success"])
+        self.assertFalse(self.tag("alpha", "!!!")["success"])
         self.assertFalse(self.tag("missing", "ok")["success"])
+
+    def test_punctuation_is_cleaned_up_and_reported(self):
+        res = self.tag("alpha", "Habits & Interests, don't/stop, C++")
+        self.assertEqual(res["tags"], ["c++", "dont-stop", "habits-and-interests"])
+        self.assertEqual(res["adjusted"], {"Habits & Interests": "habits-and-interests", "don't/stop": "dont-stop"})
+        self.assertNotIn("adjusted", self.tag("beta", "Plain Tag")) 
 
     def test_per_note_limit(self):
         self.tag("alpha", ", ".join(f"topic{chr(97 + i) * 6}" for i in range(mod.MAX_TAGS_PER_NOTE)))

@@ -247,15 +247,23 @@ def resolve_author(author_name: Any, model: Any) -> str:
 
 
 def normalize_tag(text: Any) -> str:
-    """Lowercase, with runs of spaces/underscores/hyphens turned into one hyphen: 'Comfy UI' -> 'comfy-ui'."""
-    cleaned = re.sub(r"-{2,}", "-", re.sub(r"[\s_]+", "-", str(text or "").strip().lower())).strip("-")
+    """Make any text a valid tag instead of refusing it: lowercase, '&' becomes 'and', apostrophes vanish, every
+    other character outside letters/digits/. + # becomes a hyphen, and runs of hyphens collapse:
+    'Habits & Interests' -> 'habits-and-interests', 'Comfy UI' -> 'comfy-ui'."""
+    cleaned = str(text or "").strip().lower().replace("&", " and ")
+    cleaned = re.sub(r"['\u2019`\"]", "", cleaned)
+    cleaned = re.sub(r"-{2,}", "-", re.sub(r"[^\w.+#]+|_+", "-", cleaned)).strip("-")
     if not cleaned:
-        raise NoteError("A tag can't be empty.")
+        raise NoteError(f"{str(text).strip()!r} has no letters or digits to make a tag from.")
     if len(cleaned) > TAG_MAX:
         raise NoteError(f"Tag {cleaned!r} is {len(cleaned)} characters; the limit is {TAG_MAX}. Use a shorter tag.")
-    if not re.fullmatch(r"[\w.+#-]+", cleaned):
-        raise NoteError(f"Tag {cleaned!r} has characters other than letters, digits and . + # - (separate several tags with commas).")
     return cleaned
+
+
+def tag_adjustments(value: Any) -> Dict[str, str]:
+    """Tags whose characters had to be changed (beyond case and spacing), as {what was given: what it became}."""
+    parts = value if isinstance(value, (list, tuple)) else str(value or "").replace(";", ",").split(",")
+    return {str(p).strip(): normalize_tag(p) for p in parts if str(p).strip() and re.search(r"[^\w\s.+#-]", str(p))}
 
 
 def split_tags(value: Any) -> List[str]:
@@ -1022,7 +1030,7 @@ class Tools:
         If you give a NEW tag that resembles existing ones, nothing is saved and the reply lists the
         similar tags: retry with one of those. Only when none fit, pass create=true to make it.
 
-        LIMITS: a tag is at most 40 characters (letters, digits and . + # -), a note has at most 10 tags.
+        LIMITS: a tag is at most 40 characters, a note has at most 10 tags. Punctuation is cleaned up for you ("Habits & Interests" becomes habits-and-interests).
 
         :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
         :param tags: One tag, or several separated by commas, e.g. "comfy, sdxl".
@@ -1030,8 +1038,11 @@ class Tools:
         """
         try:
             result = await asyncio.to_thread(add_tags_db, self.valves.NOTES_DB_PATH, validate_name(name), split_tags(tags), _to_bool(create))
+            adjusted = tag_adjustments(tags)
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
+        if adjusted:
+            result["adjusted"] = adjusted  # the model asked for one spelling and got another: say so
         return {"success": True, **result}
 
     async def agent_notes_remove_tag(self, name: str, tag: str) -> Dict[str, Any]:
