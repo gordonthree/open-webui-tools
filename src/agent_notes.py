@@ -594,8 +594,10 @@ def delete_entry_db(db_path: str, name: str, entry_no: str) -> Dict[str, Any]:
         conn.close()
 
 
-def update_note_db(db_path: str, name: str, new_name: Optional[str], comment: Optional[str]) -> Dict[str, Any]:
-    """new_name/comment of None mean 'leave unchanged'; pass comment='' to clear it."""
+def update_note_db(db_path: str, name: str, new_name: Optional[str], comment: Optional[str], new_author: Optional[str] = None) -> Dict[str, Any]:
+    """new_name/comment/new_author of None mean 'leave unchanged'; pass comment='' to clear it. new_author changes who
+    the note is recorded as started by (its entries keep their own authors). A change of author alone doesn't touch
+    updated_at, so it never makes the note's summary stale."""
     conn = notes_db_connect(db_path)
     try:
         try:
@@ -609,13 +611,19 @@ def update_note_db(db_path: str, name: str, new_name: Optional[str], comment: Op
                     ).fetchone()
                     if clash:
                         raise _name_taken_error(final_name)
-                conn.execute(
-                    "UPDATE note_id SET note_name = ?, note_comment = ?, updated_at = ? WHERE note_pk = ?",
-                    (final_name, final_comment, _now_iso(), note["note_pk"]),
-                )
+                if new_name is not None or comment is not None:
+                    conn.execute(
+                        "UPDATE note_id SET note_name = ?, note_comment = ?, updated_at = ? WHERE note_pk = ?",
+                        (final_name, final_comment, _now_iso(), note["note_pk"]),
+                    )
+                if new_author is not None:
+                    conn.execute("UPDATE note_id SET author_id = ? WHERE note_pk = ?", (_author_id(conn, new_author, _now_iso()), note["note_pk"]))
         except sqlite3.IntegrityError:
             raise _name_taken_error(new_name or name)
-        return {"old_name": note["note_name"], "note_name": final_name, "note_comment": final_comment}
+        out = {"old_name": note["note_name"], "note_name": final_name, "note_comment": final_comment}
+        if new_author is not None:
+            out["author"] = new_author
+        return out
     finally:
         conn.close()
 
@@ -1090,26 +1098,30 @@ class Tools:
         return {"success": True, **result}
 
     async def agent_notes_update(
-        self, name: str, new_name: Optional[str] = None, comment: Optional[str] = None, clear_comment: bool = False
+        self, name: str, new_name: Optional[str] = None, comment: Optional[str] = None, clear_comment: bool = False,
+        author_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Rename a note and/or change its comment. Entries are untouched. Give at least one of
-        new_name, comment, or clear_comment.
+        Rename a note, change its comment, and/or change who is recorded as its author. Entries are
+        untouched (each keeps its own author). Give at least one of new_name, comment,
+        clear_comment, or author_name.
 
-        LIMITS: note name 60 characters, comment 500 (a call over either is refused, nothing is
-        changed).
+        LIMITS: note name 60 characters, comment 500, author name 60 (a call over any of them is
+        refused, nothing is changed).
 
         :param name: The note's current name, as shown by agent_notes_list (case doesn't matter).
         :param new_name: The new name (at most 60 characters; must not match another note's name). Pass "" (or omit) to keep the current name.
         :param comment: The new comment (at most 500 characters). Pass "" (or omit) to keep the current comment.
         :param clear_comment: true to erase the comment entirely. Pass false (the normal choice) otherwise.
+        :param author_name: Record this as the note's author instead (at most 60 characters). Pass "" (or omit) to leave the author as it is.
         """
         try:
             wants_name = not is_unset(new_name)
             wants_comment = not is_unset(comment)
+            wants_author = not is_unset(author_name)
             clearing = _to_bool(clear_comment)
-            if not (wants_name or wants_comment or clearing):
-                raise NoteError("Nothing to update - give new_name, comment, or clear_comment=true.")
+            if not (wants_name or wants_comment or clearing or wants_author):
+                raise NoteError("Nothing to update - give new_name, comment, clear_comment=true, or author_name.")
             if clearing and wants_comment:
                 raise NoteError("Give either comment or clear_comment=true, not both.")
             result = await asyncio.to_thread(
@@ -1118,6 +1130,7 @@ class Tools:
                 validate_name(name),
                 validate_name(new_name) if wants_name else None,
                 "" if clearing else (validate_comment(comment) if wants_comment else None),
+                validate_author(author_name) if wants_author else None,
             )
         except (ValueError, sqlite3.Error) as e:
             return _error(e)

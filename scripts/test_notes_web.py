@@ -124,6 +124,12 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual(status, 303)
         self.assertEqual(self.post("/remove_tag", name="Ideas", tag="comfy")[0], 400)
 
+    def test_author_can_be_changed_from_the_note_page(self):
+        self.post("/create", name="Ideas", text="x")
+        status, _, _ = self.post("/update", name="Ideas", new_name="Ideas", comment="", author="Someone Else")
+        self.assertEqual(status, 303)
+        self.assertIn("started by Someone Else", self.get("/note", name="Ideas")[2])
+
     def test_unknown_routes(self):
         self.assertEqual(self.get("/nope")[0], 404)
         self.assertEqual(self.post("/nope", name="x")[0], 404)

@@ -800,6 +800,44 @@ class VerboseTests(NotesTestCase):
         self.assertIn("Started by", self.run_async(self.tool.agent_notes_list(verbose=True))["table"])
 
 
+class UpdateAuthorTests(NotesTestCase):
+    def setUp(self):
+        super().setUp()
+        self.run_async(self.tool.agent_notes_create("n", "first", author_name="Alice"))
+
+    def started_by(self):
+        return self.run_async(self.tool.agent_notes_read("n", verbose=True))["started_by"]
+
+    def test_author_can_be_changed_and_entries_keep_theirs(self):
+        res = self.run_async(self.tool.agent_notes_update("n", author_name="Bob"))
+        self.assertEqual((res["success"], res["author"]), (True, "Bob"))
+        self.assertEqual(self.started_by(), "Bob")
+        entry = self.run_async(self.tool.agent_notes_read("n", verbose=True))["entries"][0]
+        self.assertEqual(entry["author"], "Alice")
+
+    def test_author_match_ignores_case_and_reuses_the_author_row(self):
+        self.run_async(self.tool.agent_notes_update("n", author_name="alice"))
+        self.assertEqual(self.started_by(), "Alice")
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM note_author WHERE lower(author_name) = 'alice'"), [(1,)])
+
+    def test_changing_only_the_author_does_not_stale_a_summary_or_move_updated_at(self):
+        self.run_async(self.tool.agent_notes_update_summary("n", "about things"))
+        before = self.sql("SELECT updated_at FROM note_id")
+        self.run_async(self.tool.agent_notes_update("n", author_name="Bob"))
+        self.assertEqual(self.sql("SELECT updated_at FROM note_id"), before)
+        self.tool.valves.MIN_SUMMARY_CHARS = 0
+        self.assertEqual(self.run_async(self.tool.agent_notes_list(needs_summary=True))["count"], 0)
+
+    def test_combined_with_rename_and_validation(self):
+        res = self.run_async(self.tool.agent_notes_update("n", new_name="m", author_name="Bob"))
+        self.assertEqual((res["note_name"], res["author"]), ("m", "Bob"))
+        bad = self.run_async(self.tool.agent_notes_update("m", author_name="x" * 61))
+        self.assertFalse(bad["success"])
+
+    def test_nothing_to_update_mentions_author(self):
+        self.assertIn("author_name", self.run_async(self.tool.agent_notes_update("n"))["error"])
+
+
 class ShortNoteTests(NotesTestCase):
     def setUp(self):
         super().setUp()

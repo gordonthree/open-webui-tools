@@ -250,7 +250,7 @@ summaries and bare entry-text strings. `verbose=true` restores the full detail.
 | `agent_notes_append` | `name`, `text` required |
 | `agent_notes_edit_entry` | `name`, `entry_no` (e.g. `3` or `"#3"`), `text` — all required |
 | `agent_notes_delete_entry` | `name`, `entry_no` — both required. Other entries keep their numbers; numbers are never reused |
-| `agent_notes_update` | `name` required; any of `new_name`, `comment`, or `clear_comment=true` (an empty `comment` means "unchanged", so clearing needs the flag) |
+| `agent_notes_update` | `name` required; any of `new_name`, `comment`, `clear_comment=true` (an empty `comment` means "unchanged", so clearing needs the flag), or `author_name` (re-attributes the note's starter, not its entries; alone it leaves `updated_at` alone so summaries stay current) |
 | `agent_notes_delete` | `name` required. Removes the note and all its entries, no confirmation |
 | `agent_notes_search` | `query` required; `limit` (default `10` per list, capped by `MAX_SEARCH_RESULTS`). Returns matching notes (name/comment) and matching entries |
 | `agent_notes_update_summary` | `name`, `summary` (≤500 chars, whitespace collapsed) required; `author_name` optional. Creates or replaces the note's one summary |

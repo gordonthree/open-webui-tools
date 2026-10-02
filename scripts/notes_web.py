@@ -175,9 +175,10 @@ def render_note(db: str, name: str) -> str:
     body += (
         f"<h3>Append entry</h3><form method='post' action='/append'>{hidden}"
         f"<textarea name='text' rows='3' maxlength='{notes.NOTE_TEXT_MAX}' required></textarea><button>Append</button></form>"
-        f"<details><summary>rename / change comment</summary><form method='post' action='/update'>{hidden}"
+        f"<details><summary>rename / change comment / author</summary><form method='post' action='/update'>{hidden}"
         f"<p><input type='text' name='new_name' value='{e(n)}' maxlength='{notes.NOTE_NAME_MAX}'></p>"
         f"<p><input type='text' name='comment' value='{e(note['note_comment'])}' maxlength='{notes.NOTE_COMMENT_MAX}'></p>"
+        f"<p><input type='text' name='author' value='{e(result['started_by'] or '')}' maxlength='{notes.AUTHOR_NAME_MAX}' placeholder='author'></p>"
         f"<button>Save</button></form></details>"
         f"<details><summary class='danger'>delete note</summary><form method='post' action='/delete_note'>{hidden}"
         f"<button class='danger'>Permanently delete '{e(n)}' and its {result['total']} entries</button></form></details>"
@@ -229,7 +230,8 @@ def handle_post(db: str, path: str, form: Dict[str, str], author: str = DEFAULT_
             return redirect(note_url(done["note_name"]))
         if path == "/update":
             new_name = notes.validate_name(form.get("new_name"))
-            done = notes.update_note_db(db, name(), new_name, notes.validate_comment(form.get("comment")))
+            author_text = (form.get("author") or "").strip()
+            done = notes.update_note_db(db, name(), new_name, notes.validate_comment(form.get("comment")), notes.validate_author(author_text) if author_text else None)
             return redirect(note_url(done["note_name"]))
         if path == "/add_tag":  # a person decides what's a new tag, so no similar-tag check here
             done = notes.add_tags_db(db, name(), notes.split_tags(form.get("tags")), create=True)
