@@ -676,6 +676,71 @@ class TagTests(NotesTestCase):
         self.assertTrue(self.tag("old", "fresh")["success"])
 
 
+class ReadTaggedTests(NotesTestCase):
+    def setUp(self):
+        super().setUp()
+        self.create("voice", "speaks softly")
+        self.create("history", "born in 1990")
+        self.create("hobbies", "paints")
+        for name, tags in (("voice", "identity, speech"), ("history", "identity"), ("hobbies", "pastimes")):
+            self.run_async(self.tool.agent_notes_add_tags(name, tags))
+
+    def read(self, tags, match=None):
+        return self.run_async(self.tool.agent_notes_read_tagged(tags, match))
+
+    def names(self, res):
+        return [n["note_name"] for n in res["notes"]]
+
+    def test_any_returns_union_best_match_first_with_contents(self):
+        res = self.read("identity, speech")
+        self.assertEqual(self.names(res), ["voice", "history"])  # voice carries both
+        self.assertEqual(res["notes"][0]["entries"][0]["text"], "speaks softly")
+        self.assertEqual(res["notes"][0]["matched_tags"], ["identity", "speech"])
+
+    def test_all_requires_every_tag(self):
+        self.assertEqual(self.names(self.read("identity, speech", "all")), ["voice"])
+
+    def test_variant_spelling_and_unknown_tag(self):
+        res = self.read("Identities, nonsense")
+        self.assertEqual(sorted(self.names(res)), ["history", "voice"])
+        self.assertIn("nonsense", res["note"])
+        self.assertFalse(self.read("identity, nonsense", "all")["success"])
+        self.assertFalse(self.read("nonsense")["success"])
+        self.assertFalse(self.read("identity", "some")["success"])
+
+    def test_summary_is_included(self):
+        self.run_async(self.tool.agent_notes_update_summary("voice", "how she talks"))
+        self.assertEqual(self.read("speech")["notes"][0]["summary"], "how she talks")
+
+    def test_budget_never_cuts_a_string_and_reports_what_was_left_out(self):
+        for i in range(8):
+            self.run_async(self.tool.agent_notes_append("voice", f"line {i} " + "x" * 300))
+        self.tool.valves.MAX_TAGGED_CHARS = 1200
+        res = self.read("identity, speech")
+        self.assertLessEqual(len(str(res["notes"])), 1500)
+        for note in res["notes"]:
+            for e in note["entries"]:
+                self.assertTrue(e["text"] in ("speaks softly", "born in 1990") or e["text"].endswith("x" * 300))  # whole entries only
+        voice = res["notes"][0]
+        self.assertGreater(voice["entries_not_shown"], 0)
+        self.assertEqual([e["entry_no"] for e in voice["entries"]], sorted(e["entry_no"] for e in voice["entries"]))  # time order
+        self.assertIn("agent_notes_read", res["note"])
+
+    def test_one_long_note_cannot_starve_the_others(self):
+        for i in range(10):
+            self.run_async(self.tool.agent_notes_append("voice", f"v{i} " + "y" * 400))
+        self.tool.valves.MAX_TAGGED_CHARS = 1500
+        res = self.read("identity")
+        history = next(n for n in res["notes"] if n["note_name"] == "history")
+        self.assertEqual([e["text"] for e in history["entries"]], ["born in 1990"])
+
+    def test_notes_that_do_not_fit_are_named(self):
+        notes = [{"note_name": n, "tags": ["t"], "matched_tags": ["t"], "summary": None, "entries": [{"entry_no": 1, "text": "hi"}]} for n in ("a", "b", "c")]
+        packed, left_out = mod.pack_tagged(notes, 200)
+        self.assertEqual([n["note_name"] for n in packed], ["a"])
+        self.assertEqual(left_out, ["b", "c"])
+
+
 class OpenWebUICoercionTests(unittest.TestCase):
     def test_no_method_is_annotated_int(self):
         """Open WebUI int()s a string for an int-annotated parameter before our code runs (so "" or "#3" would fail)."""

@@ -39,7 +39,7 @@ Current tools:
   renders anything itself — it's a catalog, same spirit as `run_workflow`'s workflow templates.
 
 - `agent_notes.py` → `agent_notes_list`, `agent_notes_read`, `agent_notes_create`, `agent_notes_append`, `agent_notes_edit_entry`,
-  `agent_notes_delete_entry`, `agent_notes_update`, `agent_notes_delete`, `agent_notes_search`, `agent_notes_add_tags`, `agent_notes_remove_tag`, `agent_notes_list_tags`,
+  `agent_notes_delete_entry`, `agent_notes_update`, `agent_notes_delete`, `agent_notes_search`, `agent_notes_add_tags`, `agent_notes_remove_tag`, `agent_notes_list_tags`, `agent_notes_read_tagged`,
   `agent_notes_rename_tag` (plus the summary methods) — a persistent notebook for agents,
   an easier-to-drive alternative to Open WebUI's built-in `note` tool. Unrelated to ComfyUI. A note
   is a name plus an append-only log of short numbered entries, in its **own** SQLite file
@@ -253,6 +253,7 @@ entry text 500 — enforced by the tool (with an actionable message) and by SQLi
 | `agent_notes_delete_summary` | `name` required. Refuses if the note has no summary |
 | `agent_notes_add_tags` | `name`, `tags` (one, or comma-separated) required; `create=true` to make a new tag that resembles existing ones. Refuses a new tag that looks like an existing one (returns the similar tags), reuses one that matches ignoring case/hyphens/plurals; nothing is saved if any tag is refused. Max 10 tags per note, 40 chars each. Punctuation is cleaned rather than refused (`&` becomes `and`, apostrophes dropped, other symbols become hyphens) and the reply lists the change under `adjusted` |
 | `agent_notes_remove_tag` | `name`, `tag` required. A tag no note carries any more is deleted |
+| `agent_notes_read_tagged` | `tags` required (one or comma-separated); `match` = `any` (default, best match first) or `all`. Returns each matching note's tags, summary and newest entries within the `MAX_TAGGED_CHARS` valve (default 6000 characters): whole strings only, headings for all notes first, then entries newest-first rotating across the notes so one long note can't starve the rest. Reports `entries_not_shown` per note and `notes_left_out` |
 | `agent_notes_list_tags` | optional `query`. Tags in use with note counts. `agent_notes_list` also takes `tag=` to filter, shows a Tags column and lists the tags in use |
 | `agent_notes_rename_tag` | `tag`, `new_tag` required; merges into `new_tag` if it already exists |
 

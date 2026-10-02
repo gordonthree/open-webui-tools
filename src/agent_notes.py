@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.5.0
+version: 1.6.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -30,6 +30,7 @@ import asyncio
 import contextlib
 import datetime
 import difflib
+import json
 import logging
 import re
 import sqlite3
@@ -747,6 +748,91 @@ def rename_tag_db(db_path: str, tag: str, new_tag: str) -> Dict[str, Any]:
         conn.close()
 
 
+def tagged_notes_db(db_path: str, tags: List[str], match_all: bool) -> "tuple[List[Any], List[str], List[str]]":
+    """Notes carrying the given tags, best match first: (notes, tags found, tags that don't exist). Each note is a dict with its
+    tags, summary and every entry (newest first), ready for pack_tagged."""
+    conn = notes_db_connect(db_path)
+    try:
+        counts = _tag_counts(conn)
+        by_key = {_tag_key(n): n for n in counts}
+        found: List[str] = []
+        missing: List[str] = []
+        for tag in tags:
+            target = tag if tag in counts else by_key.get(_tag_key(tag))
+            if target is None:
+                similar = _similar_tags(tag, counts)
+                missing.append(tag + (f" (similar: {', '.join(similar)})" if similar else ""))
+            elif target not in found:
+                found.append(target)
+        if not found or (match_all and missing):
+            named = ", ".join(missing) if missing else ", ".join(tags)
+            raise NoteError(f"No note is tagged {named}. Use agent_notes_list_tags to see the tags in use.")
+        marks = ",".join("?" for _ in found)
+        rows = conn.execute(
+            f"SELECT n.note_pk, n.note_name, n.updated_at, COUNT(DISTINCT t.tag_id) AS matched FROM note_id n "
+            f"JOIN note_tag nt ON nt.note_pk = n.note_pk JOIN tag t ON t.tag_id = nt.tag_id WHERE t.tag_name IN ({marks}) "
+            f"GROUP BY n.note_pk HAVING matched >= ? ORDER BY matched DESC, n.updated_at DESC, n.note_pk DESC",
+            found + [len(found) if match_all else 1],
+        ).fetchall()
+        notes = []
+        for r in rows:
+            note_tags = _note_tags(conn, r["note_pk"])
+            summary = conn.execute("SELECT summary_text FROM note_summary WHERE note_pk = ?", (r["note_pk"],)).fetchone()
+            entries = conn.execute(
+                "SELECT d.entry_no, d.note_text, d.created_at, a.author_name FROM note_data d LEFT JOIN note_author a ON a.author_id = d.author_id "
+                "WHERE d.note_pk = ? ORDER BY d.created_at DESC, d.entry_no DESC",
+                (r["note_pk"],),
+            ).fetchall()
+            notes.append({
+                "note_name": r["note_name"], "tags": note_tags, "matched_tags": [t for t in note_tags if t in found],
+                "summary": summary["summary_text"] if summary else None,
+                "entries": [{"entry_no": e["entry_no"], "author": e["author_name"] or "unknown", "created_at": e["created_at"], "text": e["note_text"]} for e in entries],
+            })
+        return notes, found, missing
+    finally:
+        conn.close()
+
+
+_HEADING_EXTRAS = 70  # the "entries", "total_entries" and "entries_not_shown" keys pack_tagged adds to every note
+
+
+def _size(obj: Any) -> int:
+    return len(json.dumps(obj, ensure_ascii=False)) + 2  # + the ", " that separates it from its neighbour
+
+
+def pack_tagged(notes: List[Dict[str, Any]], budget: int) -> "tuple[List[Dict[str, Any]], List[str]]":
+    """Fit as much as possible of these notes into `budget` characters without ever cutting a string in half.
+    Pass 1 admits each note's heading (name, tags, summary) in rank order, stopping at the first that doesn't fit.
+    Pass 2 then adds entries newest-first, rotating across the admitted notes so one long note can't use the whole
+    budget; a note stops growing the first time its next entry doesn't fit. Returns (notes with entries in time
+    order, names of the notes left out)."""
+    used = 0
+    packed: List[Dict[str, Any]] = []
+    for note in notes:
+        cost = _HEADING_EXTRAS + _size({k: v for k, v in note.items() if k != "entries"})
+        if used + cost > budget:
+            break
+        used += cost
+        packed.append({**{k: v for k, v in note.items() if k != "entries"}, "total_entries": len(note["entries"]), "_pending": list(note["entries"]), "entries": []})
+    open_notes = list(packed)
+    while open_notes:
+        for note in list(open_notes):
+            if not note["_pending"]:
+                open_notes.remove(note)
+                continue
+            cost = _size(note["_pending"][0])
+            if used + cost > budget:
+                open_notes.remove(note)  # soft stop: this note is done growing; others may still have shorter entries that fit
+                continue
+            used += cost
+            note["entries"].append(note["_pending"].pop(0))
+    for note in packed:
+        note.pop("_pending")
+        note["entries"].reverse()  # newest-first while packing; read in time order
+        note["entries_not_shown"] = note["total_entries"] - len(note["entries"])
+    return packed, [n["note_name"] for n in notes[len(packed):]]
+
+
 def delete_note_db(db_path: str, name: str) -> Dict[str, Any]:
     conn = notes_db_connect(db_path)
     try:
@@ -783,6 +869,7 @@ class Tools:
         )
         MAX_READ_ENTRIES: int = Field(default=50, description="Caps how many of a note's most recent entries agent_notes_read returns at once.")
         MAX_LIST_RESULTS: int = Field(default=50, description="Caps agent_notes_list results.")
+        MAX_TAGGED_CHARS: int = Field(default=6000, description="Character budget for agent_notes_read_tagged's reply (about a quarter as many tokens). Whole notes/entries only; anything that doesn't fit is left out and reported.")
         MAX_SEARCH_RESULTS: int = Field(default=30, description="Caps each of agent_notes_search' two result lists (matching notes, matching entries).")
 
     def __init__(self):
@@ -1084,6 +1171,44 @@ class Tools:
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
         return {"success": True, **result}
+
+    async def agent_notes_read_tagged(self, tags: str, match: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Pull in the notes carrying certain tags, with their contents, in one call: for each note its
+        tags, its summary if it has one, and its most recent entries. Use this to gather everything
+        about a subject (say tags "identity, speech" for a character) instead of reading notes one by one.
+
+        The reply has a size limit, so it holds whole entries only, newest first, spread across the
+        notes; it says which notes or entries were left out. For the rest, use agent_notes_read on
+        that note.
+
+        :param tags: One tag, or several separated by commas, e.g. "identity, speech". Variant spellings are matched (see agent_notes_list_tags).
+        :param match: "any" (the default) for notes carrying at least one of the tags, best match first; "all" for only notes carrying every tag. Pass "" (or omit) for any.
+        """
+        v = self.valves
+        try:
+            wanted = split_tags(tags)
+            mode = "any" if is_unset(match) else str(match).strip().lower()
+            if mode not in ("any", "all"):
+                raise NoteError(f'match must be "any" or "all", got {match!r}.')
+            notes, found, missing = await asyncio.to_thread(tagged_notes_db, v.NOTES_DB_PATH, wanted, mode == "all")
+        except (ValueError, sqlite3.Error) as e:
+            return _error(e)
+        packed, left_out = pack_tagged(notes, max(500, v.MAX_TAGGED_CHARS) - 300)  # 300: the reply's own keys and remarks
+        out: Dict[str, Any] = {"success": True, "tags": found, "match": mode, "notes_found": len(notes), "notes": packed}
+        remarks = []
+        if not notes:
+            remarks.append(f"No note carries {'all of ' if mode == 'all' else ''}those tags.")
+        if missing:
+            remarks.append("Not in use as tags: " + "; ".join(missing) + ".")
+        if left_out:
+            out["notes_left_out"] = left_out
+            remarks.append(f"{len(left_out)} more matching note(s) didn't fit the size limit and were left out; use agent_notes_read on them by name.")
+        if any(n["entries_not_shown"] for n in packed):
+            remarks.append("Some notes show only their newest entries (see entries_not_shown); agent_notes_read has the rest.")
+        if remarks:
+            out["note"] = " ".join(remarks)
+        return out
 
     async def agent_notes_search(self, query: str, limit: Optional[str] = None) -> Dict[str, Any]:
         """
