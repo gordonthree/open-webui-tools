@@ -244,7 +244,7 @@ summaries and bare entry-text strings. `verbose=true` restores the full detail.
 
 | Method | Arguments |
 |---|---|
-| `agent_notes_list` | `limit` (default `20`, capped by `MAX_LIST_RESULTS`); `needs_summary=true` lists only notes with no summary or a stale one. The table has a Summary column: none/current/stale |
+| `agent_notes_list` | `limit` (default `20`, capped by `MAX_LIST_RESULTS`); `needs_summary=true` lists only notes with no summary or a stale one, skipping notes under the `MIN_SUMMARY_CHARS` valve (default 1000 characters of entry text). The table has a Summary column: none/current/stale/short (short = too small to need one) |
 | `agent_notes_read` | `name` (required); `limit` — most recent N entries, default/max `MAX_READ_ENTRIES` |
 | `agent_notes_create` | `name`, `text` (first entry) required; `comment` optional. Refuses if the name already exists — use `agent_notes_append` |
 | `agent_notes_append` | `name`, `text` required |

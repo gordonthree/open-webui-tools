@@ -20,6 +20,7 @@ class NotesTestCase(unittest.TestCase):
         self.db = str(Path(self.tmp) / "nested" / "agent_notes.sqlite3")  # parent dir doesn't exist yet
         self.tool = mod.Tools()
         self.tool.valves.NOTES_DB_PATH = self.db
+        self.tool.valves.MIN_SUMMARY_CHARS = 0  # tests use tiny notes; the short-note rule has its own tests
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -471,7 +472,7 @@ class SummaryTests(NotesTestCase):
         self.assertNotIn("\n| current |", todo["table"])
         self.summarize("none")
         self.summarize("stale")
-        self.assertIn("Every note", self.run_async(self.tool.agent_notes_list(needs_summary=True))["table"])
+        self.assertIn("No note needs a summary", self.run_async(self.tool.agent_notes_list(needs_summary=True))["table"])
 
     def test_search_ranks_by_matched_words_and_matches_note_names(self):
         for name, text in [("a", "dragon lair map"), ("b", "dragon only"), ("c", "unrelated tavern"), ("lair-notes", "misc")]:
@@ -797,6 +798,37 @@ class VerboseTests(NotesTestCase):
         self.assertNotIn("Started by", plain)
         self.assertNotIn("Last updated", plain)
         self.assertIn("Started by", self.run_async(self.tool.agent_notes_list(verbose=True))["table"])
+
+
+class ShortNoteTests(NotesTestCase):
+    def setUp(self):
+        super().setUp()
+        self.create("tiny", "a few words")
+        self.create("big", "x" * 400)
+        self.run_async(self.tool.agent_notes_append("big", "y" * 400))
+        self.tool.valves.MIN_SUMMARY_CHARS = 500
+
+    def table(self, **kw):
+        return self.run_async(self.tool.agent_notes_list(**kw))
+
+    def test_short_note_is_labelled_and_not_offered_for_summarizing(self):
+        self.assertIn("| tiny | 1 | short |", self.table()["table"])
+        todo = self.table(needs_summary=True)
+        self.assertEqual(todo["count"], 1)
+        self.assertIn("big", todo["table"])
+        self.assertNotIn("tiny", todo["table"])
+
+    def test_nothing_to_do_when_only_short_notes_lack_summaries(self):
+        self.run_async(self.tool.agent_notes_update_summary("big", "two long entries"))
+        self.assertEqual(self.table(needs_summary=True)["count"], 0)
+
+    def test_growing_past_the_threshold_makes_it_summarizable(self):
+        self.run_async(self.tool.agent_notes_append("tiny", "z" * 500))
+        self.assertIn("tiny", self.table(needs_summary=True)["table"])
+
+    def test_zero_turns_the_threshold_off(self):
+        self.tool.valves.MIN_SUMMARY_CHARS = 0
+        self.assertEqual(self.table(needs_summary=True)["count"], 2)
 
 
 class OpenWebUICoercionTests(unittest.TestCase):

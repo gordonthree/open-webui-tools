@@ -515,7 +515,9 @@ def read_note_db(db_path: str, name: str, limit: int) -> Dict[str, Any]:
         conn.close()
 
 
-def list_notes_db(db_path: str, limit: int, needs_summary: bool = False, tag: Optional[str] = None) -> "tuple[int, List[Any]]":
+def list_notes_db(db_path: str, limit: int, needs_summary: bool = False, tag: Optional[str] = None, min_summary_chars: int = 0) -> "tuple[int, List[Any]]":
+    """min_summary_chars: a note with no summary whose entries total fewer characters than this is 'short' (cheap to just
+    read, and a summary of it would only copy it) and isn't offered to a summarizer. 0 turns that off."""
     conn = notes_db_connect(db_path)
     try:
         if tag is not None:
@@ -527,11 +529,12 @@ def list_notes_db(db_path: str, limit: int, needs_summary: bool = False, tag: Op
             tag = match
         rows = conn.execute(
             "SELECT * FROM (SELECT n.note_pk, n.note_name, n.note_comment, n.updated_at, COUNT(d.entry_no) AS entries, a.author_name, "
-            f"CASE WHEN s.note_pk IS NULL THEN 'none' WHEN {_STALE_SQL} THEN 'stale' ELSE 'current' END AS summary_state, "
+            f"CASE WHEN s.note_pk IS NULL THEN CASE WHEN (SELECT COALESCE(SUM(length(x.note_text)), 0) FROM note_data x WHERE x.note_pk = n.note_pk) < {int(min_summary_chars)} THEN 'short' ELSE 'none' END "
+            f"WHEN {_STALE_SQL} THEN 'stale' ELSE 'current' END AS summary_state, "
             "(SELECT group_concat(tag_name, ', ') FROM (SELECT t.tag_name FROM note_tag nt JOIN tag t ON t.tag_id = nt.tag_id WHERE nt.note_pk = n.note_pk ORDER BY t.tag_name)) AS tags "
             "FROM note_id n LEFT JOIN note_data d ON d.note_pk = n.note_pk LEFT JOIN note_author a ON a.author_id = n.author_id "
             "LEFT JOIN note_summary s ON s.note_pk = n.note_pk GROUP BY n.note_pk) "
-            "AS x WHERE (? = 0 OR summary_state != 'current') "
+            "AS x WHERE (? = 0 OR summary_state NOT IN ('current', 'short')) "
             "AND (? IS NULL OR EXISTS (SELECT 1 FROM note_tag nt JOIN tag t ON t.tag_id = nt.tag_id WHERE nt.note_pk = x.note_pk AND t.tag_name = ?)) "
             "ORDER BY updated_at DESC, note_pk DESC",
             (1 if needs_summary else 0, tag, tag),
@@ -884,6 +887,7 @@ class Tools:
         )
         MAX_READ_ENTRIES: int = Field(default=50, description="Caps how many of a note's most recent entries agent_notes_read returns at once.")
         MAX_LIST_RESULTS: int = Field(default=50, description="Caps agent_notes_list results.")
+        MIN_SUMMARY_CHARS: int = Field(default=1000, description="A note whose entries total fewer characters than this isn't offered for summarizing (agent_notes_list needs_summary=true skips it, and shows 'short'): a summary of a note that small would just copy it. 0 summarizes everything.")
         MAX_TAGGED_CHARS: int = Field(default=6000, description="Character budget for agent_notes_read_tagged's reply (about a quarter as many tokens). Whole notes/entries only; anything that doesn't fit is left out and reported.")
         MAX_SEARCH_RESULTS: int = Field(default=30, description="Caps each of agent_notes_search' two result lists (matching notes, matching entries).")
 
@@ -897,8 +901,8 @@ class Tools:
         of entries, last updated, comment). Start here to see whether a note already exists
         before creating one. Call agent_notes_read to see a note's contents.
 
-        The Summary column says whether the note has a summary: none, current, or stale (the note
-        changed since it was summarized).
+        The Summary column says whether the note has a summary: none, current, stale (the note
+        changed since it was summarized), or short (too small to need one; just read it).
 
         :param limit: Maximum notes returned, default 20. Pass "" (or omit) for the default.
         :param needs_summary: true to list only notes whose summary is missing or stale (a summarizing agent's to-do list). Pass false (the normal choice) otherwise.
@@ -909,13 +913,13 @@ class Tools:
         try:
             cap = min(_to_int(limit, 20, "limit"), v.MAX_LIST_RESULTS)
             tag_filter = None if is_unset(tag) else normalize_tag(tag)
-            total, rows = await asyncio.to_thread(list_notes_db, v.NOTES_DB_PATH, cap, _to_bool(needs_summary), tag_filter)
+            total, rows = await asyncio.to_thread(list_notes_db, v.NOTES_DB_PATH, cap, _to_bool(needs_summary), tag_filter, v.MIN_SUMMARY_CHARS)
             in_use = await asyncio.to_thread(list_tags_db, v.NOTES_DB_PATH)
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
         tag_line = ", ".join(f"{n} ({c})" for n, c in in_use[:TAGS_SHOWN]) if in_use else ""
         if not rows:
-            empty = "Every note has a current summary." if _to_bool(needs_summary) else "No notes yet - use agent_notes_create to start one."
+            empty = "No note needs a summary right now." if _to_bool(needs_summary) else "No notes yet - use agent_notes_create to start one."
             out_empty: Dict[str, Any] = {"success": True, "count": 0, "total_notes": 0, "table": empty}
             if tag_line:
                 out_empty["tags_in_use"] = tag_line
@@ -1304,7 +1308,7 @@ class Tools:
         Use this to find which note holds what you need, then agent_notes_read for the details. Any
         word of the query can match; notes matching more of the words rank higher, so a few
         distinctive keywords work better than a full sentence. A result marked stale means the
-        note changed after it was summarized, so confirm with agent_notes_read.
+        note changed after it was summarized, so confirm with agent_notes_read. Short notes (under about 1000 characters) have no summary; find those with agent_notes_search or a tag.
 
         :param query: A few keywords, e.g. "dragon lair map".
         :param limit: Maximum results, default 10. Pass "" (or omit) for the default.
