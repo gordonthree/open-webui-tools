@@ -38,9 +38,9 @@ Current tools:
   straight into `generate_image`'s or `run_workflow`'s own `source_image` argument. This tool never
   renders anything itself — it's a catalog, same spirit as `run_workflow`'s workflow templates.
 
-- `agent_notes.py` → `list_notes`, `read_note`, `create_note`, `append_note`, `edit_entry`,
-  `delete_entry`, `update_note`, `delete_note`, `search_notes`, `add_tags`, `remove_tag`, `list_tags`,
-  `rename_tag` (plus the summary methods) — a persistent notebook for agents,
+- `agent_notes.py` → `agent_notes_list`, `agent_notes_read`, `agent_notes_create`, `agent_notes_append`, `agent_notes_edit_entry`,
+  `agent_notes_delete_entry`, `agent_notes_update`, `agent_notes_delete`, `agent_notes_search`, `agent_notes_add_tags`, `agent_notes_remove_tag`, `agent_notes_list_tags`,
+  `agent_notes_rename_tag` (plus the summary methods) — a persistent notebook for agents,
   an easier-to-drive alternative to Open WebUI's built-in `note` tool. Unrelated to ComfyUI. A note
   is a name plus an append-only log of short numbered entries, in its **own** SQLite file
   (`agent_notes.sqlite3`, `NOTES_DB_PATH` valve — not the job database, though it defaults to the
@@ -239,28 +239,28 @@ entry text 500 — enforced by the tool (with an actionable message) and by SQLi
 
 | Method | Arguments |
 |---|---|
-| `list_notes` | `limit` (default `20`, capped by `MAX_LIST_RESULTS`); `needs_summary=true` lists only notes with no summary or a stale one. The table has a Summary column: none/current/stale |
-| `read_note` | `name` (required); `limit` — most recent N entries, default/max `MAX_READ_ENTRIES` |
-| `create_note` | `name`, `text` (first entry) required; `comment` optional. Refuses if the name already exists — use `append_note` |
-| `append_note` | `name`, `text` required |
-| `edit_entry` | `name`, `entry_no` (e.g. `3` or `"#3"`), `text` — all required |
-| `delete_entry` | `name`, `entry_no` — both required. Other entries keep their numbers; numbers are never reused |
-| `update_note` | `name` required; any of `new_name`, `comment`, or `clear_comment=true` (an empty `comment` means "unchanged", so clearing needs the flag) |
-| `delete_note` | `name` required. Removes the note and all its entries, no confirmation |
-| `search_notes` | `query` required; `limit` (default `10` per list, capped by `MAX_SEARCH_RESULTS`). Returns matching notes (name/comment) and matching entries |
-| `update_summary` | `name`, `summary` (≤500 chars, whitespace collapsed) required; `author_name` optional. Creates or replaces the note's one summary |
-| `search_summary` | `query` required; `limit` (default `10`, capped by `MAX_SEARCH_RESULTS`). Splits the query into words, any word can match a note name or summary, ranked by words matched; each result carries `stale` |
-| `delete_summary` | `name` required. Refuses if the note has no summary |
-| `add_tags` | `name`, `tags` (one, or comma-separated) required; `create=true` to make a new tag that resembles existing ones. Refuses a new tag that looks like an existing one (returns the similar tags), reuses one that matches ignoring case/hyphens/plurals; nothing is saved if any tag is refused. Max 10 tags per note, 40 chars each |
-| `remove_tag` | `name`, `tag` required. A tag no note carries any more is deleted |
-| `list_tags` | optional `query`. Tags in use with note counts. `list_notes` also takes `tag=` to filter, shows a Tags column and lists the tags in use |
-| `rename_tag` | `tag`, `new_tag` required; merges into `new_tag` if it already exists |
+| `agent_notes_list` | `limit` (default `20`, capped by `MAX_LIST_RESULTS`); `needs_summary=true` lists only notes with no summary or a stale one. The table has a Summary column: none/current/stale |
+| `agent_notes_read` | `name` (required); `limit` — most recent N entries, default/max `MAX_READ_ENTRIES` |
+| `agent_notes_create` | `name`, `text` (first entry) required; `comment` optional. Refuses if the name already exists — use `agent_notes_append` |
+| `agent_notes_append` | `name`, `text` required |
+| `agent_notes_edit_entry` | `name`, `entry_no` (e.g. `3` or `"#3"`), `text` — all required |
+| `agent_notes_delete_entry` | `name`, `entry_no` — both required. Other entries keep their numbers; numbers are never reused |
+| `agent_notes_update` | `name` required; any of `new_name`, `comment`, or `clear_comment=true` (an empty `comment` means "unchanged", so clearing needs the flag) |
+| `agent_notes_delete` | `name` required. Removes the note and all its entries, no confirmation |
+| `agent_notes_search` | `query` required; `limit` (default `10` per list, capped by `MAX_SEARCH_RESULTS`). Returns matching notes (name/comment) and matching entries |
+| `agent_notes_update_summary` | `name`, `summary` (≤500 chars, whitespace collapsed) required; `author_name` optional. Creates or replaces the note's one summary |
+| `agent_notes_search_summary` | `query` required; `limit` (default `10`, capped by `MAX_SEARCH_RESULTS`). Splits the query into words, any word can match a note name or summary, ranked by words matched; each result carries `stale` |
+| `agent_notes_delete_summary` | `name` required. Refuses if the note has no summary |
+| `agent_notes_add_tags` | `name`, `tags` (one, or comma-separated) required; `create=true` to make a new tag that resembles existing ones. Refuses a new tag that looks like an existing one (returns the similar tags), reuses one that matches ignoring case/hyphens/plurals; nothing is saved if any tag is refused. Max 10 tags per note, 40 chars each |
+| `agent_notes_remove_tag` | `name`, `tag` required. A tag no note carries any more is deleted |
+| `agent_notes_list_tags` | optional `query`. Tags in use with note counts. `agent_notes_list` also takes `tag=` to filter, shows a Tags column and lists the tags in use |
+| `agent_notes_rename_tag` | `tag`, `new_tag` required; merges into `new_tag` if it already exists |
 
 Tags (v1.4.0): `tag` (`tag_name` unique, case-insensitive, stored lowercase-hyphenated) and `note_tag`
 (`note_pk`, `tag_id`, both cascading). Tags belong to the parent note, not to entries, and tagging
 doesn't touch `updated_at`, so it never makes a summary stale. Free-form tags with guardrails instead
 of a curated list: the tool shows existing tags, folds variant spellings onto them, and makes the
-model confirm (`create=true`) before adding a look-alike. `rename_tag` is the cleanup for drift that
+model confirm (`create=true`) before adding a look-alike. `agent_notes_rename_tag` is the cleanup for drift that
 gets through. Existing databases gain the two tables automatically.
 
 Every delete is a real `DELETE` (no soft-delete/undo); deleting a note relies on SQLite's
@@ -271,27 +271,27 @@ Every delete is a real `DELETE` (no soft-delete/undo); deleting a note relies on
 `note_author` (`author_id` autonumber, `author_name` unique ignoring case, `created_at`); both other
 tables carry an `author_id` (the note's starter, the entry's writer; editing doesn't change it).
 Author #1 is `Mara Voss`, seeded into every database and given every row that predates authors.
-`create_note`/`append_note` also take an optional `created_at` (v1.2.0) so old notes can be moved in
+`agent_notes_create`/`agent_notes_append` also take an optional `created_at` (v1.2.0) so old notes can be moved in
 with their real dates: ISO 8601 (a bare date, or with time/offset/`Z`; no offset = UTC) or a Unix
 epoch in s/ms/µs/ns (Open WebUI's own notes use ns), stored as UTC ISO; unparseable, future (>1 day)
 or pre-1970 values are refused, and blank means now. A backdated append never moves the note's
 `updated_at` backwards, and entries read back in time order, so a backdated entry shows before
 newer ones despite its higher number.
-`create_note`/`append_note` take an optional `author_name` (max 60); if blank the tool uses the
+`agent_notes_create`/`agent_notes_append` take an optional `author_name` (max 60); if blank the tool uses the
 model name Open WebUI passes as `__model__` (name, else id), else `Unknown agent`. An existing
 database is upgraded in place on first connect (nullable `author_id` columns added, old rows set to
 #1) — back it up first if it matters. Nullable also means an older copy of the tool can still write
 to an upgraded database; its rows just show author `unknown`.
 
 Summaries (v1.3.0), for a scheduled sub agent to keep current so agents can search them RAG-style:
-`note_summary` has one row per note (`note_pk` primary key, so `update_summary` is an upsert; cascades
+`note_summary` has one row per note (`note_pk` primary key, so `agent_notes_update_summary` is an upsert; cascades
 on note delete, survives rename) with `summary_text` (≤500), `author_id`, `last_summarized`, and
 `source_updated_at` + `source_entries` — a snapshot of the note when it was summarized. A summary is
 **stale** when the note's `updated_at` or entry count no longer matches the snapshot (the count
 catches backdated appends, which don't move `updated_at`). Staleness is computed, never stored, and
 a note edited between the summarizer reading it and writing the summary is treated as current until
 its next change. Search is word-based `LIKE` over name + summary (no FTS5/embeddings) — fine for
-hundreds of notes. `read_note` includes the summary; `notes_web.py` shows it. New table only, so an
+hundreds of notes. `agent_notes_read` includes the summary; `notes_web.py` shows it. New table only, so an
 older tool copy keeps working against the upgraded database. `notes_web.py` attributes its writes
 to `--author` (default `Gordon`).
 
@@ -364,9 +364,19 @@ it into your local `secrets.md`, and `push_tool.py` can update it like the other
 
 ## Status notes
 
+### 2026-10-02
+`agent_notes.py` v1.5.0: every tool method now carries an `agent_notes_` prefix (`agent_notes_list`,
+`agent_notes_read`, `agent_notes_create`, `agent_notes_append`, `agent_notes_update`,
+`agent_notes_delete`, `agent_notes_search`, plus `agent_notes_edit_entry`, `_delete_entry`,
+`_update_summary`, `_search_summary`, `_delete_summary`, `_add_tags`, `_remove_tag`, `_list_tags`,
+`_rename_tag`). Reason: Open WebUI's built-in notes tools (`search_notes`, `view_note`, `write_note`,
+`replace_note_content`) share names with ours, and a 9B model asked for `list_notes` ended up
+searching OWUI's own notes instead. Older entries below and old chats use the previous names
+(`list_notes`, `read_note`, ...); the README's method tables and `Nightly_Summarizer.md` use the new ones.
+
 ### 2026-10-01 (2)
 `agent_notes.py` v1.4.0 adds note tags (`add_tags`, `remove_tag`, `list_tags`, `rename_tag`, and a `tag`
-filter on `list_notes`); the web viewer shows, filters and edits them. Design agreed with the project
+filter on `list_notes`, since renamed — see below); the web viewer shows, filters and edits them. Design agreed with the project
 owner: a normalized `tag`/`note_tag` pair rather than a JSON column (searchable, case-insensitive,
 renameable), tags on the parent note only, free-form with look-alike detection rather than a curated
 list. Not deployed yet (re-import through OWUI). `Nightly_Summarizer.md` doesn't assign tags yet.

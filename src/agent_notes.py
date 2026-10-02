@@ -1,19 +1,19 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.4.0
+version: 1.5.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
     diffed. Notes are addressed by their plain-language name, entries by their number.
-    list_notes/read_note/search_notes browse; create_note/append_note add; edit_entry/
-    delete_entry/update_note/delete_note maintain. Every delete is permanent.
+    agent_notes_list/agent_notes_read/agent_notes_search browse; agent_notes_create/agent_notes_append add; agent_notes_edit_entry/
+    agent_notes_delete_entry/agent_notes_update/agent_notes_delete maintain. Every delete is permanent.
 
-    Each note can also carry one short summary (update_summary/search_summary/delete_summary),
+    Each note can also carry one short summary (agent_notes_update_summary/agent_notes_search_summary/agent_notes_delete_summary),
     meant to be kept current by a scheduled sub agent so other agents can find the right note by
     searching summaries instead of reading everything.
 
-    Notes can be tagged (add_tags/remove_tag/list_tags/rename_tag) so related notes can be found
+    Notes can be tagged (agent_notes_add_tags/agent_notes_remove_tag/agent_notes_list_tags/agent_notes_rename_tag) so related notes can be found
     together. Tags are short, lowercase, and shared across notes; when a new tag looks like an
     existing one the tool says so instead of creating a near-duplicate.
 
@@ -55,7 +55,7 @@ SUMMARY_MAX = 500
 AUTHOR_NAME_MAX = 60
 TAG_MAX = 40
 MAX_TAGS_PER_NOTE = 10
-TAGS_SHOWN = 40  # how many in-use tags list_notes lists for the model to choose from
+TAGS_SHOWN = 40  # how many in-use tags agent_notes_list lists for the model to choose from
 LEGACY_AUTHOR = "Mara Voss"  # author #1: seeded into every notes database, and given every row that predates authors
 FALLBACK_AUTHOR = "Unknown agent"  # used only when the caller gave no author_name and Open WebUI named no model
 
@@ -120,7 +120,7 @@ def notes_db_connect(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=DB_BUSY_TIMEOUT_S, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON;")  # off by default in SQLite; delete_note relies on the cascade
+    conn.execute("PRAGMA foreign_keys=ON;")  # off by default in SQLite; agent_notes_delete relies on the cascade
     conn.execute("PRAGMA journal_mode=WAL;")
     if db_path not in _schema_ready:
         conn.executescript(NOTES_SCHEMA)
@@ -272,7 +272,7 @@ def split_tags(value: Any) -> List[str]:
 def validate_summary(text: Any) -> str:
     cleaned = " ".join(str(text or "").split())  # a summary is one paragraph: collapse newlines and runs of spaces
     if not cleaned:
-        raise NoteError("Summary text is required and can't be empty (use delete_summary to remove a summary).")
+        raise NoteError("Summary text is required and can't be empty (use agent_notes_delete_summary to remove a summary).")
     if len(cleaned) > SUMMARY_MAX:
         raise NoteError(f"Summary is {len(cleaned)} characters; the limit is {SUMMARY_MAX} (over by {len(cleaned) - SUMMARY_MAX}). Tighten it.")
     return cleaned
@@ -326,7 +326,7 @@ def validate_text(text: Any) -> str:
     if len(cleaned) > NOTE_TEXT_MAX:
         raise NoteError(
             f"Entry text is {len(cleaned)} characters; the limit is {NOTE_TEXT_MAX} (over by {len(cleaned) - NOTE_TEXT_MAX}). "
-            "Shorten it, or split it across several entries with append_note."
+            "Shorten it, or split it across several entries with agent_notes_append."
         )
     return cleaned
 
@@ -338,10 +338,10 @@ def validate_text(text: Any) -> str:
 def _not_found(conn: sqlite3.Connection, name: str) -> NoteError:
     names = [r["note_name"] for r in conn.execute("SELECT note_name FROM note_id")]
     if not names:
-        return NoteError(f"No note named {name!r}, and no notes exist yet - use create_note to start one.")
+        return NoteError(f"No note named {name!r}, and no notes exist yet - use agent_notes_create to start one.")
     by_lower = {n.lower(): n for n in names}
     close = [by_lower[m] for m in difflib.get_close_matches(name.lower(), list(by_lower), n=3, cutoff=0.5)]
-    hint = f" Did you mean: {', '.join(repr(c) for c in close)}?" if close else " Use list_notes to see what exists."
+    hint = f" Did you mean: {', '.join(repr(c) for c in close)}?" if close else " Use agent_notes_list to see what exists."
     return NoteError(f"No note named {name!r}.{hint}")
 
 
@@ -385,7 +385,7 @@ def create_note_db(db_path: str, name: str, text: str, comment: str, author: str
                 if existing:
                     raise NoteError(
                         f"A note named {existing['note_name']!r} already exists ({existing['entries']} entries). "
-                        "Use append_note to add to it, or choose a different name."
+                        "Use agent_notes_append to add to it, or choose a different name."
                     )
                 author_id = _author_id(conn, author, _now_iso())
                 cur = conn.execute(
@@ -514,7 +514,7 @@ def list_notes_db(db_path: str, limit: int, needs_summary: bool = False, tag: Op
             match = tag if tag in counts else next((n for n in counts if _tag_key(n) == _tag_key(tag)), None)
             if match is None:
                 similar = _similar_tags(tag, counts)
-                raise NoteError(f"No note is tagged {tag!r}." + (f" Similar tags: {', '.join(repr(n) for n in similar)}." if similar else " Use list_tags to see the tags in use."))
+                raise NoteError(f"No note is tagged {tag!r}." + (f" Similar tags: {', '.join(repr(n) for n in similar)}." if similar else " Use agent_notes_list_tags to see the tags in use."))
             tag = match
         rows = conn.execute(
             "SELECT * FROM (SELECT n.note_pk, n.note_name, n.note_comment, n.updated_at, COUNT(d.entry_no) AS entries, a.author_name, "
@@ -670,7 +670,7 @@ def add_tags_db(db_path: str, name: str, tags: List[str], create: bool = False) 
                 )
             added = [t for t in use if t not in have]
             if len(have) + len(added) > MAX_TAGS_PER_NOTE:
-                raise NoteError(f"Note {note['note_name']!r} has {len(have)} tags ({', '.join(sorted(have))}); adding {len(added)} would pass the limit of {MAX_TAGS_PER_NOTE}. Remove one first with remove_tag.")
+                raise NoteError(f"Note {note['note_name']!r} has {len(have)} tags ({', '.join(sorted(have))}); adding {len(added)} would pass the limit of {MAX_TAGS_PER_NOTE}. Remove one first with agent_notes_remove_tag.")
             created = []
             for tag in added:
                 row = conn.execute("SELECT tag_id FROM tag WHERE tag_name = ?", (tag,)).fetchone()
@@ -723,7 +723,7 @@ def rename_tag_db(db_path: str, tag: str, new_tag: str) -> Dict[str, Any]:
             if old is None:
                 counts = _tag_counts(conn)
                 similar = _similar_tags(tag, counts)
-                raise NoteError(f"No tag named {tag!r}." + (f" Did you mean: {', '.join(repr(n) for n in similar)}?" if similar else " Use list_tags to see what exists."))
+                raise NoteError(f"No tag named {tag!r}." + (f" Did you mean: {', '.join(repr(n) for n in similar)}?" if similar else " Use agent_notes_list_tags to see what exists."))
             target = conn.execute("SELECT tag_id, tag_name FROM tag WHERE tag_name = ?", (new_tag,)).fetchone()
             if target is None or target["tag_id"] == old["tag_id"]:
                 conn.execute("UPDATE tag SET tag_name = ? WHERE tag_id = ?", (new_tag, old["tag_id"]))
@@ -769,19 +769,19 @@ class Tools:
             default="/app/backend/data/comfy_outputs/agent_notes.sqlite3",
             description="SQLite database file for agent notes. Deliberately separate from the ComfyUI job database; keep it in the same folder.",
         )
-        MAX_READ_ENTRIES: int = Field(default=50, description="Caps how many of a note's most recent entries read_note returns at once.")
-        MAX_LIST_RESULTS: int = Field(default=50, description="Caps list_notes results.")
-        MAX_SEARCH_RESULTS: int = Field(default=30, description="Caps each of search_notes' two result lists (matching notes, matching entries).")
+        MAX_READ_ENTRIES: int = Field(default=50, description="Caps how many of a note's most recent entries agent_notes_read returns at once.")
+        MAX_LIST_RESULTS: int = Field(default=50, description="Caps agent_notes_list results.")
+        MAX_SEARCH_RESULTS: int = Field(default=30, description="Caps each of agent_notes_search' two result lists (matching notes, matching entries).")
 
     def __init__(self):
         self.valves = self.Valves()
         self.citation = False
 
-    async def list_notes(self, limit: Optional[int] = None, needs_summary: bool = False, tag: Optional[str] = None) -> Dict[str, Any]:
+    async def agent_notes_list(self, limit: Optional[int] = None, needs_summary: bool = False, tag: Optional[str] = None) -> Dict[str, Any]:
         """
         List the notes that exist, most recently changed first, as a Markdown table (name, number
         of entries, last updated, comment). Start here to see whether a note already exists
-        before creating one. Call read_note to see a note's contents.
+        before creating one. Call agent_notes_read to see a note's contents.
 
         The Summary column says whether the note has a summary: none, current, or stale (the note
         changed since it was summarized).
@@ -800,7 +800,7 @@ class Tools:
             return _error(e)
         tag_line = ", ".join(f"{n} ({c})" for n, c in in_use[:TAGS_SHOWN]) if in_use else ""
         if not rows:
-            empty = "Every note has a current summary." if _to_bool(needs_summary) else "No notes yet - use create_note to start one."
+            empty = "Every note has a current summary." if _to_bool(needs_summary) else "No notes yet - use agent_notes_create to start one."
             out_empty: Dict[str, Any] = {"success": True, "count": 0, "total_notes": 0, "table": empty}
             if tag_line:
                 out_empty["tags_in_use"] = tag_line
@@ -818,13 +818,13 @@ class Tools:
             out["note"] = f"Showing {len(rows)} of {total} notes; pass a larger limit (max {v.MAX_LIST_RESULTS}) for more."
         return out
 
-    async def read_note(self, name: str, limit: Optional[int] = None) -> Dict[str, Any]:
+    async def agent_notes_read(self, name: str, limit: Optional[int] = None) -> Dict[str, Any]:
         """
         Read a note: its comment and its entries in chronological order, each with its entry
         number. If the note has more entries than fit, you get the most recent ones and the
         result says so.
 
-        :param name: The note's name, as shown by list_notes (case doesn't matter).
+        :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
         :param limit: How many of the most recent entries to return. Pass "" (or omit) for the maximum allowed.
         """
         v = self.valves
@@ -863,17 +863,17 @@ class Tools:
             )
         return out
 
-    async def create_note(
+    async def agent_notes_create(
         self, name: str, text: str, comment: Optional[str] = None, author_name: Optional[str] = None,
         created_at: Optional[str] = None, __model__: Optional[dict] = None
     ) -> Dict[str, Any]:
         """
         Start a brand-new note with its first entry. Names are unique (ignoring case): if a note
-        with this name already exists, nothing is created - use append_note to add to it instead.
+        with this name already exists, nothing is created - use agent_notes_append to add to it instead.
 
         LIMITS (a call over any of them is refused, nothing is saved): note name 60 characters,
         comment 500, each entry's text 500. Keep entries short and self-contained; put longer
-        material in several entries (append_note) rather than one long one.
+        material in several entries (agent_notes_append) rather than one long one.
 
         :param name: A short, descriptive name (at most 60 characters), e.g. "character-bios" or "Chapter 3 plot points". This is how you and other agents refer to the note from now on.
         :param text: The first entry's text, at most 500 characters.
@@ -893,21 +893,21 @@ class Tools:
             )
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
-        return {"success": True, **result, "note": "Created. Use append_note to add more entries."}
+        return {"success": True, **result, "note": "Created. Use agent_notes_append to add more entries."}
 
-    async def append_note(
+    async def agent_notes_append(
         self, name: str, text: str, author_name: Optional[str] = None, created_at: Optional[str] = None, __model__: Optional[dict] = None
     ) -> Dict[str, Any]:
         """
         Add a new entry to the end of an existing note. This never changes earlier entries - use
-        it for anything new you want to record. To fix an earlier entry use edit_entry; to
-        start a new note use create_note.
+        it for anything new you want to record. To fix an earlier entry use agent_notes_edit_entry; to
+        start a new note use agent_notes_create.
 
         LIMIT: each entry's text is at most 500 characters (a longer one is refused, nothing is
-        saved). For longer content, make several append_note calls, one idea per entry.
+        saved). For longer content, make several agent_notes_append calls, one idea per entry.
 
-        :param name: The note's name, as shown by list_notes (case doesn't matter).
-        :param text: The new entry's text, at most 500 characters. Longer content: split it across several append_note calls.
+        :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
+        :param text: The new entry's text, at most 500 characters. Longer content: split it across several agent_notes_append calls.
         :param author_name: Who is writing this, at most 60 characters. Pass "" (or omit) to be recorded under your model's name.
         :param created_at: Only when copying in an older note: when this entry was originally written, as ISO 8601 (2026-03-01T14:30:00Z, or just 2026-03-01) or a Unix epoch number. Pass "" (or omit) for the current time, which is right for anything new. Entries read back in time order, so a backdated entry appears before newer ones even though its number is higher.
         """
@@ -924,44 +924,44 @@ class Tools:
             return _error(e)
         return {"success": True, **result}
 
-    async def edit_entry(self, name: str, entry_no: int, text: str) -> Dict[str, Any]:
+    async def agent_notes_edit_entry(self, name: str, entry_no: int, text: str) -> Dict[str, Any]:
         """
         Replace the text of one existing entry, keeping its number and its place in the note.
 
         LIMIT: the new text is at most 500 characters (a longer one is refused, the entry is left
-        as it was). If the rewrite won't fit, shorten it and put the rest in append_note.
+        as it was). If the rewrite won't fit, shorten it and put the rest in agent_notes_append.
 
-        :param name: The note's name, as shown by list_notes (case doesn't matter).
-        :param entry_no: The entry's number, as shown by read_note (e.g. 3 or "#3").
+        :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
+        :param entry_no: The entry's number, as shown by agent_notes_read (e.g. 3 or "#3").
         :param text: The entry's new text, at most 500 characters.
         """
         try:
             number = _to_int(entry_no, None, "entry_no")
             if number is None:
-                raise NoteError("entry_no is required - read_note shows each entry's number.")
+                raise NoteError("entry_no is required - agent_notes_read shows each entry's number.")
             result = await asyncio.to_thread(edit_entry_db, self.valves.NOTES_DB_PATH, validate_name(name), number, validate_text(text))
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
         return {"success": True, **result}
 
-    async def delete_entry(self, name: str, entry_no: int) -> Dict[str, Any]:
+    async def agent_notes_delete_entry(self, name: str, entry_no: int) -> Dict[str, Any]:
         """
         Permanently delete one entry from a note. The other entries keep their numbers (numbers
         are never reused).
 
-        :param name: The note's name, as shown by list_notes (case doesn't matter).
-        :param entry_no: The entry's number, as shown by read_note (e.g. 3 or "#3").
+        :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
+        :param entry_no: The entry's number, as shown by agent_notes_read (e.g. 3 or "#3").
         """
         try:
             number = _to_int(entry_no, None, "entry_no")
             if number is None:
-                raise NoteError("entry_no is required - read_note shows each entry's number.")
+                raise NoteError("entry_no is required - agent_notes_read shows each entry's number.")
             result = await asyncio.to_thread(delete_entry_db, self.valves.NOTES_DB_PATH, validate_name(name), number)
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
         return {"success": True, **result}
 
-    async def update_note(
+    async def agent_notes_update(
         self, name: str, new_name: Optional[str] = None, comment: Optional[str] = None, clear_comment: bool = False
     ) -> Dict[str, Any]:
         """
@@ -971,7 +971,7 @@ class Tools:
         LIMITS: note name 60 characters, comment 500 (a call over either is refused, nothing is
         changed).
 
-        :param name: The note's current name, as shown by list_notes (case doesn't matter).
+        :param name: The note's current name, as shown by agent_notes_list (case doesn't matter).
         :param new_name: The new name (at most 60 characters; must not match another note's name). Pass "" (or omit) to keep the current name.
         :param comment: The new comment (at most 500 characters). Pass "" (or omit) to keep the current comment.
         :param clear_comment: true to erase the comment entirely. Pass false (the normal choice) otherwise.
@@ -995,12 +995,12 @@ class Tools:
             return _error(e)
         return {"success": True, **result}
 
-    async def delete_note(self, name: str) -> Dict[str, Any]:
+    async def agent_notes_delete(self, name: str) -> Dict[str, Any]:
         """
         Permanently delete a note and every entry in it. This cannot be undone and asks for no
-        confirmation, so be sure - read_note first if unsure.
+        confirmation, so be sure - agent_notes_read first if unsure.
 
-        :param name: The note's name, as shown by list_notes (case doesn't matter).
+        :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
         """
         try:
             result = await asyncio.to_thread(delete_note_db, self.valves.NOTES_DB_PATH, validate_name(name))
@@ -1008,11 +1008,11 @@ class Tools:
             return _error(e)
         return {"success": True, **result}
 
-    async def add_tags(self, name: str, tags: str, create: bool = False) -> Dict[str, Any]:
+    async def agent_notes_add_tags(self, name: str, tags: str, create: bool = False) -> Dict[str, Any]:
         """
-        Tag a note so related notes can be found together (list_notes with a tag lists them). Tags
+        Tag a note so related notes can be found together (agent_notes_list with a tag lists them). Tags
         are short lowercase labels shared by every note, e.g. "comfy", "character-bios", "todo".
-        REUSE existing tags: list_notes shows the tags in use, and list_tags shows them with counts.
+        REUSE existing tags: agent_notes_list shows the tags in use, and agent_notes_list_tags shows them with counts.
 
         A tag that matches an existing one (ignoring case, hyphens and plurals) is simply reused.
         If you give a NEW tag that resembles existing ones, nothing is saved and the reply lists the
@@ -1020,7 +1020,7 @@ class Tools:
 
         LIMITS: a tag is at most 40 characters (letters, digits and . + # -), a note has at most 10 tags.
 
-        :param name: The note's name, as shown by list_notes (case doesn't matter).
+        :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
         :param tags: One tag, or several separated by commas, e.g. "comfy, sdxl".
         :param create: true to create a tag even though similar ones exist (only after checking they don't fit). Pass false (the normal choice) otherwise.
         """
@@ -1030,12 +1030,12 @@ class Tools:
             return _error(e)
         return {"success": True, **result}
 
-    async def remove_tag(self, name: str, tag: str) -> Dict[str, Any]:
+    async def agent_notes_remove_tag(self, name: str, tag: str) -> Dict[str, Any]:
         """
         Take one tag off a note. The tag disappears entirely once no note carries it.
 
-        :param name: The note's name, as shown by list_notes (case doesn't matter).
-        :param tag: The tag to remove, as shown by read_note or list_notes.
+        :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
+        :param tag: The tag to remove, as shown by agent_notes_read or agent_notes_list.
         """
         try:
             result = await asyncio.to_thread(remove_tag_db, self.valves.NOTES_DB_PATH, validate_name(name), normalize_tag(tag))
@@ -1043,10 +1043,10 @@ class Tools:
             return _error(e)
         return {"success": True, **result}
 
-    async def list_tags(self, query: Optional[str] = None) -> Dict[str, Any]:
+    async def agent_notes_list_tags(self, query: Optional[str] = None) -> Dict[str, Any]:
         """
         List the tags in use, with how many notes carry each, most used first. Check this before
-        inventing a new tag for add_tags.
+        inventing a new tag for agent_notes_add_tags.
 
         :param query: Only tags containing or resembling this text. Pass "" (or omit) for all tags.
         """
@@ -1056,12 +1056,12 @@ class Tools:
             return _error(e)
         return {"success": True, "count": len(rows), "tags": [{"tag": n, "notes": c} for n, c in rows]}
 
-    async def rename_tag(self, tag: str, new_tag: str) -> Dict[str, Any]:
+    async def agent_notes_rename_tag(self, tag: str, new_tag: str) -> Dict[str, Any]:
         """
         Rename a tag on every note that carries it. If new_tag already exists the two are merged:
         use this to fold a near-duplicate (say "sdxl-poses") into the tag it should have been ("poses").
 
-        :param tag: The existing tag, as shown by list_tags.
+        :param tag: The existing tag, as shown by agent_notes_list_tags.
         :param new_tag: Its new name, at most 40 characters.
         """
         try:
@@ -1070,7 +1070,7 @@ class Tools:
             return _error(e)
         return {"success": True, **result}
 
-    async def search_notes(self, query: str, limit: Optional[int] = None) -> Dict[str, Any]:
+    async def agent_notes_search(self, query: str, limit: Optional[int] = None) -> Dict[str, Any]:
         """
         Search every note for some text (case-insensitive substring). Matches note names and
         comments, and the text of individual entries; returns both lists so you can find which
@@ -1096,20 +1096,20 @@ class Tools:
             ],
         }
 
-    async def update_summary(
+    async def agent_notes_update_summary(
         self, name: str, summary: str, author_name: Optional[str] = None, __model__: Optional[dict] = None
     ) -> Dict[str, Any]:
         """
         Write (or replace) a note's summary: a brief, searchable description of what the note
-        contains, so other agents can find it with search_summary without reading every note. Each
+        contains, so other agents can find it with agent_notes_search_summary without reading every note. Each
         note has at most one summary; calling this again replaces it. Read the whole note first
-        (read_note) so the summary reflects all of it.
+        (agent_notes_read) so the summary reflects all of it.
 
         Write for retrieval: name the key people, places, decisions and topics in plain words, since
-        search_summary matches on the words used. LIMIT: 500 characters (a longer one is refused,
+        agent_notes_search_summary matches on the words used. LIMIT: 500 characters (a longer one is refused,
         nothing is saved).
 
-        :param name: The note's name, as shown by list_notes (case doesn't matter).
+        :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
         :param summary: The summary, at most 500 characters, one paragraph.
         :param author_name: Who wrote the summary, at most 60 characters. Pass "" (or omit) to be recorded under your model's name.
         """
@@ -1125,13 +1125,13 @@ class Tools:
             return _error(e)
         return {"success": True, **result}
 
-    async def search_summary(self, query: str, limit: Optional[int] = None) -> Dict[str, Any]:
+    async def agent_notes_search_summary(self, query: str, limit: Optional[int] = None) -> Dict[str, Any]:
         """
         Search the notes' summaries (and note names) for the words in a query, best match first.
-        Use this to find which note holds what you need, then read_note for the details. Any
+        Use this to find which note holds what you need, then agent_notes_read for the details. Any
         word of the query can match; notes matching more of the words rank higher, so a few
         distinctive keywords work better than a full sentence. A result marked stale means the
-        note changed after it was summarized, so confirm with read_note.
+        note changed after it was summarized, so confirm with agent_notes_read.
 
         :param query: A few keywords, e.g. "dragon lair map".
         :param limit: Maximum results, default 10. Pass "" (or omit) for the default.
@@ -1160,12 +1160,12 @@ class Tools:
             ],
         }
 
-    async def delete_summary(self, name: str) -> Dict[str, Any]:
+    async def agent_notes_delete_summary(self, name: str) -> Dict[str, Any]:
         """
         Permanently remove a note's summary. The note and its entries are untouched. Normally you
-        don't need this - update_summary replaces a summary - but it clears one that is wrong.
+        don't need this - agent_notes_update_summary replaces a summary - but it clears one that is wrong.
 
-        :param name: The note's name, as shown by list_notes (case doesn't matter).
+        :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
         """
         try:
             result = await asyncio.to_thread(delete_summary_db, self.valves.NOTES_DB_PATH, validate_name(name))
