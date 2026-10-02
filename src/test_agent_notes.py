@@ -126,7 +126,7 @@ class EditAndDeleteEntryTests(NotesTestCase):
     def test_edit_replaces_text_keeps_number_and_marks_edited(self):
         res = self.run_async(self.tool.agent_notes_edit_entry("log", 2, "TWO"))
         self.assertTrue(res["success"])
-        read = self.run_async(self.tool.agent_notes_read("log"))
+        read = self.run_async(self.tool.agent_notes_read("log", verbose=True))
         by_no = {e["entry_no"]: e for e in read["entries"]}
         self.assertEqual(by_no[2]["text"], "TWO")
         self.assertIn("edited_at", by_no[2])
@@ -315,7 +315,7 @@ class AuthorTests(NotesTestCase):
     def test_explicit_author_name_is_recorded_on_note_and_entries(self):
         self.run_async(self.tool.agent_notes_create("n", "one", "", "Claude"))
         self.run_async(self.tool.agent_notes_append("n", "two", "Gemma"))
-        res = self.run_async(self.tool.agent_notes_read("n"))
+        res = self.run_async(self.tool.agent_notes_read("n", verbose=True))
         self.assertEqual(res["started_by"], "Claude")
         self.assertEqual([e["author"] for e in res["entries"]], ["Claude", "Gemma"])
         self.assertEqual([a[1] for a in self.authors()], ["Mara Voss", "Claude", "Gemma"])
@@ -323,12 +323,12 @@ class AuthorTests(NotesTestCase):
     def test_model_name_from_open_webui_is_the_default(self):
         self.run_async(self.tool.agent_notes_create("n", "one", __model__={"id": "qwen3:32b", "name": "Qwen 3"}))
         self.run_async(self.tool.agent_notes_append("n", "two", author_name="", __model__={"id": "only-an-id"}))
-        self.assertEqual([e["author"] for e in self.run_async(self.tool.agent_notes_read("n"))["entries"]], ["Qwen 3", "only-an-id"])
+        self.assertEqual([e["author"] for e in self.run_async(self.tool.agent_notes_read("n", verbose=True))["entries"]], ["Qwen 3", "only-an-id"])
 
     def test_explicit_name_beats_model_and_blank_everything_falls_back(self):
         self.run_async(self.tool.agent_notes_create("n", "one", author_name="Me", __model__={"name": "Qwen 3"}))
         self.run_async(self.tool.agent_notes_append("n", "two"))
-        self.assertEqual([e["author"] for e in self.run_async(self.tool.agent_notes_read("n"))["entries"]], ["Me", mod.FALLBACK_AUTHOR])
+        self.assertEqual([e["author"] for e in self.run_async(self.tool.agent_notes_read("n", verbose=True))["entries"]], ["Me", mod.FALLBACK_AUTHOR])
 
     def test_authors_are_reused_ignoring_case_and_whitespace(self):
         self.run_async(self.tool.agent_notes_create("n", "one", author_name="Claude"))
@@ -344,8 +344,8 @@ class AuthorTests(NotesTestCase):
 
     def test_list_and_search_show_authors(self):
         self.run_async(self.tool.agent_notes_create("n", "needle", author_name="Claude"))
-        self.assertIn("| Claude |", self.run_async(self.tool.agent_notes_list())["table"])
-        self.assertEqual(self.run_async(self.tool.agent_notes_search("needle"))["matching_entries"][0]["author"], "Claude")
+        self.assertIn("| Claude |", self.run_async(self.tool.agent_notes_list(verbose=True))["table"])
+        self.assertEqual(self.run_async(self.tool.agent_notes_search("needle", verbose=True))["matching_entries"][0]["author"], "Claude")
 
 
 class TimestampTests(NotesTestCase):
@@ -360,7 +360,7 @@ class TimestampTests(NotesTestCase):
         before = self.sql("SELECT updated_at FROM note_id")
         self.run_async(self.tool.agent_notes_append("n", "from last year", created_at="2025-01-02"))
         self.assertEqual(self.sql("SELECT updated_at FROM note_id"), before)
-        entries = self.run_async(self.tool.agent_notes_read("n"))["entries"]
+        entries = self.run_async(self.tool.agent_notes_read("n", verbose=True))["entries"]
         self.assertEqual([(e["entry_no"], e["created_at"][:10]) for e in entries][0], (2, "2025-01-02"))
         self.assertEqual(entries[1]["entry_no"], 1)
 
@@ -429,7 +429,7 @@ class SummaryTests(NotesTestCase):
     def test_author_and_read_note_shows_summary_and_staleness(self):
         self.create("n", "x")
         self.summarize(author_name="Nightly")
-        got = self.run_async(self.tool.agent_notes_read("n"))["summary"]
+        got = self.run_async(self.tool.agent_notes_read("n", verbose=True))["summary"]
         self.assertEqual((got["summarized_by"], got["stale"]), ("Nightly", False))
         self.run_async(self.tool.agent_notes_append("n", "more"))
         self.assertTrue(self.run_async(self.tool.agent_notes_read("n"))["summary"]["stale"])
@@ -477,7 +477,7 @@ class SummaryTests(NotesTestCase):
         for name, text in [("a", "dragon lair map"), ("b", "dragon only"), ("c", "unrelated tavern"), ("lair-notes", "misc")]:
             self.create(name, "x")
             self.summarize(name, text)
-        res = self.run_async(self.tool.agent_notes_search_summary("Dragon LAIR"))
+        res = self.run_async(self.tool.agent_notes_search_summary("Dragon LAIR", verbose=True))
         self.assertEqual(res["results"][0]["note_name"], "a")  # both words; the other two match one each
         self.assertEqual(res["results"][0]["matched_words"], "2 of 2")
         self.assertEqual({r["note_name"] for r in res["results"]}, {"a", "b", "lair-notes"})
@@ -530,7 +530,7 @@ class AuthorMigrationTests(NotesTestCase):
 
     def test_existing_rows_are_attributed_to_author_one(self):
         self.make_old_db()
-        res = self.run_async(self.tool.agent_notes_read("old"))
+        res = self.run_async(self.tool.agent_notes_read("old", verbose=True))
         self.assertEqual(res["started_by"], "Mara Voss")
         self.assertEqual([e["author"] for e in res["entries"]], ["Mara Voss", "Mara Voss"])
         self.assertEqual(self.sql("SELECT author_id, author_name FROM note_author"), [(1, "Mara Voss")])
@@ -538,7 +538,7 @@ class AuthorMigrationTests(NotesTestCase):
     def test_new_writes_after_migration_get_their_own_author(self):
         self.make_old_db()
         self.run_async(self.tool.agent_notes_append("old", "c", "Claude"))
-        authors = [e["author"] for e in self.run_async(self.tool.agent_notes_read("old"))["entries"]]
+        authors = [e["author"] for e in self.run_async(self.tool.agent_notes_read("old", verbose=True))["entries"]]
         self.assertEqual(authors, ["Mara Voss", "Mara Voss", "Claude"])
 
     def test_migration_is_idempotent_and_does_not_reattribute_later_unattributed_rows(self):
@@ -547,7 +547,7 @@ class AuthorMigrationTests(NotesTestCase):
         # a row written by an older copy of the tool, after the upgrade, has no author...
         self.exec_raw("INSERT INTO note_data (note_pk, entry_no, note_text, created_at) VALUES (1, 3, 'late', 'x')")
         mod._schema_ready.discard(self.db)  # ...and stays that way when another process migrates again
-        res = self.run_async(self.tool.agent_notes_read("old"))
+        res = self.run_async(self.tool.agent_notes_read("old", verbose=True))
         self.assertEqual(res["entries"][-1]["author"], "unknown")
         self.assertEqual(self.sql("SELECT COUNT(*) FROM note_author"), [(1,)])
 
@@ -685,8 +685,8 @@ class ReadTaggedTests(NotesTestCase):
         for name, tags in (("voice", "identity, speech"), ("history", "identity"), ("hobbies", "pastimes")):
             self.run_async(self.tool.agent_notes_add_tags(name, tags))
 
-    def read(self, tags, match=None):
-        return self.run_async(self.tool.agent_notes_read_tagged(tags, match))
+    def read(self, tags, match=None, verbose=True):
+        return self.run_async(self.tool.agent_notes_read_tagged(tags, match, verbose))
 
     def names(self, res):
         return [n["note_name"] for n in res["notes"]]
@@ -707,6 +707,30 @@ class ReadTaggedTests(NotesTestCase):
         self.assertFalse(self.read("identity, nonsense", "all")["success"])
         self.assertFalse(self.read("nonsense")["success"])
         self.assertFalse(self.read("identity", "some")["success"])
+
+    def test_plain_mode_is_just_names_summaries_and_text(self):
+        self.run_async(self.tool.agent_notes_update_summary("voice", "how she talks"))
+        res = self.read("identity, speech", verbose=False)
+        self.assertEqual(set(res), {"success", "notes"})
+        voice = next(n for n in res["notes"] if n["note_name"] == "voice")
+        self.assertEqual(voice, {"note_name": "voice", "summary": "how she talks", "entries": ["speaks softly"]})
+        history = next(n for n in res["notes"] if n["note_name"] == "history")
+        self.assertEqual(history, {"note_name": "history", "entries": ["born in 1990"]})  # no summary key, no counts when nothing is cut
+
+    def test_plain_mode_fits_more_than_verbose(self):
+        for i in range(30):
+            self.run_async(self.tool.agent_notes_append("voice", f"line {i} " + "z" * 60))
+        self.tool.valves.MAX_TAGGED_CHARS = 2500
+        plain = sum(len(n["entries"]) for n in self.read("speech", verbose=False)["notes"])
+        full = sum(len(n["entries"]) for n in self.read("speech", verbose=True)["notes"])
+        self.assertGreater(plain, full)
+
+    def test_plain_mode_reports_cut_entries(self):
+        for i in range(30):
+            self.run_async(self.tool.agent_notes_append("voice", f"line {i} " + "z" * 60))
+        self.tool.valves.MAX_TAGGED_CHARS = 1000
+        voice = self.read("speech", verbose=False)["notes"][0]
+        self.assertGreater(voice["entries_not_shown"], 0)
 
     def test_summary_is_included(self):
         self.run_async(self.tool.agent_notes_update_summary("voice", "how she talks"))
@@ -739,6 +763,40 @@ class ReadTaggedTests(NotesTestCase):
         packed, left_out = mod.pack_tagged(notes, 200)
         self.assertEqual([n["note_name"] for n in packed], ["a"])
         self.assertEqual(left_out, ["b", "c"])
+
+
+class VerboseTests(NotesTestCase):
+    def setUp(self):
+        super().setUp()
+        self.create("n", "needle text")
+        self.run_async(self.tool.agent_notes_update_summary("n", "needle summary", "Nightly"))
+
+    def test_read_plain_keeps_entry_numbers_but_drops_bookkeeping(self):
+        res = self.run_async(self.tool.agent_notes_read("n"))
+        self.assertEqual(res["entries"], [{"entry_no": 1, "text": "needle text"}])
+        self.assertNotIn("started_by", res)
+        self.assertEqual(res["summary"], {"text": "needle summary", "stale": False})
+
+    def test_read_verbose_has_everything(self):
+        res = self.run_async(self.tool.agent_notes_read("n", verbose=True))
+        self.assertEqual(set(res["entries"][0]), {"entry_no", "author", "created_at", "text"})
+        self.assertIn("summarized_by", res["summary"])
+        self.assertIn("started_by", res)
+
+    def test_search_plain_and_verbose(self):
+        plain = self.run_async(self.tool.agent_notes_search("needle"))["matching_entries"][0]
+        self.assertEqual(set(plain), {"note_name", "entry_no", "text"})
+        self.assertIn("author", self.run_async(self.tool.agent_notes_search("needle", verbose=True))["matching_entries"][0])
+
+    def test_search_summary_plain_keeps_staleness_only(self):
+        plain = self.run_async(self.tool.agent_notes_search_summary("needle"))["results"][0]
+        self.assertEqual(set(plain), {"note_name", "summary", "stale"})
+
+    def test_list_plain_drops_author_and_time_columns(self):
+        plain = self.run_async(self.tool.agent_notes_list())["table"].splitlines()[0]
+        self.assertNotIn("Started by", plain)
+        self.assertNotIn("Last updated", plain)
+        self.assertIn("Started by", self.run_async(self.tool.agent_notes_list(verbose=True))["table"])
 
 
 class OpenWebUICoercionTests(unittest.TestCase):

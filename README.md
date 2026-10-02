@@ -237,6 +237,11 @@ status note below for how this was found.
 Same `""`/`false` = omitted convention as above. Limits: note name 60 characters, note comment 500,
 entry text 500 — enforced by the tool (with an actionable message) and by SQLite `CHECK`s.
 
+`agent_notes_list`, `_read`, `_search`, `_search_summary` and `_read_tagged` take `verbose` (default `false`):
+plain replies drop authors, timestamps and other bookkeeping to save a small model's context. `_read` and
+`_search` still return `entry_no` (needed to edit/delete); `_read_tagged` plain returns only note names,
+summaries and bare entry-text strings. `verbose=true` restores the full detail.
+
 | Method | Arguments |
 |---|---|
 | `agent_notes_list` | `limit` (default `20`, capped by `MAX_LIST_RESULTS`); `needs_summary=true` lists only notes with no summary or a stale one. The table has a Summary column: none/current/stale |

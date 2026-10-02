@@ -800,6 +800,18 @@ def _size(obj: Any) -> int:
     return len(json.dumps(obj, ensure_ascii=False)) + 2  # + the ", " that separates it from its neighbour
 
 
+def _shape_tagged(note: Dict[str, Any], verbose: bool) -> Dict[str, Any]:
+    """The note as the model will receive it. Plain mode keeps only what a reader needs: the name, the summary if
+    there is one, and the entry texts as bare strings."""
+    if verbose:
+        return {**note, "_verbose": True}
+    shaped: Dict[str, Any] = {"note_name": note["note_name"]}
+    if note["summary"]:
+        shaped["summary"] = note["summary"]
+    shaped["entries"] = [e["text"] for e in note["entries"]]
+    return shaped
+
+
 def pack_tagged(notes: List[Dict[str, Any]], budget: int) -> "tuple[List[Dict[str, Any]], List[str]]":
     """Fit as much as possible of these notes into `budget` characters without ever cutting a string in half.
     Pass 1 admits each note's heading (name, tags, summary) in rank order, stopping at the first that doesn't fit.
@@ -829,7 +841,10 @@ def pack_tagged(notes: List[Dict[str, Any]], budget: int) -> "tuple[List[Dict[st
     for note in packed:
         note.pop("_pending")
         note["entries"].reverse()  # newest-first while packing; read in time order
-        note["entries_not_shown"] = note["total_entries"] - len(note["entries"])
+        hidden = note.pop("total_entries") - len(note["entries"])
+        verbose = note.pop("_verbose", False)
+        if hidden or verbose:
+            note["entries_not_shown"] = hidden
     return packed, [n["note_name"] for n in notes[len(packed):]]
 
 
@@ -876,7 +891,7 @@ class Tools:
         self.valves = self.Valves()
         self.citation = False
 
-    async def agent_notes_list(self, limit: Optional[str] = None, needs_summary: bool = False, tag: Optional[str] = None) -> Dict[str, Any]:
+    async def agent_notes_list(self, limit: Optional[str] = None, needs_summary: bool = False, tag: Optional[str] = None, verbose: bool = False) -> Dict[str, Any]:
         """
         List the notes that exist, most recently changed first, as a Markdown table (name, number
         of entries, last updated, comment). Start here to see whether a note already exists
@@ -888,6 +903,7 @@ class Tools:
         :param limit: Maximum notes returned, default 20. Pass "" (or omit) for the default.
         :param needs_summary: true to list only notes whose summary is missing or stale (a summarizing agent's to-do list). Pass false (the normal choice) otherwise.
         :param tag: List only notes carrying this tag. Pass "" (or omit) for all notes. The result also lists the tags in use, so you can see which exist.
+        :param verbose: true to include authors, timestamps and other bookkeeping. Pass false (the normal choice) to get just the text, which is shorter.
         """
         v = self.valves
         try:
@@ -904,12 +920,19 @@ class Tools:
             if tag_line:
                 out_empty["tags_in_use"] = tag_line
             return out_empty
-        lines = ["| Note | Entries | Last updated (UTC) | Started by | Summary | Tags | Comment |", "|---|---|---|---|---|---|---|"]
-        for r in rows:
-            lines.append(
-                f"| {_cell(r['note_name'], NOTE_NAME_MAX)} | {r['entries']} | {r['updated_at'][:16].replace('T', ' ')} "
-                f"| {_cell(r['author_name'] or 'unknown', AUTHOR_NAME_MAX)} | {r['summary_state']} | {_cell(r['tags'] or '')} | {_cell(r['note_comment'])} |"
-            )
+        if _to_bool(verbose):
+            lines = ["| Note | Entries | Last updated (UTC) | Started by | Summary | Tags | Comment |", "|---|---|---|---|---|---|---|"]
+            for r in rows:
+                lines.append(
+                    f"| {_cell(r['note_name'], NOTE_NAME_MAX)} | {r['entries']} | {r['updated_at'][:16].replace('T', ' ')} "
+                    f"| {_cell(r['author_name'] or 'unknown', AUTHOR_NAME_MAX)} | {r['summary_state']} | {_cell(r['tags'] or '')} | {_cell(r['note_comment'])} |"
+                )
+        else:
+            lines = ["| Note | Entries | Summary | Tags | Comment |", "|---|---|---|---|---|"]
+            for r in rows:
+                lines.append(
+                    f"| {_cell(r['note_name'], NOTE_NAME_MAX)} | {r['entries']} | {r['summary_state']} | {_cell(r['tags'] or '')} | {_cell(r['note_comment'])} |"
+                )
         out: Dict[str, Any] = {"success": True, "count": len(rows), "total_notes": total, "table": "\n".join(lines)}
         if tag_line:
             out["tags_in_use"] = tag_line
@@ -917,7 +940,7 @@ class Tools:
             out["note"] = f"Showing {len(rows)} of {total} notes; pass a larger limit (max {v.MAX_LIST_RESULTS}) for more."
         return out
 
-    async def agent_notes_read(self, name: str, limit: Optional[str] = None) -> Dict[str, Any]:
+    async def agent_notes_read(self, name: str, limit: Optional[str] = None, verbose: bool = False) -> Dict[str, Any]:
         """
         Read a note: its comment and its entries in chronological order, each with its entry
         number. If the note has more entries than fit, you get the most recent ones and the
@@ -925,6 +948,7 @@ class Tools:
 
         :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
         :param limit: How many of the most recent entries to return. Pass "" (or omit) for the maximum allowed.
+        :param verbose: true to include authors, timestamps and other bookkeeping. Pass false (the normal choice) to get just the text, which is shorter.
         """
         v = self.valves
         try:
@@ -932,29 +956,30 @@ class Tools:
             result = await asyncio.to_thread(read_note_db, v.NOTES_DB_PATH, validate_name(name), cap)
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
+        full = _to_bool(verbose)
         entries = []
         for r in result["entries"]:
-            item = {"entry_no": r["entry_no"], "author": r["author_name"] or "unknown", "created_at": r["created_at"], "text": r["note_text"]}
-            if r["edited_at"]:
-                item["edited_at"] = r["edited_at"]
+            item = {"entry_no": r["entry_no"], "text": r["note_text"]}  # the number stays: edit_entry/delete_entry need it
+            if full:
+                item = {"entry_no": r["entry_no"], "author": r["author_name"] or "unknown", "created_at": r["created_at"], "text": r["note_text"]}
+                if r["edited_at"]:
+                    item["edited_at"] = r["edited_at"]
             entries.append(item)
         out: Dict[str, Any] = {
             "success": True,
             "note_name": result["note"]["note_name"],
             "note_comment": result["note"]["note_comment"],
-            "started_by": result["started_by"] or "unknown",
             "tags": result["tags"],
             "total_entries": result["total"],
             "entries": entries,
         }
+        if full:
+            out["started_by"] = result["started_by"] or "unknown"
         if result["summary"]:
             sm = result["summary"]
-            out["summary"] = {
-                "text": sm["summary_text"],
-                "last_summarized": sm["last_summarized"],
-                "summarized_by": sm["author_name"] or "unknown",
-                "stale": bool(sm["stale"]),
-            }
+            out["summary"] = {"text": sm["summary_text"], "stale": bool(sm["stale"])}
+            if full:
+                out["summary"].update({"last_summarized": sm["last_summarized"], "summarized_by": sm["author_name"] or "unknown"})
         if result["total"] > len(entries):
             out["note"] = (
                 f"Showing the {len(entries)} most recent of {result['total']} entries. "
@@ -1172,7 +1197,7 @@ class Tools:
             return _error(e)
         return {"success": True, **result}
 
-    async def agent_notes_read_tagged(self, tags: str, match: Optional[str] = None) -> Dict[str, Any]:
+    async def agent_notes_read_tagged(self, tags: str, match: Optional[str] = None, verbose: bool = False) -> Dict[str, Any]:
         """
         Pull in the notes carrying certain tags, with their contents, in one call: for each note its
         tags, its summary if it has one, and its most recent entries. Use this to gather everything
@@ -1184,6 +1209,7 @@ class Tools:
 
         :param tags: One tag, or several separated by commas, e.g. "identity, speech". Variant spellings are matched (see agent_notes_list_tags).
         :param match: "any" (the default) for notes carrying at least one of the tags, best match first; "all" for only notes carrying every tag. Pass "" (or omit) for any.
+        :param verbose: true to include each entry's number, author and timestamp and each note's tags. Pass false (the normal choice) to get just names, summaries and entry text, which is much shorter.
         """
         v = self.valves
         try:
@@ -1194,8 +1220,12 @@ class Tools:
             notes, found, missing = await asyncio.to_thread(tagged_notes_db, v.NOTES_DB_PATH, wanted, mode == "all")
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
-        packed, left_out = pack_tagged(notes, max(500, v.MAX_TAGGED_CHARS) - 300)  # 300: the reply's own keys and remarks
-        out: Dict[str, Any] = {"success": True, "tags": found, "match": mode, "notes_found": len(notes), "notes": packed}
+        full = _to_bool(verbose)
+        shaped = [_shape_tagged(n, full) for n in notes]
+        packed, left_out = pack_tagged(shaped, max(500, v.MAX_TAGGED_CHARS) - 300)  # 300: the reply's own keys and remarks
+        out: Dict[str, Any] = {"success": True, "notes": packed}
+        if full:
+            out.update({"tags": found, "match": mode, "notes_found": len(notes)})
         remarks = []
         if not notes:
             remarks.append(f"No note carries {'all of ' if mode == 'all' else ''}those tags.")
@@ -1204,13 +1234,13 @@ class Tools:
         if left_out:
             out["notes_left_out"] = left_out
             remarks.append(f"{len(left_out)} more matching note(s) didn't fit the size limit and were left out; use agent_notes_read on them by name.")
-        if any(n["entries_not_shown"] for n in packed):
+        if any(n.get("entries_not_shown") for n in packed):
             remarks.append("Some notes show only their newest entries (see entries_not_shown); agent_notes_read has the rest.")
         if remarks:
             out["note"] = " ".join(remarks)
         return out
 
-    async def agent_notes_search(self, query: str, limit: Optional[str] = None) -> Dict[str, Any]:
+    async def agent_notes_search(self, query: str, limit: Optional[str] = None, verbose: bool = False) -> Dict[str, Any]:
         """
         Search every note for some text (case-insensitive substring). Matches note names and
         comments, and the text of individual entries; returns both lists so you can find which
@@ -1218,6 +1248,7 @@ class Tools:
 
         :param query: The text to look for.
         :param limit: Maximum matches in each list, default 10. Pass "" (or omit) for the default.
+        :param verbose: true to include authors, timestamps and other bookkeeping. Pass false (the normal choice) to get just the text, which is shorter.
         """
         v = self.valves
         try:
@@ -1231,7 +1262,9 @@ class Tools:
             "success": True,
             "matching_notes": [{"note_name": r["note_name"], "note_comment": r["note_comment"]} for r in notes],
             "matching_entries": [
-                {"note_name": r["note_name"], "entry_no": r["entry_no"], "author": r["author_name"] or "unknown", "text": r["note_text"]}
+                {"note_name": r["note_name"], "entry_no": r["entry_no"], "text": r["note_text"]}
+                if not _to_bool(verbose)
+                else {"note_name": r["note_name"], "entry_no": r["entry_no"], "author": r["author_name"] or "unknown", "text": r["note_text"]}
                 for r in entries
             ],
         }
@@ -1265,7 +1298,7 @@ class Tools:
             return _error(e)
         return {"success": True, **result}
 
-    async def agent_notes_search_summary(self, query: str, limit: Optional[str] = None) -> Dict[str, Any]:
+    async def agent_notes_search_summary(self, query: str, limit: Optional[str] = None, verbose: bool = False) -> Dict[str, Any]:
         """
         Search the notes' summaries (and note names) for the words in a query, best match first.
         Use this to find which note holds what you need, then agent_notes_read for the details. Any
@@ -1275,6 +1308,7 @@ class Tools:
 
         :param query: A few keywords, e.g. "dragon lair map".
         :param limit: Maximum results, default 10. Pass "" (or omit) for the default.
+        :param verbose: true to include authors, timestamps and other bookkeeping. Pass false (the normal choice) to get just the text, which is shorter.
         """
         v = self.valves
         try:
@@ -1288,7 +1322,9 @@ class Tools:
             "success": True,
             "count": len(rows),
             "results": [
-                {
+                {"note_name": r["note_name"], "summary": r["summary_text"], "stale": bool(r["stale"])}
+                if not _to_bool(verbose)
+                else {
                     "note_name": r["note_name"],
                     "summary": r["summary_text"],
                     "matched_words": f"{r['score']} of {words}",
