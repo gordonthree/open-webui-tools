@@ -551,5 +551,123 @@ class AuthorMigrationTests(NotesTestCase):
         self.assertEqual(self.sql("SELECT COUNT(*) FROM note_author"), [(1,)])
 
 
+class TagTests(NotesTestCase):
+    def setUp(self):
+        super().setUp()
+        self.create("alpha")
+        self.create("beta")
+
+    def tag(self, name, tags, create=False):
+        return self.run_async(self.tool.add_tags(name, tags, create))
+
+    def test_add_and_read_back_tags(self):
+        res = self.tag("alpha", "ComfyUI, SDXL Poses")
+        self.assertTrue(res["success"])
+        self.assertEqual(res["tags"], ["comfyui", "sdxl-poses"])
+        self.assertEqual(self.run_async(self.tool.read_note("alpha"))["tags"], ["comfyui", "sdxl-poses"])
+
+    def test_same_tag_on_another_note_is_shared_and_counted(self):
+        self.tag("alpha", "comfy")
+        res = self.tag("beta", "Comfy")
+        self.assertEqual(res["new_tags"], [])
+        self.assertEqual(self.run_async(self.tool.list_tags())["tags"], [{"tag": "comfy", "notes": 2}])
+
+    def test_variant_spellings_reuse_the_existing_tag(self):
+        self.tag("alpha", "comfy-ui")
+        res = self.tag("beta", "comfyui")
+        self.assertEqual(res["tags"], ["comfy-ui"])
+        self.assertEqual(res["matched_existing"], {"comfyui": "comfy-ui"})
+        res = self.tag("beta", "Comfy UI")  # already on beta
+        self.assertEqual(res["already_had"], ["comfy-ui"])
+
+    def test_plural_is_folded(self):
+        self.tag("alpha", "pose")
+        self.assertEqual(self.tag("beta", "poses")["tags"], ["pose"])
+
+    def test_similar_new_tag_is_refused_with_suggestions_and_saves_nothing(self):
+        self.tag("alpha", "sdxl")
+        res = self.tag("beta", "unrelated, sdxl-poses")
+        self.assertFalse(res["success"])
+        self.assertIn("'sdxl'", res["error"])
+        self.assertIn("create=true", res["error"])
+        self.assertEqual(self.run_async(self.tool.read_note("beta"))["tags"], [])
+
+    def test_create_true_overrides_the_similarity_check(self):
+        self.tag("alpha", "sdxl")
+        res = self.tag("beta", "sdxl-poses", create=True)
+        self.assertEqual(res["new_tags"], ["sdxl-poses"])
+
+    def test_misspelling_is_caught(self):
+        self.tag("alpha", "character")
+        self.assertFalse(self.tag("beta", "charcter")["success"])
+
+    def test_tag_validation(self):
+        self.assertFalse(self.tag("alpha", "")["success"])
+        self.assertFalse(self.tag("alpha", "x" * 41)["success"])
+        self.assertFalse(self.tag("alpha", "bad/tag!")["success"])
+        self.assertFalse(self.tag("missing", "ok")["success"])
+
+    def test_per_note_limit(self):
+        self.tag("alpha", ", ".join(f"topic{chr(97 + i) * 6}" for i in range(mod.MAX_TAGS_PER_NOTE)))
+        res = self.tag("alpha", "onemore", create=True)
+        self.assertFalse(res["success"])
+        self.assertIn("remove_tag", res["error"])
+
+    def test_remove_tag_and_unused_tag_disappears(self):
+        self.tag("alpha", "one, two")
+        res = self.run_async(self.tool.remove_tag("alpha", "One"))
+        self.assertEqual((res["removed"], res["tags"]), ("one", ["two"]))
+        self.assertEqual(self.sql("SELECT tag_name FROM tag"), [("two",)])
+        res = self.run_async(self.tool.remove_tag("alpha", "one"))
+        self.assertFalse(res["success"])
+        self.assertIn("two", res["error"])
+
+    def test_deleting_a_note_drops_its_tags(self):
+        self.tag("alpha", "solo")
+        self.run_async(self.tool.delete_note("alpha"))
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM note_tag"), [(0,)])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM tag"), [(0,)])
+
+    def test_list_notes_filters_by_tag_and_shows_tags(self):
+        self.tag("alpha", "red")
+        res = self.run_async(self.tool.list_notes(tag="Red"))
+        self.assertEqual(res["count"], 1)
+        self.assertIn("alpha", res["table"])
+        self.assertNotIn("beta", res["table"])
+        self.assertIn("red (1)", res["tags_in_use"])
+        self.assertIn("| red |", self.run_async(self.tool.list_notes())["table"])
+        self.assertFalse(self.run_async(self.tool.list_notes(tag="nonexistent"))["success"])
+
+    def test_tagging_does_not_make_a_summary_stale(self):
+        self.run_async(self.tool.update_summary("alpha", "about things"))
+        self.tag("alpha", "red")
+        self.assertEqual(self.run_async(self.tool.list_notes(needs_summary=True))["count"], 1)  # only beta
+
+    def test_search_finds_notes_by_tag(self):
+        self.tag("alpha", "dragons")
+        res = self.run_async(self.tool.search_notes("dragon"))
+        self.assertEqual([n["note_name"] for n in res["matching_notes"]], ["alpha"])
+
+    def test_rename_and_merge(self):
+        self.tag("alpha", "sdxl")
+        self.tag("beta", "sdxl-poses", create=True)
+        res = self.run_async(self.tool.rename_tag("sdxl-poses", "sdxl"))
+        self.assertTrue(res["merged"])
+        self.assertEqual(res["notes"], 2)
+        self.assertEqual(self.sql("SELECT tag_name FROM tag"), [("sdxl",)])
+        res = self.run_async(self.tool.rename_tag("sdxl", "Graphics"))
+        self.assertEqual((res["merged"], res["tag"]), (False, "graphics"))
+        self.assertFalse(self.run_async(self.tool.rename_tag("nope", "x"))["success"])
+
+    def test_existing_database_gains_tag_tables(self):
+        self.create("old")
+        self.sql("SELECT 1")
+        conn = sqlite3.connect(self.db)
+        conn.executescript("DROP TABLE note_tag; DROP TABLE tag;")
+        conn.close()
+        mod._schema_ready.discard(self.db)
+        self.assertTrue(self.tag("old", "fresh")["success"])
+
+
 if __name__ == "__main__":
     unittest.main()

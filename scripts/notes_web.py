@@ -42,6 +42,8 @@ STYLE = """
 body{font:15px/1.45 system-ui,sans-serif;max-width:52rem;margin:1.5rem auto;padding:0 1rem;color:#222;background:#fafafa}
 a{color:#0b5cad}h1{font-size:1.4rem}h1 a{color:inherit;text-decoration:none}
 table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:.35rem .5rem;border-bottom:1px solid #ddd;vertical-align:top}
+.tag{display:inline-block;background:#e6eef8;border-radius:1em;padding:0 .6em;margin:0 .2em .2em 0;font-size:.85em;text-decoration:none}
+.tag form{display:inline;margin:0}.tag button{border:0;background:none;padding:0 0 0 .3em;color:#a00;cursor:pointer}
 .muted{color:#777;font-size:.85em}.err{background:#fde8e8;border:1px solid #e0a0a0;padding:.6rem .8rem;border-radius:4px}
 .entry{background:#fff;border:1px solid #ddd;border-radius:4px;padding:.5rem .8rem;margin:.6rem 0}
 .entry pre{white-space:pre-wrap;word-wrap:break-word;margin:.3rem 0;font:inherit}
@@ -75,7 +77,25 @@ def search_form(q: str = "") -> str:
     return f"<form method='get' action='/'><input type='text' name='q' value='{e(q)}' placeholder='search notes and entries'></form>"
 
 
-def render_index(db: str, q: str) -> str:
+def tag_link(tag: str, count: Optional[int] = None) -> str:
+    more = f" <span class='muted'>{count}</span>" if count is not None else ""
+    return f"<a class='tag' href='/?tag={quote(tag)}'>{e(tag)}{more}</a>"
+
+
+def render_tags(db: str) -> str:
+    rows = notes.list_tags_db(db)
+    body = search_form() + "<h2>Tags</h2>"
+    body += "<p>" + " ".join(tag_link(n, c) for n, c in rows) + "</p>" if rows else "<p class='muted'>No tags yet.</p>"
+    if rows:
+        body += (
+            "<h3>Rename or merge</h3><p class='muted'>If the new name already exists the two tags are merged.</p>"
+            "<form method='post' action='/rename_tag'><p><input type='text' name='tag' placeholder='existing tag' required></p>"
+            f"<p><input type='text' name='new_tag' maxlength='{notes.TAG_MAX}' placeholder='new name' required></p><button>Rename</button></form>"
+        )
+    return page("Tags", body)
+
+
+def render_index(db: str, q: str, tag: str = "") -> str:
     body = search_form(q)
     if q:
         found_notes, found_entries = notes.search_notes_db(db, q, 200)
@@ -93,12 +113,17 @@ def render_index(db: str, q: str) -> str:
                 for r in found_entries
             ) + "</ul>"
         return page("Search", body)
-    total, rows = notes.list_notes_db(db, ALL)
-    body += f"<p class='muted'>{total} note{'s' if total != 1 else ''}, most recently updated first.</p>"
+    total, rows = notes.list_notes_db(db, ALL, tag=tag or None)
+    in_use = notes.list_tags_db(db)
+    if in_use:
+        body += "<p>" + " ".join(tag_link(n, c) for n, c in in_use[:30]) + " <a class='muted' href='/tags'>all tags</a></p>"
+    shown = f" tagged {e(tag)} (<a href='/'>show all</a>)" if tag else ""
+    body += f"<p class='muted'>{total} note{'s' if total != 1 else ''}{shown}, most recently updated first.</p>"
     if rows:
-        body += "<table><tr><th>Note</th><th>Entries</th><th>Updated</th><th>Started by</th><th>Comment</th></tr>" + "".join(
+        body += "<table><tr><th>Note</th><th>Entries</th><th>Updated</th><th>Started by</th><th>Tags</th><th>Comment</th></tr>" + "".join(
             f"<tr><td><a href='{note_url(r['note_name'])}'>{e(r['note_name'])}</a></td><td>{r['entries']}</td>"
-            f"<td class='muted'>{e(when(r['updated_at']))}</td><td>{e(r['author_name'] or 'unknown')}</td><td>{e(notes._truncate(r['note_comment'], 100))}</td></tr>"
+            f"<td class='muted'>{e(when(r['updated_at']))}</td><td>{e(r['author_name'] or 'unknown')}</td>"
+            f"<td>{' '.join(tag_link(t) for t in (r['tags'] or '').split(', ') if t)}</td><td>{e(notes._truncate(r['note_comment'], 100))}</td></tr>"
             for r in rows
         ) + "</table>"
     body += (
@@ -120,6 +145,15 @@ def render_note(db: str, name: str) -> str:
     if note["note_comment"]:
         body += f"<p>{e(note['note_comment'])}</p>"
     body += f"<p class='muted'>{result['total']} entries; started by {e(result['started_by'] or 'unknown')}, created {e(when(note['created_at']))}, updated {e(when(note['updated_at']))}</p>"
+    chips = "".join(
+        f"<span class='tag'><a href='/?tag={quote(t)}' style='text-decoration:none'>{e(t)}</a>"
+        f"<form method='post' action='/remove_tag'>{hidden}<input type='hidden' name='tag' value='{e(t)}'><button title='remove tag'>&times;</button></form></span>"
+        for t in result["tags"]
+    )
+    body += (
+        f"<p>{chips}</p><form method='post' action='/add_tag'>{hidden}"
+        f"<input type='text' name='tags' placeholder='add tags (comma separated)' maxlength='{notes.TAG_MAX * notes.MAX_TAGS_PER_NOTE}' style='width:16rem'> <button>Tag</button></form>"
+    )
     sm = result["summary"]
     if sm:
         flag = " &middot; <b>stale: the note changed since</b>" if sm["stale"] else ""
@@ -166,7 +200,9 @@ def handle_get(db: str, path: str, query: Dict[str, list]) -> Response:
     first = lambda key: (query.get(key) or [""])[0].strip()  # noqa: E731
     try:
         if path == "/":
-            return 200, {}, render_index(db, first("q"))
+            return 200, {}, render_index(db, first("q"), notes.normalize_tag(first("tag")) if first("tag") else "")
+        if path == "/tags":
+            return 200, {}, render_tags(db)
         if path == "/note":
             return 200, {}, render_note(db, notes.validate_name(first("name")))
     except (notes.NoteError, ValueError) as ex:
@@ -195,6 +231,15 @@ def handle_post(db: str, path: str, form: Dict[str, str], author: str = DEFAULT_
             new_name = notes.validate_name(form.get("new_name"))
             done = notes.update_note_db(db, name(), new_name, notes.validate_comment(form.get("comment")))
             return redirect(note_url(done["note_name"]))
+        if path == "/add_tag":  # a person decides what's a new tag, so no similar-tag check here
+            done = notes.add_tags_db(db, name(), notes.split_tags(form.get("tags")), create=True)
+            return redirect(note_url(done["note_name"]))
+        if path == "/remove_tag":
+            done = notes.remove_tag_db(db, name(), notes.normalize_tag(form.get("tag")))
+            return redirect(note_url(done["note_name"]))
+        if path == "/rename_tag":
+            done = notes.rename_tag_db(db, notes.normalize_tag(form.get("tag")), notes.normalize_tag(form.get("new_tag")))
+            return redirect("/?tag=" + quote(done["tag"]))
         if path == "/delete_note":
             notes.delete_note_db(db, name())
             return redirect("/")

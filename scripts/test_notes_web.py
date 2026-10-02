@@ -105,6 +105,25 @@ class HandlerTests(unittest.TestCase):
         self.post("/append", name="n", text="y")
         self.assertIn("stale: the note changed since", self.get("/note", name="n")[2])
 
+    def test_tag_flow(self):
+        self.post("/create", name="Ideas", text="x")
+        self.post("/create", name="Other", text="y")
+        status, headers, _ = self.post("/add_tag", name="Ideas", tags="Comfy, SDXL")
+        self.assertEqual(status, 303)
+        _, _, body = self.get("/note", name="Ideas")
+        self.assertIn("action='/remove_tag'", body)
+        self.assertIn("/?tag=comfy", body)
+        _, _, body = self.get("/", tag="comfy")
+        self.assertIn("1 note tagged comfy", body)
+        self.assertNotIn("Other</a></td>", body)
+        self.post("/add_tag", name="Other", tags="sdxl-poses")  # a person may create a near-duplicate
+        status, headers, _ = self.post("/rename_tag", tag="sdxl-poses", new_tag="sdxl")
+        self.assertEqual(headers["Location"], "/?tag=sdxl")
+        self.assertIn("sdxl", self.get("/tags")[2])
+        status, _, _ = self.post("/remove_tag", name="Ideas", tag="comfy")
+        self.assertEqual(status, 303)
+        self.assertEqual(self.post("/remove_tag", name="Ideas", tag="comfy")[0], 400)
+
     def test_unknown_routes(self):
         self.assertEqual(self.get("/nope")[0], 404)
         self.assertEqual(self.post("/nope", name="x")[0], 404)

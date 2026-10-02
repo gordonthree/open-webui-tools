@@ -39,7 +39,8 @@ Current tools:
   renders anything itself — it's a catalog, same spirit as `run_workflow`'s workflow templates.
 
 - `agent_notes.py` → `list_notes`, `read_note`, `create_note`, `append_note`, `edit_entry`,
-  `delete_entry`, `update_note`, `delete_note`, `search_notes` — a persistent notebook for agents,
+  `delete_entry`, `update_note`, `delete_note`, `search_notes`, `add_tags`, `remove_tag`, `list_tags`,
+  `rename_tag` (plus the summary methods) — a persistent notebook for agents,
   an easier-to-drive alternative to Open WebUI's built-in `note` tool. Unrelated to ComfyUI. A note
   is a name plus an append-only log of short numbered entries, in its **own** SQLite file
   (`agent_notes.sqlite3`, `NOTES_DB_PATH` valve — not the job database, though it defaults to the
@@ -250,6 +251,17 @@ entry text 500 — enforced by the tool (with an actionable message) and by SQLi
 | `update_summary` | `name`, `summary` (≤500 chars, whitespace collapsed) required; `author_name` optional. Creates or replaces the note's one summary |
 | `search_summary` | `query` required; `limit` (default `10`, capped by `MAX_SEARCH_RESULTS`). Splits the query into words, any word can match a note name or summary, ranked by words matched; each result carries `stale` |
 | `delete_summary` | `name` required. Refuses if the note has no summary |
+| `add_tags` | `name`, `tags` (one, or comma-separated) required; `create=true` to make a new tag that resembles existing ones. Refuses a new tag that looks like an existing one (returns the similar tags), reuses one that matches ignoring case/hyphens/plurals; nothing is saved if any tag is refused. Max 10 tags per note, 40 chars each |
+| `remove_tag` | `name`, `tag` required. A tag no note carries any more is deleted |
+| `list_tags` | optional `query`. Tags in use with note counts. `list_notes` also takes `tag=` to filter, shows a Tags column and lists the tags in use |
+| `rename_tag` | `tag`, `new_tag` required; merges into `new_tag` if it already exists |
+
+Tags (v1.4.0): `tag` (`tag_name` unique, case-insensitive, stored lowercase-hyphenated) and `note_tag`
+(`note_pk`, `tag_id`, both cascading). Tags belong to the parent note, not to entries, and tagging
+doesn't touch `updated_at`, so it never makes a summary stale. Free-form tags with guardrails instead
+of a curated list: the tool shows existing tags, folds variant spellings onto them, and makes the
+model confirm (`create=true`) before adding a look-alike. `rename_tag` is the cleanup for drift that
+gets through. Existing databases gain the two tables automatically.
 
 Every delete is a real `DELETE` (no soft-delete/undo); deleting a note relies on SQLite's
 `ON DELETE CASCADE`, so the tool enables `PRAGMA foreign_keys` on every connection. Schema: `note_id`
@@ -311,7 +323,7 @@ without writing. Bounded by the server's own history retention (cleared on resta
 
 A standalone LAN web UI for the `agent_notes` database, run from the docker host with no OWUI
 involved: `python3 scripts/notes_web.py --db /path/to/agent_notes.sqlite3 [--host 0.0.0.0] [--port 8765]`.
-Browse, search, create, append, edit/delete entries, rename/re-comment and delete notes, all through
+Browse, search, create, append, edit/delete entries, rename/re-comment and delete notes, tag notes (filter by tag, `/tags` page to rename/merge), all through
 `agent_notes.py`'s own `*_db` functions (same limits and transactions as the tool). Server-rendered
 HTML, stdlib only apart from the `pydantic` that importing `agent_notes` needs. No auth and no CSRF
 protection by design — trusted LAN only. Tests: `cd scripts && python3 -m unittest test_notes_web -v`.
@@ -351,6 +363,13 @@ brand-new tool (like `comfy_sdxl_poses` the first time), import it once through 
 it into your local `secrets.md`, and `push_tool.py` can update it like the others from then on.
 
 ## Status notes
+
+### 2026-10-01 (2)
+`agent_notes.py` v1.4.0 adds note tags (`add_tags`, `remove_tag`, `list_tags`, `rename_tag`, and a `tag`
+filter on `list_notes`); the web viewer shows, filters and edits them. Design agreed with the project
+owner: a normalized `tag`/`note_tag` pair rather than a JSON column (searchable, case-insensitive,
+renameable), tags on the parent note only, free-form with look-alike detection rather than a curated
+list. Not deployed yet (re-import through OWUI). `Nightly_Summarizer.md` doesn't assign tags yet.
 
 ### 2026-10-01
 Added `agent_notes.py` (v1.0.0), a notebook tool for agents, because Open WebUI's built-in `note`

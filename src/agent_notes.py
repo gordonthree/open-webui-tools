@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.3.0
+version: 1.4.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -12,6 +12,10 @@ description: A persistent notebook for agents, easier to use than Open WebUI's b
     Each note can also carry one short summary (update_summary/search_summary/delete_summary),
     meant to be kept current by a scheduled sub agent so other agents can find the right note by
     searching summaries instead of reading everything.
+
+    Notes can be tagged (add_tags/remove_tag/list_tags/rename_tag) so related notes can be found
+    together. Tags are short, lowercase, and shared across notes; when a new tag looks like an
+    existing one the tool says so instead of creating a near-duplicate.
 
     Every note and entry records its author: pass author_name when writing, or the tool uses the
     name of the model Open WebUI says is calling it. Entries are stamped with the current time
@@ -49,6 +53,9 @@ NOTE_COMMENT_MAX = 500
 NOTE_TEXT_MAX = 500
 SUMMARY_MAX = 500
 AUTHOR_NAME_MAX = 60
+TAG_MAX = 40
+MAX_TAGS_PER_NOTE = 10
+TAGS_SHOWN = 40  # how many in-use tags list_notes lists for the model to choose from
 LEGACY_AUTHOR = "Mara Voss"  # author #1: seeded into every notes database, and given every row that predates authors
 FALLBACK_AUTHOR = "Unknown agent"  # used only when the caller gave no author_name and Open WebUI named no model
 
@@ -87,6 +94,16 @@ CREATE TABLE IF NOT EXISTS note_summary (
     source_updated_at TEXT NOT NULL,
     source_entries INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tag (
+    tag_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag_name TEXT NOT NULL UNIQUE COLLATE NOCASE CHECK (length(tag_name) BETWEEN 1 AND {TAG_MAX})
+);
+CREATE TABLE IF NOT EXISTS note_tag (
+    note_pk INTEGER NOT NULL REFERENCES note_id(note_pk) ON DELETE CASCADE,
+    tag_id INTEGER NOT NULL REFERENCES tag(tag_id) ON DELETE CASCADE,
+    PRIMARY KEY (note_pk, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_note_tag_tag ON note_tag(tag_id);
 """
 
 DB_BUSY_TIMEOUT_S = 5.0
@@ -227,6 +244,29 @@ def resolve_author(author_name: Any, model: Any) -> str:
         if not is_unset(label):
             return validate_author(str(label)[:AUTHOR_NAME_MAX])
     return FALLBACK_AUTHOR
+
+
+def normalize_tag(text: Any) -> str:
+    """Lowercase, with runs of spaces/underscores/hyphens turned into one hyphen: 'Comfy UI' -> 'comfy-ui'."""
+    cleaned = re.sub(r"-{2,}", "-", re.sub(r"[\s_]+", "-", str(text or "").strip().lower())).strip("-")
+    if not cleaned:
+        raise NoteError("A tag can't be empty.")
+    if len(cleaned) > TAG_MAX:
+        raise NoteError(f"Tag {cleaned!r} is {len(cleaned)} characters; the limit is {TAG_MAX}. Use a shorter tag.")
+    if not re.fullmatch(r"[\w.+#-]+", cleaned):
+        raise NoteError(f"Tag {cleaned!r} has characters other than letters, digits and . + # - (separate several tags with commas).")
+    return cleaned
+
+
+def split_tags(value: Any) -> List[str]:
+    """One tag or several (comma-separated text, or a list), normalized and de-duplicated, in order."""
+    parts = value if isinstance(value, (list, tuple)) else str(value or "").replace(";", ",").split(",")
+    tags = list(dict.fromkeys(normalize_tag(p) for p in parts if str(p).strip()))
+    if not tags:
+        raise NoteError("At least one tag is required (several can be separated by commas).")
+    if len(tags) > MAX_TAGS_PER_NOTE:
+        raise NoteError(f"{len(tags)} tags in one call; a note holds at most {MAX_TAGS_PER_NOTE}.")
+    return tags
 
 
 def validate_summary(text: Any) -> str:
@@ -457,6 +497,7 @@ def read_note_db(db_path: str, name: str, limit: int) -> Dict[str, Any]:
         return {
             "note": note,
             "started_by": starter["author_name"] if starter else None,
+            "tags": _note_tags(conn, note["note_pk"]),
             "summary": summary,
             "total": total,
             "entries": list(reversed(rows)),
@@ -465,16 +506,26 @@ def read_note_db(db_path: str, name: str, limit: int) -> Dict[str, Any]:
         conn.close()
 
 
-def list_notes_db(db_path: str, limit: int, needs_summary: bool = False) -> "tuple[int, List[Any]]":
+def list_notes_db(db_path: str, limit: int, needs_summary: bool = False, tag: Optional[str] = None) -> "tuple[int, List[Any]]":
     conn = notes_db_connect(db_path)
     try:
+        if tag is not None:
+            counts = _tag_counts(conn)
+            match = tag if tag in counts else next((n for n in counts if _tag_key(n) == _tag_key(tag)), None)
+            if match is None:
+                similar = _similar_tags(tag, counts)
+                raise NoteError(f"No note is tagged {tag!r}." + (f" Similar tags: {', '.join(repr(n) for n in similar)}." if similar else " Use list_tags to see the tags in use."))
+            tag = match
         rows = conn.execute(
             "SELECT * FROM (SELECT n.note_pk, n.note_name, n.note_comment, n.updated_at, COUNT(d.entry_no) AS entries, a.author_name, "
-            f"CASE WHEN s.note_pk IS NULL THEN 'none' WHEN {_STALE_SQL} THEN 'stale' ELSE 'current' END AS summary_state "
+            f"CASE WHEN s.note_pk IS NULL THEN 'none' WHEN {_STALE_SQL} THEN 'stale' ELSE 'current' END AS summary_state, "
+            "(SELECT group_concat(tag_name, ', ') FROM (SELECT t.tag_name FROM note_tag nt JOIN tag t ON t.tag_id = nt.tag_id WHERE nt.note_pk = n.note_pk ORDER BY t.tag_name)) AS tags "
             "FROM note_id n LEFT JOIN note_data d ON d.note_pk = n.note_pk LEFT JOIN note_author a ON a.author_id = n.author_id "
             "LEFT JOIN note_summary s ON s.note_pk = n.note_pk GROUP BY n.note_pk) "
-            "WHERE (? = 0 OR summary_state != 'current') ORDER BY updated_at DESC, note_pk DESC",
-            (1 if needs_summary else 0,),
+            "AS x WHERE (? = 0 OR summary_state != 'current') "
+            "AND (? IS NULL OR EXISTS (SELECT 1 FROM note_tag nt JOIN tag t ON t.tag_id = nt.tag_id WHERE nt.note_pk = x.note_pk AND t.tag_name = ?)) "
+            "ORDER BY updated_at DESC, note_pk DESC",
+            (1 if needs_summary else 0, tag, tag),
         ).fetchall()
         return len(rows), rows[:limit]
     finally:
@@ -487,8 +538,10 @@ def search_notes_db(db_path: str, query: str, limit: int) -> "tuple[List[Any], L
     try:
         notes = conn.execute(
             "SELECT note_name, note_comment FROM note_id "
-            "WHERE note_name LIKE ? ESCAPE '\\' OR note_comment LIKE ? ESCAPE '\\' ORDER BY updated_at DESC LIMIT ?",
-            (like, like, limit),
+            "WHERE note_name LIKE ? ESCAPE '\\' OR note_comment LIKE ? ESCAPE '\\' "
+            "OR note_pk IN (SELECT nt.note_pk FROM note_tag nt JOIN tag t ON t.tag_id = nt.tag_id WHERE t.tag_name LIKE ? ESCAPE '\\') "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (like, like, like, limit),
         ).fetchall()
         entries = conn.execute(
             "SELECT n.note_name, d.entry_no, d.note_text, a.author_name FROM note_data d JOIN note_id n ON n.note_pk = d.note_pk "
@@ -555,6 +608,137 @@ def update_note_db(db_path: str, name: str, new_name: Optional[str], comment: Op
         conn.close()
 
 
+def _tag_key(name: str) -> str:
+    """What two spellings of one tag share: no hyphens, simple plurals folded ('comfy-ui', 'comfyui' and 'ComfyUIs' match)."""
+    key = name.replace("-", "")
+    if len(key) > 4 and key.endswith("ies"):
+        return key[:-3] + "y"
+    if len(key) > 3 and key.endswith("s") and not key.endswith("ss"):
+        return key[:-1]
+    return key
+
+
+def _tag_counts(conn: sqlite3.Connection) -> Dict[str, int]:
+    rows = conn.execute("SELECT t.tag_name, COUNT(nt.note_pk) AS uses FROM tag t JOIN note_tag nt ON nt.tag_id = t.tag_id GROUP BY t.tag_id ORDER BY uses DESC, t.tag_name")
+    return {r["tag_name"]: r["uses"] for r in rows}
+
+
+def _similar_tags(tag: str, counts: Dict[str, int]) -> List[str]:
+    """Existing tags this one could be a variant of: spelled alike, or one contains the other."""
+    close = difflib.get_close_matches(tag, list(counts), n=3, cutoff=0.7)
+    contained = [n for n in counts if len(tag) >= 3 and len(n) >= 3 and (tag in n or n in tag)]
+    return list(dict.fromkeys(close + contained))[:4]
+
+
+def _note_tags(conn: sqlite3.Connection, note_pk: int) -> List[str]:
+    return [r["tag_name"] for r in conn.execute("SELECT t.tag_name FROM note_tag nt JOIN tag t ON t.tag_id = nt.tag_id WHERE nt.note_pk = ? ORDER BY t.tag_name", (note_pk,))]
+
+
+def _purge_unused_tags(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM tag WHERE tag_id NOT IN (SELECT tag_id FROM note_tag)")
+
+
+def add_tags_db(db_path: str, name: str, tags: List[str], create: bool = False) -> Dict[str, Any]:
+    """Tag a note. A tag matching an existing one (ignoring case, hyphens and simple plurals) reuses it.
+    A new tag that merely resembles existing ones is refused unless create is true; nothing is saved if any tag is refused."""
+    conn = notes_db_connect(db_path)
+    try:
+        with _write_txn(conn):
+            note = _get_note(conn, name)
+            counts = _tag_counts(conn)
+            by_key = {_tag_key(n): n for n in counts}
+            have = set(_note_tags(conn, note["note_pk"]))
+            use: List[str] = []  # the existing-or-new tag name each request resolves to
+            reused: Dict[str, str] = {}
+            doubts: List[str] = []
+            for tag in tags:
+                target = tag if tag in counts else by_key.get(_tag_key(tag))
+                if target is None:
+                    similar = _similar_tags(tag, counts)
+                    if similar and not create:
+                        doubts.append(f"{tag!r} is new, but similar tags exist: " + ", ".join(f"{n!r} ({counts[n]})" for n in similar))
+                        continue
+                    target = tag
+                elif target != tag:
+                    reused[tag] = target
+                if target not in use:
+                    use.append(target)
+            if doubts:
+                raise NoteError(
+                    "Nothing was tagged. " + "; ".join(doubts) + ". Retry with one of the existing tags; "
+                    "only if none of them fit, pass create=true to make the new tag."
+                )
+            added = [t for t in use if t not in have]
+            if len(have) + len(added) > MAX_TAGS_PER_NOTE:
+                raise NoteError(f"Note {note['note_name']!r} has {len(have)} tags ({', '.join(sorted(have))}); adding {len(added)} would pass the limit of {MAX_TAGS_PER_NOTE}. Remove one first with remove_tag.")
+            created = []
+            for tag in added:
+                row = conn.execute("SELECT tag_id FROM tag WHERE tag_name = ?", (tag,)).fetchone()
+                if row is None:
+                    row = {"tag_id": conn.execute("INSERT INTO tag (tag_name) VALUES (?)", (tag,)).lastrowid}
+                    created.append(tag)
+                conn.execute("INSERT INTO note_tag (note_pk, tag_id) VALUES (?, ?)", (note["note_pk"], row["tag_id"]))
+            return {"note_name": note["note_name"], "added": added, "already_had": [t for t in use if t in have],
+                    "new_tags": created, "matched_existing": reused, "tags": sorted(have | set(added))}
+    finally:
+        conn.close()
+
+
+def remove_tag_db(db_path: str, name: str, tag: str) -> Dict[str, Any]:
+    conn = notes_db_connect(db_path)
+    try:
+        with _write_txn(conn):
+            note = _get_note(conn, name)
+            have = _note_tags(conn, note["note_pk"])
+            target = tag if tag in have else next((h for h in have if _tag_key(h) == _tag_key(tag)), None)
+            if target is None:
+                raise NoteError(f"Note {note['note_name']!r} isn't tagged {tag!r}. " + (f"Its tags: {', '.join(have)}." if have else "It has no tags."))
+            conn.execute("DELETE FROM note_tag WHERE note_pk = ? AND tag_id = (SELECT tag_id FROM tag WHERE tag_name = ?)", (note["note_pk"], target))
+            _purge_unused_tags(conn)
+            return {"note_name": note["note_name"], "removed": target, "tags": [h for h in have if h != target]}
+    finally:
+        conn.close()
+
+
+def list_tags_db(db_path: str, query: Optional[str] = None) -> List[Any]:
+    """Tags in use with their note counts, most used first; query keeps those containing it (or resembling it)."""
+    conn = notes_db_connect(db_path)
+    try:
+        counts = _tag_counts(conn)
+        if query:
+            q = normalize_tag(query)
+            keep = set(_similar_tags(q, counts)) | {n for n in counts if q in n}
+            counts = {n: c for n, c in counts.items() if n in keep}
+        return list(counts.items())
+    finally:
+        conn.close()
+
+
+def rename_tag_db(db_path: str, tag: str, new_tag: str) -> Dict[str, Any]:
+    """Rename a tag everywhere. If new_tag already exists the two are merged (notes with both keep one)."""
+    conn = notes_db_connect(db_path)
+    try:
+        with _write_txn(conn):
+            old = conn.execute("SELECT tag_id, tag_name FROM tag WHERE tag_name = ?", (tag,)).fetchone()
+            if old is None:
+                counts = _tag_counts(conn)
+                similar = _similar_tags(tag, counts)
+                raise NoteError(f"No tag named {tag!r}." + (f" Did you mean: {', '.join(repr(n) for n in similar)}?" if similar else " Use list_tags to see what exists."))
+            target = conn.execute("SELECT tag_id, tag_name FROM tag WHERE tag_name = ?", (new_tag,)).fetchone()
+            if target is None or target["tag_id"] == old["tag_id"]:
+                conn.execute("UPDATE tag SET tag_name = ? WHERE tag_id = ?", (new_tag, old["tag_id"]))
+                merged = False
+            else:
+                conn.execute("INSERT OR IGNORE INTO note_tag (note_pk, tag_id) SELECT note_pk, ? FROM note_tag WHERE tag_id = ?", (target["tag_id"], old["tag_id"]))
+                conn.execute("DELETE FROM note_tag WHERE tag_id = ?", (old["tag_id"],))
+                _purge_unused_tags(conn)
+                merged = True
+            notes_with = conn.execute("SELECT COUNT(*) FROM note_tag nt JOIN tag t ON t.tag_id = nt.tag_id WHERE t.tag_name = ?", (new_tag,)).fetchone()[0]
+            return {"old_tag": old["tag_name"], "tag": new_tag, "merged": merged, "notes": notes_with}
+    finally:
+        conn.close()
+
+
 def delete_note_db(db_path: str, name: str) -> Dict[str, Any]:
     conn = notes_db_connect(db_path)
     try:
@@ -562,6 +746,7 @@ def delete_note_db(db_path: str, name: str) -> Dict[str, Any]:
             note = _get_note(conn, name)
             entries = conn.execute("SELECT COUNT(*) FROM note_data WHERE note_pk = ?", (note["note_pk"],)).fetchone()[0]
             conn.execute("DELETE FROM note_id WHERE note_pk = ?", (note["note_pk"],))  # cascades to note_data
+            _purge_unused_tags(conn)
         return {"note_name": note["note_name"], "entries_removed": entries}
     finally:
         conn.close()
@@ -592,7 +777,7 @@ class Tools:
         self.valves = self.Valves()
         self.citation = False
 
-    async def list_notes(self, limit: Optional[int] = None, needs_summary: bool = False) -> Dict[str, Any]:
+    async def list_notes(self, limit: Optional[int] = None, needs_summary: bool = False, tag: Optional[str] = None) -> Dict[str, Any]:
         """
         List the notes that exist, most recently changed first, as a Markdown table (name, number
         of entries, last updated, comment). Start here to see whether a note already exists
@@ -603,23 +788,32 @@ class Tools:
 
         :param limit: Maximum notes returned, default 20. Pass "" (or omit) for the default.
         :param needs_summary: true to list only notes whose summary is missing or stale (a summarizing agent's to-do list). Pass false (the normal choice) otherwise.
+        :param tag: List only notes carrying this tag. Pass "" (or omit) for all notes. The result also lists the tags in use, so you can see which exist.
         """
         v = self.valves
         try:
             cap = min(_to_int(limit, 20, "limit"), v.MAX_LIST_RESULTS)
-            total, rows = await asyncio.to_thread(list_notes_db, v.NOTES_DB_PATH, cap, _to_bool(needs_summary))
+            tag_filter = None if is_unset(tag) else normalize_tag(tag)
+            total, rows = await asyncio.to_thread(list_notes_db, v.NOTES_DB_PATH, cap, _to_bool(needs_summary), tag_filter)
+            in_use = await asyncio.to_thread(list_tags_db, v.NOTES_DB_PATH)
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
+        tag_line = ", ".join(f"{n} ({c})" for n, c in in_use[:TAGS_SHOWN]) if in_use else ""
         if not rows:
             empty = "Every note has a current summary." if _to_bool(needs_summary) else "No notes yet - use create_note to start one."
-            return {"success": True, "count": 0, "total_notes": 0, "table": empty}
-        lines = ["| Note | Entries | Last updated (UTC) | Started by | Summary | Comment |", "|---|---|---|---|---|---|"]
+            out_empty: Dict[str, Any] = {"success": True, "count": 0, "total_notes": 0, "table": empty}
+            if tag_line:
+                out_empty["tags_in_use"] = tag_line
+            return out_empty
+        lines = ["| Note | Entries | Last updated (UTC) | Started by | Summary | Tags | Comment |", "|---|---|---|---|---|---|---|"]
         for r in rows:
             lines.append(
                 f"| {_cell(r['note_name'], NOTE_NAME_MAX)} | {r['entries']} | {r['updated_at'][:16].replace('T', ' ')} "
-                f"| {_cell(r['author_name'] or 'unknown', AUTHOR_NAME_MAX)} | {r['summary_state']} | {_cell(r['note_comment'])} |"
+                f"| {_cell(r['author_name'] or 'unknown', AUTHOR_NAME_MAX)} | {r['summary_state']} | {_cell(r['tags'] or '')} | {_cell(r['note_comment'])} |"
             )
         out: Dict[str, Any] = {"success": True, "count": len(rows), "total_notes": total, "table": "\n".join(lines)}
+        if tag_line:
+            out["tags_in_use"] = tag_line
         if total > len(rows):
             out["note"] = f"Showing {len(rows)} of {total} notes; pass a larger limit (max {v.MAX_LIST_RESULTS}) for more."
         return out
@@ -650,6 +844,7 @@ class Tools:
             "note_name": result["note"]["note_name"],
             "note_comment": result["note"]["note_comment"],
             "started_by": result["started_by"] or "unknown",
+            "tags": result["tags"],
             "total_entries": result["total"],
             "entries": entries,
         }
@@ -809,6 +1004,68 @@ class Tools:
         """
         try:
             result = await asyncio.to_thread(delete_note_db, self.valves.NOTES_DB_PATH, validate_name(name))
+        except (ValueError, sqlite3.Error) as e:
+            return _error(e)
+        return {"success": True, **result}
+
+    async def add_tags(self, name: str, tags: str, create: bool = False) -> Dict[str, Any]:
+        """
+        Tag a note so related notes can be found together (list_notes with a tag lists them). Tags
+        are short lowercase labels shared by every note, e.g. "comfy", "character-bios", "todo".
+        REUSE existing tags: list_notes shows the tags in use, and list_tags shows them with counts.
+
+        A tag that matches an existing one (ignoring case, hyphens and plurals) is simply reused.
+        If you give a NEW tag that resembles existing ones, nothing is saved and the reply lists the
+        similar tags: retry with one of those. Only when none fit, pass create=true to make it.
+
+        LIMITS: a tag is at most 40 characters (letters, digits and . + # -), a note has at most 10 tags.
+
+        :param name: The note's name, as shown by list_notes (case doesn't matter).
+        :param tags: One tag, or several separated by commas, e.g. "comfy, sdxl".
+        :param create: true to create a tag even though similar ones exist (only after checking they don't fit). Pass false (the normal choice) otherwise.
+        """
+        try:
+            result = await asyncio.to_thread(add_tags_db, self.valves.NOTES_DB_PATH, validate_name(name), split_tags(tags), _to_bool(create))
+        except (ValueError, sqlite3.Error) as e:
+            return _error(e)
+        return {"success": True, **result}
+
+    async def remove_tag(self, name: str, tag: str) -> Dict[str, Any]:
+        """
+        Take one tag off a note. The tag disappears entirely once no note carries it.
+
+        :param name: The note's name, as shown by list_notes (case doesn't matter).
+        :param tag: The tag to remove, as shown by read_note or list_notes.
+        """
+        try:
+            result = await asyncio.to_thread(remove_tag_db, self.valves.NOTES_DB_PATH, validate_name(name), normalize_tag(tag))
+        except (ValueError, sqlite3.Error) as e:
+            return _error(e)
+        return {"success": True, **result}
+
+    async def list_tags(self, query: Optional[str] = None) -> Dict[str, Any]:
+        """
+        List the tags in use, with how many notes carry each, most used first. Check this before
+        inventing a new tag for add_tags.
+
+        :param query: Only tags containing or resembling this text. Pass "" (or omit) for all tags.
+        """
+        try:
+            rows = await asyncio.to_thread(list_tags_db, self.valves.NOTES_DB_PATH, None if is_unset(query) else str(query))
+        except (ValueError, sqlite3.Error) as e:
+            return _error(e)
+        return {"success": True, "count": len(rows), "tags": [{"tag": n, "notes": c} for n, c in rows]}
+
+    async def rename_tag(self, tag: str, new_tag: str) -> Dict[str, Any]:
+        """
+        Rename a tag on every note that carries it. If new_tag already exists the two are merged:
+        use this to fold a near-duplicate (say "sdxl-poses") into the tag it should have been ("poses").
+
+        :param tag: The existing tag, as shown by list_tags.
+        :param new_tag: Its new name, at most 40 characters.
+        """
+        try:
+            result = await asyncio.to_thread(rename_tag_db, self.valves.NOTES_DB_PATH, normalize_tag(tag), normalize_tag(new_tag))
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
         return {"success": True, **result}
