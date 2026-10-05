@@ -237,13 +237,18 @@ status note below for how this was found.
 Same `""`/`false` = omitted convention as above. Limits: note name 60 characters, note comment 500,
 entry text 500 — enforced by the tool (with an actionable message) and by SQLite `CHECK`s.
 
-`continues=true` (v1.7.0) cuts the text at a paragraph, line or word boundary into pieces of at most 470
-characters and saves them as consecutive entries; every piece but the last ends with ` [continues at entry #N]`
-so a small model reading (or finding by search) a middle entry can see there is more. The text itself is
-unaltered — strip that trailing marker to get it back verbatim — and the last piece has no marker. The reply gives
-`entry_numbers`. The `MAX_CONTINUATION_ENTRIES` valve (default 6, about 2800 characters per call) caps the
-pieces; over it, nothing is saved. Nothing marks continuations in the schema; the marker text is the only link,
-so editing or deleting a piece doesn't update its neighbours' pointers.
+`continues=true` (v1.8.0) cuts the text at a paragraph, line or word boundary into pieces of at most 500
+characters and saves them as consecutive entries sharing a `chain_id` (the first piece's entry number; NULL for an
+ordinary entry). The text is stored exactly as given — no markers. `agent_notes_read`, `_search` and `_read_tagged`
+add `continues_at` (the next surviving piece) and `continues_from` (the previous one) to pieces of a chain, worked
+out at read time so editing or deleting a piece never leaves a dangling pointer. In plain `_read_tagged` such an
+entry is a small `{text, continues_*}` object instead of a bare string. The reply to the write gives
+`entry_numbers`. The `MAX_CONTINUATION_ENTRIES` valve (default 6, about 3000 characters per call) caps the
+pieces; over it, nothing is saved. `notes_web.py` shows the links beside each entry.
+
+`chain_id` is added in place on first connect (nullable, so an older copy of the tool can still write to the
+database; back it up first if it matters). v1.7.x briefly marked pieces with a trailing ` [continues at entry #N]`
+in the text; that upgrade converts such entries to chains and strips the marker.
 
 `agent_notes_list`, `_read`, `_search`, `_search_summary` and `_read_tagged` take `verbose` (default `false`):
 plain replies drop authors, timestamps and other bookkeeping to save a small model's context. `_read` and

@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.7.0
+version: 1.8.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -53,7 +53,6 @@ NOTE_NAME_MAX = 60
 NOTE_COMMENT_MAX = 500
 NOTE_TEXT_MAX = 500
 SUMMARY_MAX = 500
-CONTINUES_CHUNK_MAX = 470  # continues=true pieces: leaves room under NOTE_TEXT_MAX for " [continues at entry #12345]"
 AUTHOR_NAME_MAX = 60
 TAG_MAX = 40
 MAX_TAGS_PER_NOTE = 10
@@ -85,6 +84,7 @@ CREATE TABLE IF NOT EXISTS note_data (
     created_at TEXT NOT NULL,
     edited_at TEXT,
     author_id INTEGER REFERENCES note_author(author_id),
+    chain_id INTEGER,
     PRIMARY KEY (note_pk, entry_no)
 );
 CREATE INDEX IF NOT EXISTS idx_note_data_time ON note_data(note_pk, created_at);
@@ -127,6 +127,7 @@ def notes_db_connect(db_path: str) -> sqlite3.Connection:
     if db_path not in _schema_ready:
         conn.executescript(NOTES_SCHEMA)
         _migrate_authors(conn)
+        _migrate_chains(conn)
         _schema_ready.add(db_path)
     return conn
 
@@ -167,6 +168,27 @@ def _migrate_authors(conn: sqlite3.Connection) -> None:
         )
         for table in added:
             conn.execute(f"UPDATE {table} SET author_id = 1")
+
+
+def _migrate_chains(conn: sqlite3.Connection) -> None:
+    """Add note_data.chain_id (nullable, so an older copy of the tool can still write to the database): the entry_no of the
+    first piece of a long text saved with continues=true, shared by all its pieces. v1.7.x marked pieces with a trailing
+    ' [continues at entry #N]' in the text instead; when the column is first added, turn those into chains and strip the marker."""
+    with _write_txn(conn):
+        if "chain_id" in [r["name"] for r in conn.execute("PRAGMA table_info(note_data)")]:
+            return
+        conn.execute("ALTER TABLE note_data ADD COLUMN chain_id INTEGER")
+        chain: Dict[Any, int] = {}
+        for r in conn.execute("SELECT note_pk, entry_no, note_text FROM note_data ORDER BY note_pk, entry_no").fetchall():
+            m = re.search(r" \[continues at entry #(\d+)\]$", r["note_text"])
+            if not m:
+                continue
+            first = chain.get((r["note_pk"], r["entry_no"]), r["entry_no"])
+            chain[(r["note_pk"], r["entry_no"])] = first
+            chain[(r["note_pk"], int(m.group(1)))] = first
+            conn.execute("UPDATE note_data SET note_text = ? WHERE note_pk = ? AND entry_no = ?", (r["note_text"][: m.start()], r["note_pk"], r["entry_no"]))
+        for (note_pk, entry_no), first in chain.items():
+            conn.execute("UPDATE note_data SET chain_id = ? WHERE note_pk = ? AND entry_no = ?", (first, note_pk, entry_no))
 
 
 def _author_id(conn: sqlite3.Connection, author_name: str, now: str) -> int:
@@ -342,8 +364,7 @@ def validate_text(text: Any) -> str:
 
 
 def split_text(text: Any, max_parts: int) -> List[str]:
-    """Cut text into pieces of at most CONTINUES_CHUNK_MAX characters for agent_notes_create/_append continues=true (the
-    database layer then adds a "continues at" marker to all but the last). The words are kept exactly as given: a cut
+    """Cut text into pieces of at most NOTE_TEXT_MAX characters for agent_notes_create/_append continues=true. The words are kept exactly as given: a cut
     falls on a paragraph break if one is near, else a line break, else a space (only that break itself is dropped),
     and only in a word longer than a whole piece does it fall mid-word."""
     rest = str(text or "").strip()
@@ -351,15 +372,15 @@ def split_text(text: Any, max_parts: int) -> List[str]:
         raise NoteError("Entry text is required and can't be empty.")
     parts: List[str] = []
     while len(rest) > NOTE_TEXT_MAX:  # fits in one entry as is: no pieces, no marker
-        window = rest[: CONTINUES_CHUNK_MAX + 1]
-        cut = next((c for c in (window.rfind("\n\n"), window.rfind("\n"), window.rfind(" ")) if c >= CONTINUES_CHUNK_MAX // 2), CONTINUES_CHUNK_MAX)
+        window = rest[: NOTE_TEXT_MAX + 1]
+        cut = next((c for c in (window.rfind("\n\n"), window.rfind("\n"), window.rfind(" ")) if c >= NOTE_TEXT_MAX // 2), NOTE_TEXT_MAX)
         parts.append(rest[:cut].strip())
         rest = rest[cut:].strip()
     parts.append(rest)
     if len(parts) > max_parts:
         raise NoteError(
             f"Entry text is {len(str(text).strip())} characters, which would take {len(parts)} entries; at most {max_parts} "
-            f"(about {max_parts * CONTINUES_CHUNK_MAX} characters) can be saved in one call. Nothing was saved. "
+            f"({max_parts * NOTE_TEXT_MAX} characters) can be saved in one call. Nothing was saved. "
             "Save the first part now and the rest in a later agent_notes_append call."
         )
     return [p for p in parts if p]
@@ -410,11 +431,30 @@ def _name_taken_error(name: str) -> NoteError:
 _STALE_SQL = "(s.source_updated_at != n.updated_at OR s.source_entries != (SELECT COUNT(*) FROM note_data x WHERE x.note_pk = n.note_pk))"
 
 
+# A long text saved with continues=true is several entries sharing a chain_id. Where each one leads is worked out when it is
+# read (so deleting a piece never leaves a dangling pointer): the next/previous surviving piece of the same chain. Needs the
+# note_data row as `d`.
+_CHAIN_SQL = (
+    "(SELECT MIN(c.entry_no) FROM note_data c WHERE c.note_pk = d.note_pk AND c.chain_id = d.chain_id AND c.entry_no > d.entry_no) AS continues_at, "
+    "(SELECT MAX(c.entry_no) FROM note_data c WHERE c.note_pk = d.note_pk AND c.chain_id = d.chain_id AND c.entry_no < d.entry_no) AS continues_from"
+)
+
+
+def _chain_marks(row: Any) -> Dict[str, Any]:
+    """The continues_at / continues_from fields for an entry that belongs to a chain (nothing for an ordinary entry)."""
+    out: Dict[str, Any] = {}
+    if row["continues_at"] is not None:
+        out["continues_at"] = row["continues_at"]
+    if row["continues_from"] is not None:
+        out["continues_from"] = row["continues_from"]
+    return out
+
+
 def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: str, author: str, created_at: Optional[str] = None) -> Dict[str, Any]:
     conn = notes_db_connect(db_path)
     try:
         now = created_at or _now_iso()  # the note's and first entry's time; the new author row always gets the real time
-        parts = _link_parts([text] if isinstance(text, str) else list(text), 1)
+        parts = [text] if isinstance(text, str) else list(text)
         try:
             with _write_txn(conn):
                 existing = conn.execute(
@@ -433,20 +473,14 @@ def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: st
                     (name, comment, len(parts) + 1, now, now, author_id),
                 )
                 conn.executemany(
-                    "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id) VALUES (?, ?, ?, ?, ?)",
-                    [(cur.lastrowid, i, part, now, author_id) for i, part in enumerate(parts, 1)],
+                    "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id, chain_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    [(cur.lastrowid, i, part, now, author_id, 1 if len(parts) > 1 else None) for i, part in enumerate(parts, 1)],
                 )
         except sqlite3.IntegrityError:  # lost a race with another writer creating the same name
             raise _name_taken_error(name)
         return {"note_name": name, **_entry_numbers(1, len(parts)), "created_at": now, "author": author}
     finally:
         conn.close()
-
-
-def _link_parts(parts: List[str], first_no: int) -> List[str]:
-    """Several pieces of one long text: end each but the last with a pointer to the next, so a reader (or a search hit)
-    in the middle can tell there's more. A single piece is left alone."""
-    return [f"{p} [continues at entry #{first_no + i + 1}]" if i < len(parts) - 1 else p for i, p in enumerate(parts)]
 
 
 def _entry_numbers(first: int, count: int) -> Dict[str, Any]:
@@ -460,11 +494,11 @@ def append_entry_db(db_path: str, name: str, text: "str | List[str]", author: st
             note = _get_note(conn, name)
             now = created_at or _now_iso()
             entry_no = note["next_entry_no"]
-            parts = _link_parts([text] if isinstance(text, str) else list(text), entry_no)
+            parts = [text] if isinstance(text, str) else list(text)
             author_id = _author_id(conn, author, _now_iso())
             conn.executemany(
-                "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id) VALUES (?, ?, ?, ?, ?)",
-                [(note["note_pk"], entry_no + i, part, now, author_id) for i, part in enumerate(parts)],
+                "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id, chain_id) VALUES (?, ?, ?, ?, ?, ?)",
+                [(note["note_pk"], entry_no + i, part, now, author_id, entry_no if len(parts) > 1 else None) for i, part in enumerate(parts)],
             )
             # a backdated entry never moves the note's last-updated time backwards
             conn.execute(
@@ -535,7 +569,7 @@ def read_note_db(db_path: str, name: str, limit: int) -> Dict[str, Any]:
         note = _get_note(conn, name)
         total = conn.execute("SELECT COUNT(*) FROM note_data WHERE note_pk = ?", (note["note_pk"],)).fetchone()[0]
         rows = conn.execute(
-            "SELECT d.entry_no, d.note_text, d.created_at, d.edited_at, a.author_name FROM note_data d "
+            f"SELECT d.entry_no, d.note_text, d.created_at, d.edited_at, a.author_name, {_CHAIN_SQL} FROM note_data d "
             "LEFT JOIN note_author a ON a.author_id = d.author_id WHERE d.note_pk = ? "
             "ORDER BY d.created_at DESC, d.entry_no DESC LIMIT ?",
             (note["note_pk"], limit),
@@ -599,7 +633,7 @@ def search_notes_db(db_path: str, query: str, limit: int) -> "tuple[List[Any], L
             (like, like, like, limit),
         ).fetchall()
         entries = conn.execute(
-            "SELECT n.note_name, d.entry_no, d.note_text, a.author_name FROM note_data d JOIN note_id n ON n.note_pk = d.note_pk "
+            f"SELECT n.note_name, d.entry_no, d.note_text, a.author_name, {_CHAIN_SQL} FROM note_data d JOIN note_id n ON n.note_pk = d.note_pk "
             "LEFT JOIN note_author a ON a.author_id = d.author_id "
             "WHERE d.note_text LIKE ? ESCAPE '\\' ORDER BY d.created_at DESC, d.entry_no DESC LIMIT ?",
             (like, limit),
@@ -833,14 +867,14 @@ def tagged_notes_db(db_path: str, tags: List[str], match_all: bool) -> "tuple[Li
             note_tags = _note_tags(conn, r["note_pk"])
             summary = conn.execute("SELECT summary_text FROM note_summary WHERE note_pk = ?", (r["note_pk"],)).fetchone()
             entries = conn.execute(
-                "SELECT d.entry_no, d.note_text, d.created_at, a.author_name FROM note_data d LEFT JOIN note_author a ON a.author_id = d.author_id "
+                f"SELECT d.entry_no, d.note_text, d.created_at, a.author_name, {_CHAIN_SQL} FROM note_data d LEFT JOIN note_author a ON a.author_id = d.author_id "
                 "WHERE d.note_pk = ? ORDER BY d.created_at DESC, d.entry_no DESC",
                 (r["note_pk"],),
             ).fetchall()
             notes.append({
                 "note_name": r["note_name"], "tags": note_tags, "matched_tags": [t for t in note_tags if t in found],
                 "summary": summary["summary_text"] if summary else None,
-                "entries": [{"entry_no": e["entry_no"], "author": e["author_name"] or "unknown", "created_at": e["created_at"], "text": e["note_text"]} for e in entries],
+                "entries": [{"entry_no": e["entry_no"], "author": e["author_name"] or "unknown", "created_at": e["created_at"], "text": e["note_text"], **_chain_marks(e)} for e in entries],
             })
         return notes, found, missing
     finally:
@@ -862,7 +896,8 @@ def _shape_tagged(note: Dict[str, Any], verbose: bool) -> Dict[str, Any]:
     shaped: Dict[str, Any] = {"note_name": note["note_name"]}
     if note["summary"]:
         shaped["summary"] = note["summary"]
-    shaped["entries"] = [e["text"] for e in note["entries"]]
+    # a piece of a long text keeps its links, so it's a small object; every other entry stays a bare string
+    shaped["entries"] = [{"text": e["text"], **{k: e[k] for k in ("continues_from", "continues_at") if k in e}} if ("continues_at" in e or "continues_from" in e) else e["text"] for e in note["entries"]]
     return shaped
 
 
@@ -940,7 +975,7 @@ class Tools:
         MAX_LIST_RESULTS: int = Field(default=50, description="Caps agent_notes_list results.")
         MIN_SUMMARY_CHARS: int = Field(default=1000, description="A note whose entries total fewer characters than this isn't offered for summarizing (agent_notes_list needs_summary=true skips it, and shows 'short'): a summary of a note that small would just copy it. 0 summarizes everything.")
         MAX_TAGGED_CHARS: int = Field(default=6000, description="Character budget for agent_notes_read_tagged's reply (about a quarter as many tokens). Whole notes/entries only; anything that doesn't fit is left out and reported.")
-        MAX_CONTINUATION_ENTRIES: int = Field(default=6, description="With continues=true, agent_notes_create/agent_notes_append split a long text into at most this many entries of up to 470 characters each (so 6 = about 2800 characters per call). A longer text is refused whole.")
+        MAX_CONTINUATION_ENTRIES: int = Field(default=6, description="With continues=true, agent_notes_create/agent_notes_append split a long text into at most this many entries of up to 500 characters each (so 6 = about 3000 characters per call). A longer text is refused whole.")
         MAX_SEARCH_RESULTS: int = Field(default=30, description="Caps each of agent_notes_search' two result lists (matching notes, matching entries).")
 
     def __init__(self):
@@ -1015,9 +1050,9 @@ class Tools:
         full = _to_bool(verbose)
         entries = []
         for r in result["entries"]:
-            item = {"entry_no": r["entry_no"], "text": r["note_text"]}  # the number stays: edit_entry/delete_entry need it
+            item = {"entry_no": r["entry_no"], "text": r["note_text"], **_chain_marks(r)}  # the number stays: edit_entry/delete_entry need it
             if full:
-                item = {"entry_no": r["entry_no"], "author": r["author_name"] or "unknown", "created_at": r["created_at"], "text": r["note_text"]}
+                item = {"entry_no": r["entry_no"], "author": r["author_name"] or "unknown", "created_at": r["created_at"], "text": r["note_text"], **_chain_marks(r)}
                 if r["edited_at"]:
                     item["edited_at"] = r["edited_at"]
             entries.append(item)
@@ -1060,7 +1095,7 @@ class Tools:
         :param comment: Optional one-line description of what the note is for, at most 500 characters. Pass "" (or omit) for none.
         :param author_name: Who is writing this, at most 60 characters. Pass "" (or omit) to be recorded under your model's name.
         :param created_at: Only when copying in an older note: when it was originally written, as ISO 8601 (2026-03-01T14:30:00Z, or just 2026-03-01) or a Unix epoch number. Pass "" (or omit) for the current time, which is right for anything new.
-        :param continues: Pass true when text is longer than 500 characters and must be kept verbatim: the tool saves it, unchanged, as several consecutive entries, each but the last ending \"[continues at entry #N]\" (the reply gives their numbers). Pass false (the normal choice) otherwise.
+        :param continues: Pass true when text is longer than 500 characters and must be kept verbatim: the tool saves it, unchanged, as several consecutive entries, linked together (the reply gives their numbers, and agent_notes_read then shows continues_at on each piece that carries on). Pass false (the normal choice) otherwise.
         """
         try:
             result = await asyncio.to_thread(
@@ -1092,7 +1127,7 @@ class Tools:
         :param text: The new entry's text, at most 500 characters (or longer with continues=true).
         :param author_name: Who is writing this, at most 60 characters. Pass "" (or omit) to be recorded under your model's name.
         :param created_at: Only when copying in an older note: when this entry was originally written, as ISO 8601 (2026-03-01T14:30:00Z, or just 2026-03-01) or a Unix epoch number. Pass "" (or omit) for the current time, which is right for anything new. Entries read back in time order, so a backdated entry appears before newer ones even though its number is higher.
-        :param continues: Pass true when text is longer than 500 characters and must be kept verbatim: the tool saves it, unchanged, as several consecutive entries, each but the last ending \"[continues at entry #N]\" (the reply gives their numbers). Pass false (the normal choice) otherwise.
+        :param continues: Pass true when text is longer than 500 characters and must be kept verbatim: the tool saves it, unchanged, as several consecutive entries, linked together (the reply gives their numbers, and agent_notes_read then shows continues_at on each piece that carries on). Pass false (the normal choice) otherwise.
         """
         try:
             result = await asyncio.to_thread(
@@ -1326,9 +1361,9 @@ class Tools:
             "success": True,
             "matching_notes": [{"note_name": r["note_name"], "note_comment": r["note_comment"]} for r in notes],
             "matching_entries": [
-                {"note_name": r["note_name"], "entry_no": r["entry_no"], "text": r["note_text"]}
+                {"note_name": r["note_name"], "entry_no": r["entry_no"], "text": r["note_text"], **_chain_marks(r)}
                 if not _to_bool(verbose)
-                else {"note_name": r["note_name"], "entry_no": r["entry_no"], "author": r["author_name"] or "unknown", "text": r["note_text"]}
+                else {"note_name": r["note_name"], "entry_no": r["entry_no"], "author": r["author_name"] or "unknown", "text": r["note_text"], **_chain_marks(r)}
                 for r in entries
             ],
         }

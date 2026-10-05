@@ -301,7 +301,7 @@ class ListAndSearchTests(NotesTestCase):
         out = self.run_async(self.tool.agent_notes_search("needle"))
         self.assertEqual([e["text"] for e in out["matching_entries"]], ["needle three", "needle two", "needle one", "needle four"])
 
-    def test_continues_splits_long_text_verbatim_into_consecutive_entries(self):
+    def test_continues_splits_long_text_verbatim_into_a_linked_chain(self):
         text = " ".join(f"word{i}" for i in range(300))  # ~2000 characters
         made = self.run_async(self.tool.agent_notes_create("long", text, continues=True))
         self.assertTrue(made["success"], made)
@@ -310,12 +310,53 @@ class ListAndSearchTests(NotesTestCase):
         self.assertEqual(more["entry_numbers"], "6-7")
         entries = self.run_async(self.tool.agent_notes_read("long"))["entries"]
         self.assertTrue(all(len(e["text"]) <= mod.NOTE_TEXT_MAX for e in entries))
-        import re
-        self.assertEqual(entries[0]["text"].rsplit(" [continues", 1)[1], " at entry #2]")
-        self.assertNotIn("continues at", entries[4]["text"])  # the last piece has no pointer
-        self.assertIn("[continues at entry #7]", entries[5]["text"])
-        strip = lambda t: re.sub(r" \[continues at entry #\d+\]$", "", t)
-        self.assertEqual(" ".join(strip(e["text"]) for e in entries[:5]), text)  # no word lost, cut or changed
+        self.assertEqual(" ".join(e["text"] for e in entries[:5]), text)  # the stored text is exactly the words given
+        self.assertEqual([e.get("continues_at") for e in entries], [2, 3, 4, 5, None, 7, None])
+        self.assertEqual([e.get("continues_from") for e in entries], [None, 1, 2, 3, 4, None, 6])
+        self.assertEqual(self.sql("SELECT DISTINCT chain_id FROM note_data WHERE entry_no > 5"), [(6,)])
+
+    def test_ordinary_entries_carry_no_chain_fields_and_search_shows_links(self):
+        self.create("n", "plain")
+        self.run_async(self.tool.agent_notes_append("n", "needle " * 100, continues=True))
+        read = self.run_async(self.tool.agent_notes_read("n"))["entries"]
+        self.assertEqual(set(read[0]), {"entry_no", "text"})
+        hits = self.run_async(self.tool.agent_notes_search("needle"))["matching_entries"]
+        self.assertEqual({h["entry_no"]: (h.get("continues_from"), h.get("continues_at")) for h in hits}, {2: (None, 3), 3: (2, None)})
+
+    def test_read_tagged_plain_keeps_chain_links_on_pieces_only(self):
+        self.create("n", "plain")
+        self.run_async(self.tool.agent_notes_append("n", "word " * 150, continues=True))
+        self.run_async(self.tool.agent_notes_add_tags("n", "t", create=True))
+        out = self.run_async(self.tool.agent_notes_read_tagged("t"))
+        entries = out["notes"][0]["entries"]
+        self.assertEqual(entries[0], "plain")
+        self.assertEqual([e["continues_at"] if isinstance(e, dict) and "continues_at" in e else None for e in entries[1:]], [3, None])
+        self.assertEqual(entries[2]["continues_from"], 2)
+
+    def test_deleting_or_editing_a_piece_keeps_the_chain_consistent(self):
+        self.run_async(self.tool.agent_notes_create("n", "word " * 400, continues=True))  # entries 1-4
+        self.run_async(self.tool.agent_notes_delete_entry("n", "2"))
+        self.run_async(self.tool.agent_notes_edit_entry("n", "3", "edited"))
+        entries = {e["entry_no"]: e for e in self.run_async(self.tool.agent_notes_read("n"))["entries"]}
+        self.assertEqual((entries[1]["continues_at"], entries[3]["continues_from"], entries[3]["continues_at"]), (3, 1, 4))
+        self.assertEqual(entries[3]["text"], "edited")
+        self.run_async(self.tool.agent_notes_delete_entry("n", "1"))
+        self.run_async(self.tool.agent_notes_delete_entry("n", "4"))
+        self.assertNotIn("continues_at", self.run_async(self.tool.agent_notes_read("n"))["entries"][0])
+
+    def test_upgrade_turns_v1_7_text_markers_into_chains(self):
+        self.create("old", "plain")  # makes the database, already at the new schema
+        conn = sqlite3.connect(self.db)
+        conn.execute("ALTER TABLE note_data DROP COLUMN chain_id")
+        pk = conn.execute("SELECT note_pk FROM note_id").fetchone()[0]
+        for no, text in ((2, "alpha [continues at entry #3]"), (3, "beta [continues at entry #4]"), (4, "gamma")):
+            conn.execute("INSERT INTO note_data (note_pk, entry_no, note_text, created_at) VALUES (?, ?, ?, '2026-01-01')", (pk, no, text))
+        conn.commit(); conn.close()
+        mod._schema_ready.discard(self.db)
+        entries = {e["entry_no"]: e for e in self.run_async(self.tool.agent_notes_read("old"))["entries"]}
+        self.assertEqual([entries[n]["text"] for n in (1, 2, 3, 4)], ["plain", "alpha", "beta", "gamma"])
+        self.assertEqual((entries[2]["continues_at"], entries[3]["continues_at"], entries[4]["continues_from"]), (3, 4, 3))
+        self.assertNotIn("continues_at", entries[1])
 
     def test_continues_hard_cuts_an_unbroken_run_and_every_entry_fits(self):
         self.run_async(self.tool.agent_notes_create("blob", "x" * 1400, continues=True))

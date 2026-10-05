@@ -73,6 +73,13 @@ def note_url(name: str) -> str:
     return "/note?name=" + quote(name)
 
 
+def links(r) -> str:
+    """' - continues from #2, continues at #4' for an entry that is a piece of a long text (empty for an ordinary entry)."""
+    marks = [f"continues from #{r['continues_from']}" for _ in [0] if r["continues_from"] is not None]
+    marks += [f"continues at #{r['continues_at']}" for _ in [0] if r["continues_at"] is not None]
+    return f" &middot; {e(', '.join(marks))}" if marks else ""
+
+
 def search_form(q: str = "") -> str:
     return f"<form method='get' action='/'><input type='text' name='q' value='{e(q)}' placeholder='search notes and entries'></form>"
 
@@ -164,7 +171,7 @@ def render_note(db: str, name: str) -> str:
     for r in entries:
         edited = f" &middot; edited {e(when(r['edited_at']))}" if r["edited_at"] else ""
         body += (
-            f"<div class='entry' id='e{r['entry_no']}'><span class='muted'>#{r['entry_no']} &middot; {e(r['author_name'] or 'unknown')} &middot; {e(when(r['created_at']))}{edited}</span>"
+            f"<div class='entry' id='e{r['entry_no']}'><span class='muted'>#{r['entry_no']} &middot; {e(r['author_name'] or 'unknown')} &middot; {e(when(r['created_at']))}{edited}{links(r)}</span>"
             f"<pre>{e(r['note_text'])}</pre>"
             f"<details><summary>edit / delete</summary>"
             f"<form method='post' action='/edit'>{hidden}<input type='hidden' name='entry_no' value='{r['entry_no']}'>"
