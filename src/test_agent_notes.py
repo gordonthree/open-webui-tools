@@ -310,7 +310,19 @@ class ListAndSearchTests(NotesTestCase):
         self.assertEqual(more["entry_numbers"], "6-7")
         entries = self.run_async(self.tool.agent_notes_read("long"))["entries"]
         self.assertTrue(all(len(e["text"]) <= mod.NOTE_TEXT_MAX for e in entries))
-        self.assertEqual(" ".join(e["text"] for e in entries[:5]), text)  # no word lost, cut or changed
+        import re
+        self.assertEqual(entries[0]["text"].rsplit(" [continues", 1)[1], " at entry #2]")
+        self.assertNotIn("continues at", entries[4]["text"])  # the last piece has no pointer
+        self.assertIn("[continues at entry #7]", entries[5]["text"])
+        strip = lambda t: re.sub(r" \[continues at entry #\d+\]$", "", t)
+        self.assertEqual(" ".join(strip(e["text"]) for e in entries[:5]), text)  # no word lost, cut or changed
+
+    def test_continues_hard_cuts_an_unbroken_run_and_every_entry_fits(self):
+        self.run_async(self.tool.agent_notes_create("blob", "x" * 1400, continues=True))
+        entries = self.run_async(self.tool.agent_notes_read("blob"))["entries"]
+        self.assertEqual(len(entries), 3)
+        self.assertTrue(all(len(e["text"]) <= mod.NOTE_TEXT_MAX for e in entries))
+        self.assertEqual(sum(e["text"].count("x") for e in entries), 1400)
 
     def test_continues_off_still_refuses_and_short_text_is_one_entry(self):
         self.assertFalse(self.run_async(self.tool.agent_notes_create("n", "x" * 501))["success"])

@@ -237,10 +237,13 @@ status note below for how this was found.
 Same `""`/`false` = omitted convention as above. Limits: note name 60 characters, note comment 500,
 entry text 500 — enforced by the tool (with an actionable message) and by SQLite `CHECK`s.
 
-`continues=true` (v1.7.0) cuts the text at a paragraph, line or word boundary into pieces of at most 500
-characters — nothing added or altered, so entries stay verbatim — and the reply gives `entry_numbers`. The
-`MAX_CONTINUATION_ENTRIES` valve (default 6, about 3000 characters per call) caps the pieces; over it, nothing
-is saved. Entries aren't marked as continuations in the database (no schema change): they're just consecutive.
+`continues=true` (v1.7.0) cuts the text at a paragraph, line or word boundary into pieces of at most 470
+characters and saves them as consecutive entries; every piece but the last ends with ` [continues at entry #N]`
+so a small model reading (or finding by search) a middle entry can see there is more. The text itself is
+unaltered — strip that trailing marker to get it back verbatim — and the last piece has no marker. The reply gives
+`entry_numbers`. The `MAX_CONTINUATION_ENTRIES` valve (default 6, about 2800 characters per call) caps the
+pieces; over it, nothing is saved. Nothing marks continuations in the schema; the marker text is the only link,
+so editing or deleting a piece doesn't update its neighbours' pointers.
 
 `agent_notes_list`, `_read`, `_search`, `_search_summary` and `_read_tagged` take `verbose` (default `false`):
 plain replies drop authors, timestamps and other bookkeeping to save a small model's context. `_read` and

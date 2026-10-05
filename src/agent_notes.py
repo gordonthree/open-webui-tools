@@ -53,6 +53,7 @@ NOTE_NAME_MAX = 60
 NOTE_COMMENT_MAX = 500
 NOTE_TEXT_MAX = 500
 SUMMARY_MAX = 500
+CONTINUES_CHUNK_MAX = 470  # continues=true pieces: leaves room under NOTE_TEXT_MAX for " [continues at entry #12345]"
 AUTHOR_NAME_MAX = 60
 TAG_MAX = 40
 MAX_TAGS_PER_NOTE = 10
@@ -341,23 +342,24 @@ def validate_text(text: Any) -> str:
 
 
 def split_text(text: Any, max_parts: int) -> List[str]:
-    """Cut text into pieces of at most NOTE_TEXT_MAX characters for agent_notes_create/_append continues=true. The words
-    are kept exactly as given: a cut falls on a paragraph break if one is near, else a line break, else a space (only
-    that break itself is dropped), and only in a word longer than a whole entry does it fall mid-word."""
+    """Cut text into pieces of at most CONTINUES_CHUNK_MAX characters for agent_notes_create/_append continues=true (the
+    database layer then adds a "continues at" marker to all but the last). The words are kept exactly as given: a cut
+    falls on a paragraph break if one is near, else a line break, else a space (only that break itself is dropped),
+    and only in a word longer than a whole piece does it fall mid-word."""
     rest = str(text or "").strip()
     if not rest:
         raise NoteError("Entry text is required and can't be empty.")
     parts: List[str] = []
-    while len(rest) > NOTE_TEXT_MAX:
-        window = rest[: NOTE_TEXT_MAX + 1]
-        cut = next((c for c in (window.rfind("\n\n"), window.rfind("\n"), window.rfind(" ")) if c >= NOTE_TEXT_MAX // 2), NOTE_TEXT_MAX)
+    while len(rest) > NOTE_TEXT_MAX:  # fits in one entry as is: no pieces, no marker
+        window = rest[: CONTINUES_CHUNK_MAX + 1]
+        cut = next((c for c in (window.rfind("\n\n"), window.rfind("\n"), window.rfind(" ")) if c >= CONTINUES_CHUNK_MAX // 2), CONTINUES_CHUNK_MAX)
         parts.append(rest[:cut].strip())
         rest = rest[cut:].strip()
     parts.append(rest)
     if len(parts) > max_parts:
         raise NoteError(
             f"Entry text is {len(str(text).strip())} characters, which would take {len(parts)} entries; at most {max_parts} "
-            f"({max_parts * NOTE_TEXT_MAX} characters) can be saved in one call. Nothing was saved. "
+            f"(about {max_parts * CONTINUES_CHUNK_MAX} characters) can be saved in one call. Nothing was saved. "
             "Save the first part now and the rest in a later agent_notes_append call."
         )
     return [p for p in parts if p]
@@ -412,7 +414,7 @@ def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: st
     conn = notes_db_connect(db_path)
     try:
         now = created_at or _now_iso()  # the note's and first entry's time; the new author row always gets the real time
-        parts = [text] if isinstance(text, str) else list(text)
+        parts = _link_parts([text] if isinstance(text, str) else list(text), 1)
         try:
             with _write_txn(conn):
                 existing = conn.execute(
@@ -441,6 +443,12 @@ def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: st
         conn.close()
 
 
+def _link_parts(parts: List[str], first_no: int) -> List[str]:
+    """Several pieces of one long text: end each but the last with a pointer to the next, so a reader (or a search hit)
+    in the middle can tell there's more. A single piece is left alone."""
+    return [f"{p} [continues at entry #{first_no + i + 1}]" if i < len(parts) - 1 else p for i, p in enumerate(parts)]
+
+
 def _entry_numbers(first: int, count: int) -> Dict[str, Any]:
     return {"entry_no": first} if count == 1 else {"entry_no": first, "entries_saved": count, "entry_numbers": f"{first}-{first + count - 1}"}
 
@@ -452,7 +460,7 @@ def append_entry_db(db_path: str, name: str, text: "str | List[str]", author: st
             note = _get_note(conn, name)
             now = created_at or _now_iso()
             entry_no = note["next_entry_no"]
-            parts = [text] if isinstance(text, str) else list(text)
+            parts = _link_parts([text] if isinstance(text, str) else list(text), entry_no)
             author_id = _author_id(conn, author, _now_iso())
             conn.executemany(
                 "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id) VALUES (?, ?, ?, ?, ?)",
@@ -932,7 +940,7 @@ class Tools:
         MAX_LIST_RESULTS: int = Field(default=50, description="Caps agent_notes_list results.")
         MIN_SUMMARY_CHARS: int = Field(default=1000, description="A note whose entries total fewer characters than this isn't offered for summarizing (agent_notes_list needs_summary=true skips it, and shows 'short'): a summary of a note that small would just copy it. 0 summarizes everything.")
         MAX_TAGGED_CHARS: int = Field(default=6000, description="Character budget for agent_notes_read_tagged's reply (about a quarter as many tokens). Whole notes/entries only; anything that doesn't fit is left out and reported.")
-        MAX_CONTINUATION_ENTRIES: int = Field(default=6, description="With continues=true, agent_notes_create/agent_notes_append split a long text into at most this many entries of up to 500 characters each (so 6 = about 3000 characters per call). A longer text is refused whole.")
+        MAX_CONTINUATION_ENTRIES: int = Field(default=6, description="With continues=true, agent_notes_create/agent_notes_append split a long text into at most this many entries of up to 470 characters each (so 6 = about 2800 characters per call). A longer text is refused whole.")
         MAX_SEARCH_RESULTS: int = Field(default=30, description="Caps each of agent_notes_search' two result lists (matching notes, matching entries).")
 
     def __init__(self):
@@ -1052,7 +1060,7 @@ class Tools:
         :param comment: Optional one-line description of what the note is for, at most 500 characters. Pass "" (or omit) for none.
         :param author_name: Who is writing this, at most 60 characters. Pass "" (or omit) to be recorded under your model's name.
         :param created_at: Only when copying in an older note: when it was originally written, as ISO 8601 (2026-03-01T14:30:00Z, or just 2026-03-01) or a Unix epoch number. Pass "" (or omit) for the current time, which is right for anything new.
-        :param continues: Pass true when text is longer than 500 characters and must be kept verbatim: the tool saves it, unchanged, as several consecutive entries (the reply gives their numbers). Pass false (the normal choice) otherwise.
+        :param continues: Pass true when text is longer than 500 characters and must be kept verbatim: the tool saves it, unchanged, as several consecutive entries, each but the last ending \"[continues at entry #N]\" (the reply gives their numbers). Pass false (the normal choice) otherwise.
         """
         try:
             result = await asyncio.to_thread(
@@ -1084,7 +1092,7 @@ class Tools:
         :param text: The new entry's text, at most 500 characters (or longer with continues=true).
         :param author_name: Who is writing this, at most 60 characters. Pass "" (or omit) to be recorded under your model's name.
         :param created_at: Only when copying in an older note: when this entry was originally written, as ISO 8601 (2026-03-01T14:30:00Z, or just 2026-03-01) or a Unix epoch number. Pass "" (or omit) for the current time, which is right for anything new. Entries read back in time order, so a backdated entry appears before newer ones even though its number is higher.
-        :param continues: Pass true when text is longer than 500 characters and must be kept verbatim: the tool saves it, unchanged, as several consecutive entries (the reply gives their numbers). Pass false (the normal choice) otherwise.
+        :param continues: Pass true when text is longer than 500 characters and must be kept verbatim: the tool saves it, unchanged, as several consecutive entries, each but the last ending \"[continues at entry #N]\" (the reply gives their numbers). Pass false (the normal choice) otherwise.
         """
         try:
             result = await asyncio.to_thread(
