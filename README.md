@@ -237,6 +237,11 @@ status note below for how this was found.
 Same `""`/`false` = omitted convention as above. Limits: note name 60 characters, note comment 500,
 entry text 500 — enforced by the tool (with an actionable message) and by SQLite `CHECK`s.
 
+`continues=true` (v1.7.0) cuts the text at a paragraph, line or word boundary into pieces of at most 500
+characters — nothing added or altered, so entries stay verbatim — and the reply gives `entry_numbers`. The
+`MAX_CONTINUATION_ENTRIES` valve (default 6, about 3000 characters per call) caps the pieces; over it, nothing
+is saved. Entries aren't marked as continuations in the database (no schema change): they're just consecutive.
+
 `agent_notes_list`, `_read`, `_search`, `_search_summary` and `_read_tagged` take `verbose` (default `false`):
 plain replies drop authors, timestamps and other bookkeeping to save a small model's context. `_read` and
 `_search` still return `entry_no` (needed to edit/delete); `_read_tagged` plain returns only note names,
@@ -246,13 +251,13 @@ summaries and bare entry-text strings. `verbose=true` restores the full detail.
 |---|---|
 | `agent_notes_list` | `limit` (default `20`, capped by `MAX_LIST_RESULTS`); `needs_summary=true` lists only notes with no summary or a stale one, skipping notes under the `MIN_SUMMARY_CHARS` valve (default 1000 characters of entry text). The table has a Summary column: none/current/stale/short (short = too small to need one) |
 | `agent_notes_read` | `name` (required); `limit` — most recent N entries, default/max `MAX_READ_ENTRIES` |
-| `agent_notes_create` | `name`, `text` (first entry) required; `comment` optional. Refuses if the name already exists — use `agent_notes_append` |
-| `agent_notes_append` | `name`, `text` required |
+| `agent_notes_create` | `name`, `text` (first entry) required; `comment` optional; `continues=true` saves a text over 500 characters verbatim as several consecutive entries. Refuses if the name already exists — use `agent_notes_append` |
+| `agent_notes_append` | `name`, `text` required; `continues=true` as for create |
 | `agent_notes_edit_entry` | `name`, `entry_no` (e.g. `3` or `"#3"`), `text` — all required |
 | `agent_notes_delete_entry` | `name`, `entry_no` — both required. Other entries keep their numbers; numbers are never reused |
 | `agent_notes_update` | `name` required; any of `new_name`, `comment`, `clear_comment=true` (an empty `comment` means "unchanged", so clearing needs the flag), or `author_name` (re-attributes the note's starter, not its entries; alone it leaves `updated_at` alone so summaries stay current) |
 | `agent_notes_delete` | `name` required. Removes the note and all its entries, no confirmation |
-| `agent_notes_search` | `query` required; `limit` (default `10` per list, capped by `MAX_SEARCH_RESULTS`). Returns matching notes (name/comment) and matching entries |
+| `agent_notes_search` | `query` required; `limit` (default `10` per list, capped by `MAX_SEARCH_RESULTS`). Returns matching notes (name/comment) and matching entries, newest entries first |
 | `agent_notes_update_summary` | `name`, `summary` (≤500 chars, whitespace collapsed) required; `author_name` optional. Creates or replaces the note's one summary |
 | `agent_notes_search_summary` | `query` required; `limit` (default `10`, capped by `MAX_SEARCH_RESULTS`). Splits the query into words, any word can match a note name or summary, ranked by words matched; each result carries `stale` |
 | `agent_notes_delete_summary` | `name` required. Refuses if the note has no summary |

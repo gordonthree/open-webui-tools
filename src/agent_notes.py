@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.6.0
+version: 1.7.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -23,7 +23,7 @@ description: A persistent notebook for agents, easier to use than Open WebUI's b
 
     Limits (also stated in each writing method's docstring, which is what the model actually
     sees): note name 60 characters, note comment 500, each entry's text 500. Longer content goes
-    in several entries, not one long one.
+    in several entries, not one long one: continues=true on create/append does the splitting, verbatim.
 """
 
 import asyncio
@@ -335,9 +335,37 @@ def validate_text(text: Any) -> str:
     if len(cleaned) > NOTE_TEXT_MAX:
         raise NoteError(
             f"Entry text is {len(cleaned)} characters; the limit is {NOTE_TEXT_MAX} (over by {len(cleaned) - NOTE_TEXT_MAX}). "
-            "Shorten it, or split it across several entries with agent_notes_append."
+            "Shorten it, or pass continues=true to have it saved as several entries, word for word."
         )
     return cleaned
+
+
+def split_text(text: Any, max_parts: int) -> List[str]:
+    """Cut text into pieces of at most NOTE_TEXT_MAX characters for agent_notes_create/_append continues=true. The words
+    are kept exactly as given: a cut falls on a paragraph break if one is near, else a line break, else a space (only
+    that break itself is dropped), and only in a word longer than a whole entry does it fall mid-word."""
+    rest = str(text or "").strip()
+    if not rest:
+        raise NoteError("Entry text is required and can't be empty.")
+    parts: List[str] = []
+    while len(rest) > NOTE_TEXT_MAX:
+        window = rest[: NOTE_TEXT_MAX + 1]
+        cut = next((c for c in (window.rfind("\n\n"), window.rfind("\n"), window.rfind(" ")) if c >= NOTE_TEXT_MAX // 2), NOTE_TEXT_MAX)
+        parts.append(rest[:cut].strip())
+        rest = rest[cut:].strip()
+    parts.append(rest)
+    if len(parts) > max_parts:
+        raise NoteError(
+            f"Entry text is {len(str(text).strip())} characters, which would take {len(parts)} entries; at most {max_parts} "
+            f"({max_parts * NOTE_TEXT_MAX} characters) can be saved in one call. Nothing was saved. "
+            "Save the first part now and the rest in a later agent_notes_append call."
+        )
+    return [p for p in parts if p]
+
+
+def entry_parts(text: Any, continues: Any, max_parts: int) -> List[str]:
+    """The text as the entries to save: one, or with continues=true as many as it takes (up to max_parts)."""
+    return split_text(text, max(1, max_parts)) if _to_bool(continues) else [validate_text(text)]
 
 
 # --------------------------------------------------------------------------- #
@@ -380,10 +408,11 @@ def _name_taken_error(name: str) -> NoteError:
 _STALE_SQL = "(s.source_updated_at != n.updated_at OR s.source_entries != (SELECT COUNT(*) FROM note_data x WHERE x.note_pk = n.note_pk))"
 
 
-def create_note_db(db_path: str, name: str, text: str, comment: str, author: str, created_at: Optional[str] = None) -> Dict[str, Any]:
+def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: str, author: str, created_at: Optional[str] = None) -> Dict[str, Any]:
     conn = notes_db_connect(db_path)
     try:
         now = created_at or _now_iso()  # the note's and first entry's time; the new author row always gets the real time
+        parts = [text] if isinstance(text, str) else list(text)
         try:
             with _write_txn(conn):
                 existing = conn.execute(
@@ -398,36 +427,42 @@ def create_note_db(db_path: str, name: str, text: str, comment: str, author: str
                     )
                 author_id = _author_id(conn, author, _now_iso())
                 cur = conn.execute(
-                    "INSERT INTO note_id (note_name, note_comment, next_entry_no, created_at, updated_at, author_id) VALUES (?, ?, 2, ?, ?, ?)",
-                    (name, comment, now, now, author_id),
+                    "INSERT INTO note_id (note_name, note_comment, next_entry_no, created_at, updated_at, author_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    (name, comment, len(parts) + 1, now, now, author_id),
                 )
-                conn.execute(
-                    "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id) VALUES (?, 1, ?, ?, ?)",
-                    (cur.lastrowid, text, now, author_id),
+                conn.executemany(
+                    "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id) VALUES (?, ?, ?, ?, ?)",
+                    [(cur.lastrowid, i, part, now, author_id) for i, part in enumerate(parts, 1)],
                 )
         except sqlite3.IntegrityError:  # lost a race with another writer creating the same name
             raise _name_taken_error(name)
-        return {"note_name": name, "entry_no": 1, "created_at": now, "author": author}
+        return {"note_name": name, **_entry_numbers(1, len(parts)), "created_at": now, "author": author}
     finally:
         conn.close()
 
 
-def append_entry_db(db_path: str, name: str, text: str, author: str, created_at: Optional[str] = None) -> Dict[str, Any]:
+def _entry_numbers(first: int, count: int) -> Dict[str, Any]:
+    return {"entry_no": first} if count == 1 else {"entry_no": first, "entries_saved": count, "entry_numbers": f"{first}-{first + count - 1}"}
+
+
+def append_entry_db(db_path: str, name: str, text: "str | List[str]", author: str, created_at: Optional[str] = None) -> Dict[str, Any]:
     conn = notes_db_connect(db_path)
     try:
         with _write_txn(conn):
             note = _get_note(conn, name)
             now = created_at or _now_iso()
             entry_no = note["next_entry_no"]
-            conn.execute(
+            parts = [text] if isinstance(text, str) else list(text)
+            author_id = _author_id(conn, author, _now_iso())
+            conn.executemany(
                 "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id) VALUES (?, ?, ?, ?, ?)",
-                (note["note_pk"], entry_no, text, now, _author_id(conn, author, _now_iso())),
+                [(note["note_pk"], entry_no + i, part, now, author_id) for i, part in enumerate(parts)],
             )
             # a backdated entry never moves the note's last-updated time backwards
             conn.execute(
-                "UPDATE note_id SET next_entry_no = ?, updated_at = max(updated_at, ?) WHERE note_pk = ?", (entry_no + 1, now, note["note_pk"])
+                "UPDATE note_id SET next_entry_no = ?, updated_at = max(updated_at, ?) WHERE note_pk = ?", (entry_no + len(parts), now, note["note_pk"])
             )
-        return {"note_name": note["note_name"], "entry_no": entry_no, "created_at": now, "author": author}
+        return {"note_name": note["note_name"], **_entry_numbers(entry_no, len(parts)), "created_at": now, "author": author}
     finally:
         conn.close()
 
@@ -558,7 +593,7 @@ def search_notes_db(db_path: str, query: str, limit: int) -> "tuple[List[Any], L
         entries = conn.execute(
             "SELECT n.note_name, d.entry_no, d.note_text, a.author_name FROM note_data d JOIN note_id n ON n.note_pk = d.note_pk "
             "LEFT JOIN note_author a ON a.author_id = d.author_id "
-            "WHERE d.note_text LIKE ? ESCAPE '\\' ORDER BY n.updated_at DESC, d.entry_no LIMIT ?",
+            "WHERE d.note_text LIKE ? ESCAPE '\\' ORDER BY d.created_at DESC, d.entry_no DESC LIMIT ?",
             (like, limit),
         ).fetchall()
         return notes, entries
@@ -897,6 +932,7 @@ class Tools:
         MAX_LIST_RESULTS: int = Field(default=50, description="Caps agent_notes_list results.")
         MIN_SUMMARY_CHARS: int = Field(default=1000, description="A note whose entries total fewer characters than this isn't offered for summarizing (agent_notes_list needs_summary=true skips it, and shows 'short'): a summary of a note that small would just copy it. 0 summarizes everything.")
         MAX_TAGGED_CHARS: int = Field(default=6000, description="Character budget for agent_notes_read_tagged's reply (about a quarter as many tokens). Whole notes/entries only; anything that doesn't fit is left out and reported.")
+        MAX_CONTINUATION_ENTRIES: int = Field(default=6, description="With continues=true, agent_notes_create/agent_notes_append split a long text into at most this many entries of up to 500 characters each (so 6 = about 3000 characters per call). A longer text is refused whole.")
         MAX_SEARCH_RESULTS: int = Field(default=30, description="Caps each of agent_notes_search' two result lists (matching notes, matching entries).")
 
     def __init__(self):
@@ -1001,28 +1037,29 @@ class Tools:
 
     async def agent_notes_create(
         self, name: str, text: str, comment: Optional[str] = None, author_name: Optional[str] = None,
-        created_at: Optional[str] = None, __model__: Optional[dict] = None
+        created_at: Optional[str] = None, continues: bool = False, __model__: Optional[dict] = None
     ) -> Dict[str, Any]:
         """
         Start a brand-new note with its first entry. Names are unique (ignoring case): if a note
         with this name already exists, nothing is created - use agent_notes_append to add to it instead.
 
         LIMITS (a call over any of them is refused, nothing is saved): note name 60 characters,
-        comment 500, each entry's text 500. Keep entries short and self-contained; put longer
-        material in several entries (agent_notes_append) rather than one long one.
+        comment 500, each entry's text 500. Keep entries short and self-contained. For longer
+        text that must be kept word for word, pass continues=true (see below).
 
         :param name: A short, descriptive name (at most 60 characters), e.g. "character-bios" or "Chapter 3 plot points". This is how you and other agents refer to the note from now on.
-        :param text: The first entry's text, at most 500 characters.
+        :param text: The first entry's text, at most 500 characters (or longer with continues=true).
         :param comment: Optional one-line description of what the note is for, at most 500 characters. Pass "" (or omit) for none.
         :param author_name: Who is writing this, at most 60 characters. Pass "" (or omit) to be recorded under your model's name.
         :param created_at: Only when copying in an older note: when it was originally written, as ISO 8601 (2026-03-01T14:30:00Z, or just 2026-03-01) or a Unix epoch number. Pass "" (or omit) for the current time, which is right for anything new.
+        :param continues: Pass true when text is longer than 500 characters and must be kept verbatim: the tool saves it, unchanged, as several consecutive entries (the reply gives their numbers). Pass false (the normal choice) otherwise.
         """
         try:
             result = await asyncio.to_thread(
                 create_note_db,
                 self.valves.NOTES_DB_PATH,
                 validate_name(name),
-                validate_text(text),
+                entry_parts(text, continues, self.valves.MAX_CONTINUATION_ENTRIES),
                 validate_comment(comment),
                 resolve_author(author_name, __model__),
                 validate_timestamp(created_at),
@@ -1032,7 +1069,7 @@ class Tools:
         return {"success": True, **result, "note": "Created. Use agent_notes_append to add more entries."}
 
     async def agent_notes_append(
-        self, name: str, text: str, author_name: Optional[str] = None, created_at: Optional[str] = None, __model__: Optional[dict] = None
+        self, name: str, text: str, author_name: Optional[str] = None, created_at: Optional[str] = None, continues: bool = False, __model__: Optional[dict] = None
     ) -> Dict[str, Any]:
         """
         Add a new entry to the end of an existing note. This never changes earlier entries - use
@@ -1040,19 +1077,21 @@ class Tools:
         start a new note use agent_notes_create.
 
         LIMIT: each entry's text is at most 500 characters (a longer one is refused, nothing is
-        saved). For longer content, make several agent_notes_append calls, one idea per entry.
+        saved) - unless you pass continues=true, which saves a longer text word for word as
+        several consecutive entries (the reply gives their numbers; the tool limits how many).
 
         :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
-        :param text: The new entry's text, at most 500 characters. Longer content: split it across several agent_notes_append calls.
+        :param text: The new entry's text, at most 500 characters (or longer with continues=true).
         :param author_name: Who is writing this, at most 60 characters. Pass "" (or omit) to be recorded under your model's name.
         :param created_at: Only when copying in an older note: when this entry was originally written, as ISO 8601 (2026-03-01T14:30:00Z, or just 2026-03-01) or a Unix epoch number. Pass "" (or omit) for the current time, which is right for anything new. Entries read back in time order, so a backdated entry appears before newer ones even though its number is higher.
+        :param continues: Pass true when text is longer than 500 characters and must be kept verbatim: the tool saves it, unchanged, as several consecutive entries (the reply gives their numbers). Pass false (the normal choice) otherwise.
         """
         try:
             result = await asyncio.to_thread(
                 append_entry_db,
                 self.valves.NOTES_DB_PATH,
                 validate_name(name),
-                validate_text(text),
+                entry_parts(text, continues, self.valves.MAX_CONTINUATION_ENTRIES),
                 resolve_author(author_name, __model__),
                 validate_timestamp(created_at),
             )
@@ -1065,7 +1104,7 @@ class Tools:
         Replace the text of one existing entry, keeping its number and its place in the note.
 
         LIMIT: the new text is at most 500 characters (a longer one is refused, the entry is left
-        as it was). If the rewrite won't fit, shorten it and put the rest in agent_notes_append.
+        as it was). If the rewrite won't fit, shorten it and put the rest in agent_notes_append (with continues=true if it must stay verbatim).
 
         :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
         :param entry_no: The entry's number, as shown by agent_notes_read (e.g. 3 or "#3").
@@ -1261,7 +1300,7 @@ class Tools:
         """
         Search every note for some text (case-insensitive substring). Matches note names and
         comments, and the text of individual entries; returns both lists so you can find which
-        note holds something without reading them all.
+        note holds something without reading them all. Matching entries are listed newest first.
 
         :param query: The text to look for.
         :param limit: Maximum matches in each list, default 10. Pass "" (or omit) for the default.

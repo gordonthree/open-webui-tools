@@ -237,7 +237,7 @@ class LimitTests(NotesTestCase):
         self.assertFalse(self.create("b", "t" * 501)["success"])
         self.assertFalse(self.run_async(self.tool.agent_notes_append("a", "t" * 501))["success"])
         self.assertFalse(self.run_async(self.tool.agent_notes_edit_entry("a", 1, "t" * 501))["success"])
-        self.assertIn("split", self.run_async(self.tool.agent_notes_append("a", "t" * 501))["error"])
+        self.assertIn("continues", self.run_async(self.tool.agent_notes_append("a", "t" * 501))["error"])
 
     def test_empty_text_is_refused(self):
         self.assertFalse(self.create("a", "   ")["success"])
@@ -292,6 +292,40 @@ class ListAndSearchTests(NotesTestCase):
         self.assertEqual({n["note_name"] for n in res["matching_notes"]}, {"dragons", "misc"})
         res = self.run_async(self.tool.agent_notes_search("wyrmling"))
         self.assertEqual([(e["note_name"], e["entry_no"]) for e in res["matching_entries"]], [("dragons", 1)])
+
+    def test_search_lists_newest_entries_first(self):
+        self.create("a", "needle one")
+        self.run_async(self.tool.agent_notes_append("a", "needle two"))
+        self.create("b", "needle three")
+        self.run_async(self.tool.agent_notes_append("a", "needle four", created_at="2020-01-01"))
+        out = self.run_async(self.tool.agent_notes_search("needle"))
+        self.assertEqual([e["text"] for e in out["matching_entries"]], ["needle three", "needle two", "needle one", "needle four"])
+
+    def test_continues_splits_long_text_verbatim_into_consecutive_entries(self):
+        text = " ".join(f"word{i}" for i in range(300))  # ~2000 characters
+        made = self.run_async(self.tool.agent_notes_create("long", text, continues=True))
+        self.assertTrue(made["success"], made)
+        self.assertEqual(made["entry_numbers"], "1-5")
+        more = self.run_async(self.tool.agent_notes_append("long", "tail " * 150, continues=True))
+        self.assertEqual(more["entry_numbers"], "6-7")
+        entries = self.run_async(self.tool.agent_notes_read("long"))["entries"]
+        self.assertTrue(all(len(e["text"]) <= mod.NOTE_TEXT_MAX for e in entries))
+        self.assertEqual(" ".join(e["text"] for e in entries[:5]), text)  # no word lost, cut or changed
+
+    def test_continues_off_still_refuses_and_short_text_is_one_entry(self):
+        self.assertFalse(self.run_async(self.tool.agent_notes_create("n", "x" * 501))["success"])
+        one = self.run_async(self.tool.agent_notes_create("n", "short", continues=True))
+        self.assertEqual(one["entry_no"], 1)
+        self.assertNotIn("entry_numbers", one)
+
+    def test_continues_over_the_valve_saves_nothing(self):
+        self.tool.valves.MAX_CONTINUATION_ENTRIES = 2
+        self.create("m", "ok")
+        out = self.run_async(self.tool.agent_notes_create("n", "word " * 400, continues=True))
+        self.assertFalse(out["success"])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM note_id")[0][0], 1)
+        self.assertFalse(self.run_async(self.tool.agent_notes_append("m", "word " * 400, continues=True))["success"])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM note_data")[0][0], 1)
 
     def test_search_treats_like_wildcards_literally(self):
         self.create("a", "100% done")
