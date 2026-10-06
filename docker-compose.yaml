@@ -1,0 +1,58 @@
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    user: "0:0"
+    working_dir: /app/backend
+    command: bash start.sh
+    environment:
+      - GLOBAL_LOG_LEVEL=WARNING
+      - WEBUI_SECRET_KEY=${WEBUI_KEY}
+      - AUTO_INSTALL_VIDEO_FILTERS=1
+    ports:
+      - "8080:8080"
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}" # Sets the SYSLOG_IDENTIFIER in journalctl
+    volumes:
+      - ./data:/app/backend/data
+      - ./upload:/mnt/uploads
+      - /run/systemd/journal/stdout:/run/systemd/journal/stdout
+    restart: unless-stopped
+
+  open-terminal:
+    image: ghcr.io/open-webui/open-terminal:latest
+    container_name: open-terminal
+    ports:
+      - "9900:8000"
+    environment:
+      - OPEN_TERMINAL_CORS_ALLOW_ORIGINS=*
+      - OPEN_TERMINAL_API_KEY=${OPEN_TERMINAL_API_KEY}
+      - OPEN_TERMINAL_MULTI_USER=true
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}" # Sets the SYSLOG_IDENTIFIER in journalctl
+    volumes:
+      - ./open-terminal:/home
+    restart: unless-stopped
+
+
+  oikb-sync:
+    image: ghcr.io/open-webui/oikb:latest
+    container_name: oikb-sync
+    depends_on:
+      - open-webui
+    ports:
+      - "8081:8081"
+    environment:
+      - OPEN_WEBUI_URL=http://open-webui:8080
+      - OPEN_WEBUI_API_KEY=${GORDON_OWUI_KEY}
+      - OIKB_API_KEY=${OIKB_API_KEY}
+      - COMPANION_KB_ID=${COMPANION_KB_ID}
+    volumes:
+      - ./companion-docs:/companion:ro
+      - ./oikb.yaml:/app/oikb.yaml:ro
+    command: daemon --port 8081 --config /app/oikb.yaml --log-format text
+    restart: unless-stopped

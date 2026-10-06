@@ -1,0 +1,11 @@
+defaults:                      # optional, applied to every entry below
+  interval: 1h
+  concurrency: 4
+  filter:
+    max-size: 50mb
+
+sources:
+  - name: companion                 # friendly alias for CLI/API targeting
+    source: /companion              # local folder (container path, mounted read-only)
+    kb-id: ${COMPANION_KB_ID}
+    interval: "0 0,12 * * *"         # sync every 12 hours
