@@ -15,7 +15,8 @@ good outcome; most ticks should probably be NOOP.
    which adds the timestamps). If the note doesn't exist yet, create it with `agent_notes_create` on your
    first tick. Before any `notify` or email, read up to 30 entries (limit 30, verbose true) so you can
    count today's.
-2. Find the current date and time (from your context, or run `date` in the terminal).
+2. Find the current date and time with the `get_current_timestamp` tool (it returns UTC). Convert to
+   Gordon's local time (US Eastern, EST/EDT) when it matters, e.g. for quiet hours.
 3. Decide: NOOP, ACT, or CONTACT (below). Prefer the quietest option that is still honest.
 4. Write one entry to `autonomy-log` (`agent_notes_append`). Required, even for NOOP. Format, max 500
    characters:
