@@ -45,7 +45,7 @@ services:
     depends_on:
       - open-webui
     ports:
-      - "8081:8081"
+      - "8881:8881"
     environment:
       - OPEN_WEBUI_URL=http://open-webui:8080
       - OPEN_WEBUI_API_KEY=${GORDON_OWUI_KEY}
@@ -54,5 +54,5 @@ services:
     volumes:
       - ./companion-docs:/companion:ro
       - ./oikb.yaml:/app/oikb.yaml:ro
-    command: daemon --port 8081 --config /app/oikb.yaml --log-format text
+    command: daemon --port 8881 --config /app/oikb.yaml --log-format text
     restart: unless-stopped
