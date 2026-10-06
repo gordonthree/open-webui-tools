@@ -381,6 +381,53 @@ brand-new tool (like `comfy_sdxl_poses` the first time), import it once through 
 (Workspace → Tools → "+" → paste `src/<name>.py`'s content, or Import), copy the id OWUI assigns
 it into your local `secrets.md`, and `push_tool.py` can update it like the others from then on.
 
+## Model-driven RAG folder ("companion")
+
+A host folder is the source of truth for a RAG knowledge base. Models edit files in it through
+Open Terminal, and the `oikb` daemon mirrors it into an Open WebUI Knowledge Base. Services live
+in `docker-compose.yaml`; the sync config is `oikb.yaml`.
+
+```
+model --(Open Terminal)--> ./companion-docs  --(oikb, one-way)-->  Knowledge Base (COMPANION_KB_ID)
+ host folder mounted at /companion in open-terminal (rw) and oikb-sync (ro)
+```
+
+- **One-way only.** oikb copies folder -> KB. Edits made in the OWUI UI never come back to the
+  folder. Deleting a file from the folder deletes it from the KB on the next sync, and oikb's
+  `reset` command wipes *every* file in the target KB. Use a dedicated KB.
+- **`oikb-sync` service.** `ghcr.io/open-webui/oikb`, `daemon --port 8881 --config /app/oikb.yaml`.
+  Mounts `./companion-docs:/companion:ro` and `./oikb.yaml:/app/oikb.yaml:ro`. Reaches OWUI at
+  `http://open-webui:8080` with `OPEN_WEBUI_API_KEY=${GORDON_OWUI_KEY}`. `OIKB_API_KEY` protects
+  the daemon's `/sync` and `/history`; `/health` and `/metrics` are public.
+- **`oikb.yaml`.** One source: `source: /companion` (container path), `kb-id: ${COMPANION_KB_ID}`,
+  cron `0 0,12 * * *` (every 12 h). The per-source `token` is omitted so it falls back to
+  `OPEN_WEBUI_API_KEY`. `${VAR}` values come from the container environment.
+- **`.env` (not committed)** needs `WEBUI_KEY`, `OPEN_TERMINAL_API_KEY`, `GORDON_OWUI_KEY`,
+  `OIKB_API_KEY` (any random string, e.g. `openssl rand -hex 32`) and `COMPANION_KB_ID` (the UUID
+  in the KB's URL, `/workspace/knowledge/<uuid>`). Compose reads `.env`, your shell doesn't: run
+  `set -a; . ./.env; set +a` before using `$OIKB_API_KEY` in curl.
+- **Terminal access.** The model's shell runs inside `open-terminal`, not `open-webui`, so the
+  folder is mounted there at `/companion`. In multi-user mode commands run as a per-user uid
+  (e.g. 1001) that is not the folder's owner, so the folder needs
+  `chmod -R a+rwX companion-docs` and `setfacl -R -d -m o::rwx companion-docs` (default ACL so new
+  files stay writable and readable by oikb and the backup script).
+- **Sync tool.** Add `http://oikb-sync:8881` as an OpenAPI **Tool Server** (not an OpenAI
+  connection): OWUI admin -> Connections -> Tool Servers, spec path `openapi.json`, bearer auth
+  with `OIKB_API_KEY`, "Forward Cookies" off. Tools it exposes: `trigger_sync` (`identifier` = alias
+  or KB ID, optional `dry_run`; runs asynchronously), `get_sync_status`, `get_sync_history`. The
+  model can call `trigger_sync` with `identifier=companion` after editing, then `get_sync_status`
+  to confirm. Spell out the tool name and `identifier` in the companion model's system prompt;
+  models won't map "sync kb_id=..." to it on their own. Verified end to end.
+- **Model instructions** (system prompt): `/companion` is the source of truth; edit files with the
+  terminal, not through the KB; the KB lags up to 12 h unless a sync is triggered, so read just-edited
+  files directly; don't delete or rename unless asked (deletes propagate).
+- **Backups.** `backup_companion.sh` writes timestamped `companion-docs-*.tgz` files and prunes
+  those older than `KEEP_DAYS` (default 30). Defaults assume `~/docker/open-webui/`; override with
+  `SRC_DIR` / `BACKUP_DIR`. Keep `BACKUP_DIR` outside the synced folder. Run daily from cron.
+- **Gotchas seen.** Starting everything at once can make oikb's first sync fail with "connection
+  refused" because OWUI is still starting; retry the sync manually. Adding oikb under the OpenAI
+  API connections gives a generic "OpenAI Network Problem"; it must be a Tool Server.
+
 ## Status notes
 
 ### 2026-10-02
