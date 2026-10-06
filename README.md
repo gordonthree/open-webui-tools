@@ -457,7 +457,8 @@ with `automation_prompt.md`, on the companion model, filed into that folder.
 `scripts/cleanup_noop_chats.py` deletes finished NOOP tick chats: only chats in the named folder
 (`--folder`, default `Companion ticks`), at least `--min-age-minutes` old (default 60), whose last message
 is a finished assistant message that is exactly `NOOP`. `--dry-run` previews, `--yes` skips the prompt for
-cron. Tests: `cd scripts && python3 -m unittest test_cleanup_noop_chats -v`. Deliberately a human-run /
+cron, `--log FILE` appends each run's output with UTC timestamps. Suggested crontab (every 6 hours) is in
+the script's header. Tests: `cd scripts && python3 -m unittest test_cleanup_noop_chats -v`. Deliberately a human-run /
 cron script: **the model has no tool to delete chats** (pinned by the project owner 2026-10-06 as too risky
 for now).
 

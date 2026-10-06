@@ -16,8 +16,16 @@ Usage:
     python scripts/cleanup_noop_chats.py --dry-run
     python scripts/cleanup_noop_chats.py --yes                    # for cron
     python scripts/cleanup_noop_chats.py --folder "Ticks" --min-age-minutes 120 --yes
+    python scripts/cleanup_noop_chats.py --yes --log ~/logs/cleanup_noop_chats.log
+
+Suggested crontab entry (every 6 hours, on the hour; adjust the repo path and log directory):
+    0 */6 * * * /usr/bin/python3 /home/gordon/dev/open-webui-tools/scripts/cleanup_noop_chats.py --yes --log /home/gordon/logs/cleanup_noop_chats.log
+
+--log appends each run's output to the file, one line per message, each prefixed with a UTC
+timestamp. Cron mails or drops stdout, so the log is the record of what was deleted.
 """
 import argparse
+import datetime
 import sys
 import time
 from pathlib import Path
@@ -77,6 +85,24 @@ def find_noop_chats(session, base_url, folder_id, min_age_seconds, now):
     return found
 
 
+def make_reporter(log_path):
+    """Return say(msg): prints to stdout and, if log_path is given, appends a UTC-timestamped line."""
+    log_file = None
+    if log_path:
+        log_path = Path(log_path).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = log_path
+
+    def say(msg):
+        print(msg)
+        if log_file:
+            stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            with log_file.open("a", encoding="utf-8") as fh:
+                for line in str(msg).splitlines() or [""]:
+                    fh.write(f"{stamp} {line}\n")
+    return say
+
+
 def main(argv=None, session=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--folder", default=DEFAULT_FOLDER, help=f'folder name (default "{DEFAULT_FOLDER}")')
@@ -84,7 +110,9 @@ def main(argv=None, session=None):
     ap.add_argument("--dry-run", action="store_true", help="list what would be deleted, delete nothing")
     ap.add_argument("--yes", action="store_true", help="don't ask for confirmation (for cron)")
     ap.add_argument("--secrets", type=Path, default=DEFAULT_SECRETS_FILE)
+    ap.add_argument("--log", type=Path, help="append this run's output to FILE, each line timestamped (UTC)")
     args = ap.parse_args(argv)
+    say = make_reporter(args.log)
 
     secrets = parse_secrets(args.secrets)
     base_url = require(secrets, "OWUI_BASE_URL").rstrip("/")
@@ -94,14 +122,14 @@ def main(argv=None, session=None):
 
     folder_id = find_folder_id(session, base_url, args.folder)
     doomed = find_noop_chats(session, base_url, folder_id, args.min_age_minutes * 60, time.time())
-    print(f'{len(doomed)} NOOP chat(s) in "{args.folder}".')
+    say(f'{len(doomed)} NOOP chat(s) in "{args.folder}"' + (" (dry run)." if args.dry_run else "."))
     for chat in doomed:
-        print(f"  - {chat['id'][:8]}  {(chat.get('title') or '')[:60]}")
+        say(f"  - {chat['id'][:8]}  {(chat.get('title') or '')[:60]}")
     if args.dry_run or not doomed:
         return 0
     if not args.yes:
         if not sys.stdin.isatty() or input(f"Delete {len(doomed)} chat(s)? [y/N] ").strip().lower() != "y":
-            print("Aborted.")
+            say("Aborted.")
             return 1
 
     failed = 0
@@ -109,8 +137,8 @@ def main(argv=None, session=None):
         resp = session.delete(f"{base_url}/api/v1/chats/{chat['id']}", timeout=30)
         if resp.status_code != 200:
             failed += 1
-            print(f"  failed to delete {chat['id'][:8]}: {resp.status_code} {resp.text[:200]}")
-    print(f"Deleted {len(doomed) - failed}/{len(doomed)}.")
+            say(f"  failed to delete {chat['id'][:8]}: {resp.status_code} {resp.text[:200]}")
+    say(f"Deleted {len(doomed) - failed}/{len(doomed)}.")
     return 1 if failed else 0
 
 

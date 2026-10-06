@@ -145,6 +145,21 @@ class MainTests(unittest.TestCase):
         self.assertEqual(self.run_main(s), 1)
         self.assertEqual(s.deleted, [])
 
+    def test_log_file_gets_timestamped_lines(self):
+        s = self.make_session()
+        log = Path(self.secrets.parent) / "logs" / "cleanup.log"
+        self.assertEqual(self.run_main(s, "--yes", "--log", str(log)), 0)
+        lines = log.read_text().splitlines()
+        self.assertEqual(len(lines), 3)  # summary, one chat, deleted count
+        self.assertRegex(lines[0], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ 1 NOOP chat\(s\)")
+        self.assertTrue(lines[-1].endswith("Deleted 1/1."))
+
+    def test_log_appends_across_runs(self):
+        log = Path(self.secrets.parent) / "cleanup.log"
+        self.run_main(self.make_session(), "--dry-run", "--log", str(log))
+        self.run_main(self.make_session(), "--dry-run", "--log", str(log))
+        self.assertEqual(len(log.read_text().splitlines()), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
