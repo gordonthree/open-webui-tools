@@ -442,13 +442,13 @@ inside the Docker deployment. Files in `autonomy/`:
   the model's own seed, memory files (`companion-docs/autonomy/memory/`) and log.
 
 Transaction log: the `agent_notes` note `autonomy-log`, one entry per tick, action or inaction, formatted
-`NOOP|ACT|CONTACT <date time> - <what/why>` (in `agent_notes` rather than the companion folder so a pile
+`NOOP|ACT|CONTACT - <what/why>` (the tool timestamps each entry) (in `agent_notes` rather than the companion folder so a pile
 of "nothing happened" entries never reaches the RAG knowledge base; browse it with `scripts/notes_web.py`).
 
 Outcomes: `NOOP` (final message is exactly the word NOOP), `ACT` (did something quietly), `CONTACT`
-(wants Gordon; the chat is the primary channel; `notify` at most once a day and never in quiet hours,
-23:00-06:00 Gordon's local time EST/EDT; Nextcloud email unrestricted, since OWUI turns email
-notifications off while Gordon is away). Caveat found in the docs: `notify` only works in chats started from the interface, so it may
+(wants Gordon; the chat is the primary channel; up to six `notify` calls and ten emails a day, `notify` never in quiet hours,
+23:00-06:00 Gordon's local time EST/EDT; email allowed in quiet hours, since OWUI turns
+email notifications off while Gordon is away). Caveat found in the docs: `notify` only works in chats started from the interface, so it may
 not work in automation-created chats - to be tested.
 
 Setup: create a folder named `Companion ticks` in OWUI, create the Automation (User menu -> Automations)

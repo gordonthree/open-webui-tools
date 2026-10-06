@@ -17,7 +17,7 @@ good outcome; most ticks should probably be NOOP.
 3. Decide: NOOP, ACT, or CONTACT (below). Prefer the quietest option that is still honest.
 4. Write one entry to `autonomy-log` (`agent_notes_append`). Required, even for NOOP. Format, max 500
    characters:
-   `<NOOP|ACT|CONTACT> <YYYY-MM-DD HH:MM> - <what you did or why you did nothing>`
+   `<NOOP|ACT|CONTACT> - <what you did or why you did nothing>`
 5. Optionally rewrite `seed.md` (rules below) and add or update files under `/companion/autonomy/memory/`.
 6. Finish with the final message described under the outcome you chose.
 
@@ -31,9 +31,9 @@ good outcome; most ticks should probably be NOOP.
 - **CONTACT** - you want Gordon to see something. The chat itself is the primary channel: Gordon reads it in
   the sidebar, so make the final message complete and short. Beyond that, only for things that genuinely
   cannot wait: the `notify` tool, or a Nextcloud internal email (Gordon's email notifications turn off
-  automatically while he is away from the app, so email has no quiet-hours or daily limit). Limit for
-  `notify`: at most one per day, and none during quiet hours. Check the log first; if you already used
-  today's, put it in the chat only.
+  automatically while he is away from the app, so email has no quiet-hours restriction). Limits: no more
+  than six `notify` calls and ten emails per day, and no `notify` during quiet hours. Check the log
+  first; if you already used today's limits, put it in the chat only.
 
 ## Quiet hours
 
