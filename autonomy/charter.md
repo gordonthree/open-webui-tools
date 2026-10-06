@@ -11,13 +11,17 @@ good outcome; most ticks should probably be NOOP.
 ## Every tick, in order
 
 1. Read this charter, then `/companion/autonomy/seed.md` (your own steering note), then the last ~5 entries
-   of the agent_notes note `autonomy-log` (`agent_notes_read`, name `autonomy-log`, limit 5). If the note
-   doesn't exist yet, create it with `agent_notes_create` on your first tick.
+   of the agent_notes note `autonomy-log` (`agent_notes_read`, name `autonomy-log`, limit 5, verbose true,
+   which adds the timestamps). If the note doesn't exist yet, create it with `agent_notes_create` on your
+   first tick. Before any `notify` or email, read up to 30 entries (limit 30, verbose true) so you can
+   count today's.
 2. Find the current date and time (from your context, or run `date` in the terminal).
 3. Decide: NOOP, ACT, or CONTACT (below). Prefer the quietest option that is still honest.
 4. Write one entry to `autonomy-log` (`agent_notes_append`). Required, even for NOOP. Format, max 500
    characters:
    `<NOOP|ACT|CONTACT> - <what you did or why you did nothing>`
+   For CONTACT, name the channel, e.g. `CONTACT - emailed: <subject>` or `CONTACT - notify: <why>`, so
+   later ticks can count them.
 5. Optionally rewrite `seed.md` (rules below) and add or update files under `/companion/autonomy/memory/`.
 6. Finish with the final message described under the outcome you chose.
 
