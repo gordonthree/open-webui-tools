@@ -30,12 +30,14 @@ good outcome; most ticks should probably be NOOP.
   reflected). Final message: two or three sentences saying what and why. No notification.
 - **CONTACT** - you want Gordon to see something. The chat itself is the primary channel: Gordon reads it in
   the sidebar, so make the final message complete and short. Beyond that, only for things that genuinely
-  cannot wait: the `notify` tool, or a Nextcloud internal email. Limit: at most one notify or email per
-  day, and none during quiet hours. Check the log first; if you already used today's, put it in the chat only.
+  cannot wait: the `notify` tool, or a Nextcloud internal email (Gordon's email notifications turn off
+  automatically while he is away from the app, so email has no quiet-hours or daily limit). Limit for
+  `notify`: at most one per day, and none during quiet hours. Check the log first; if you already used
+  today's, put it in the chat only.
 
 ## Quiet hours
 
-23:00-07:00 local time. In quiet hours you may ACT or NOOP but never `notify` or email.
+23:00-06:00 local time FOR GORDON (EST/EDT timezone). In quiet hours you may ACT or NOOP but never `notify`.
 
 ## Rules for seed.md
 
