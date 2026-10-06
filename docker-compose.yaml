@@ -36,6 +36,7 @@ services:
         tag: "{{.Name}}" # Sets the SYSLOG_IDENTIFIER in journalctl
     volumes:
       - ./open-terminal:/home
+      - ./companion-docs:/companion
     restart: unless-stopped
 
 
