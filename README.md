@@ -428,6 +428,41 @@ model --(Open Terminal)--> ./companion-docs  --(oikb, one-way)-->  Knowledge Bas
   refused" because OWUI is still starting; retry the sync manually. Adding oikb under the OpenAI
   API connections gives a generic "OpenAI Network Problem"; it must be a Tool Server.
 
+## Companion autonomy (scheduled ticks)
+
+Simulated background autonomy for the companion model, using Open WebUI's own **Automations** (a
+scheduled prompt that creates a new chat each run, with the model's normal tools) so everything stays
+inside the Docker deployment. Files in `autonomy/`:
+
+- `charter.md` - Gordon-owned rules for a tick; the model reads it every tick and must not edit it
+  (copy to `companion-docs/autonomy/` and make it read-only, e.g. `chmod 444`).
+- `seed.md` - the model-owned steering note (under 1000 characters): what has its attention, what to
+  look at next tick. The model rewrites it in place; `backup_companion.sh` keeps history.
+- `automation_prompt.md` - the static prompt to paste into the Automation. All variability comes from
+  the model's own seed, memory files (`companion-docs/autonomy/memory/`) and log.
+
+Transaction log: the `agent_notes` note `autonomy-log`, one entry per tick, action or inaction, formatted
+`NOOP|ACT|CONTACT <date time> - <what/why>` (in `agent_notes` rather than the companion folder so a pile
+of "nothing happened" entries never reaches the RAG knowledge base; browse it with `scripts/notes_web.py`).
+
+Outcomes: `NOOP` (final message is exactly the word NOOP), `ACT` (did something quietly), `CONTACT`
+(wants Gordon; the chat is the primary channel, `notify`/Nextcloud email at most once a day and never in
+quiet hours). Caveat found in the docs: `notify` only works in chats started from the interface, so it may
+not work in automation-created chats - to be tested.
+
+Setup: create a folder named `Companion ticks` in OWUI, create the Automation (User menu -> Automations)
+with `automation_prompt.md`, on the companion model, filed into that folder.
+
+`scripts/cleanup_noop_chats.py` deletes finished NOOP tick chats: only chats in the named folder
+(`--folder`, default `Companion ticks`), at least `--min-age-minutes` old (default 60), whose last message
+is a finished assistant message that is exactly `NOOP`. `--dry-run` previews, `--yes` skips the prompt for
+cron. Tests: `cd scripts && python3 -m unittest test_cleanup_noop_chats -v`. Deliberately a human-run /
+cron script: **the model has no tool to delete chats** (pinned by the project owner 2026-10-06 as too risky
+for now).
+
+Note on OWUI's API: `GET /api/v1/chats/` returns only summary fields (no `folder_id`), so folder
+membership has to be asked for via `GET /api/v1/chats/folder/{id}` or the full `GET /api/v1/chats/{id}`.
+
 ## Status notes
 
 ### 2026-10-02
