@@ -10,11 +10,16 @@ runs into and deletes them. A chat is deleted only if ALL of these hold:
   - its current (last) message is a finished assistant message whose text is exactly NOOP.
 If Gordon replied in the chat, or the tick did anything else, the last message differs and it is kept.
 
+With --also-empty, finished ticks whose final assistant message is empty are deleted too: ticks that
+were stopped by hand (or died mid-run) leave a finished chat with no text. Opt-in, because an empty
+ending can also be a real failure worth reading first - run tick_report.py to see which is which.
+
 Connection details come from secrets.md (OWUI_BASE_URL, OWUI_API_KEY), the same file push_tool.py uses.
 
 Usage:
     python scripts/cleanup_noop_chats.py --dry-run
     python scripts/cleanup_noop_chats.py --yes                    # for cron
+    python scripts/cleanup_noop_chats.py --dry-run --also-empty   # preview stopped ticks as well
     python scripts/cleanup_noop_chats.py --folder "Ticks" --min-age-minutes 120 --yes
     python scripts/cleanup_noop_chats.py --yes --log ~/logs/cleanup_noop_chats.log
 
@@ -71,8 +76,19 @@ def is_noop(chat):
     return (current.get("content") or "").strip().casefold() == "noop"
 
 
-def find_noop_chats(session, base_url, folder_id, min_age_seconds, now):
-    """Return the full chat records of the deletable NOOP chats in the folder."""
+def is_empty_ending(chat):
+    """True if the chat's current message is a finished assistant message with no text at all."""
+    history = (chat.get("chat") or {}).get("history") or {}
+    messages = history.get("messages") or {}
+    current = messages.get(history.get("currentId"))
+    if not current or current.get("role") != "assistant" or not current.get("done"):
+        return False
+    return not (current.get("content") or "").strip()
+
+
+def find_noop_chats(session, base_url, folder_id, min_age_seconds, now, include_empty=False):
+    """Return the full chat records of the deletable chats in the folder: NOOP ones, plus (with
+    include_empty) finished ones that ended with no text."""
     found = []
     for summary in list_folder_chats(session, base_url, folder_id):
         if now - (summary.get("updated_at") or now) < min_age_seconds:
@@ -80,7 +96,7 @@ def find_noop_chats(session, base_url, folder_id, min_age_seconds, now):
         chat = get_chat(session, base_url, summary["id"])
         if chat.get("folder_id") != folder_id:
             continue  # belt and braces: never delete something that isn't verifiably in the folder
-        if is_noop(chat):
+        if is_noop(chat) or (include_empty and is_empty_ending(chat)):
             found.append(chat)
     return found
 
@@ -107,6 +123,8 @@ def main(argv=None, session=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--folder", default=DEFAULT_FOLDER, help=f'folder name (default "{DEFAULT_FOLDER}")')
     ap.add_argument("--min-age-minutes", type=float, default=60)
+    ap.add_argument("--also-empty", action="store_true",
+                    help="also delete finished ticks that ended with an empty message (stopped by hand)")
     ap.add_argument("--dry-run", action="store_true", help="list what would be deleted, delete nothing")
     ap.add_argument("--yes", action="store_true", help="don't ask for confirmation (for cron)")
     ap.add_argument("--secrets", type=Path, default=DEFAULT_SECRETS_FILE)
@@ -121,10 +139,13 @@ def main(argv=None, session=None):
         session.headers["Authorization"] = f"Bearer {require(secrets, 'OWUI_API_KEY')}"
 
     folder_id = find_folder_id(session, base_url, args.folder)
-    doomed = find_noop_chats(session, base_url, folder_id, args.min_age_minutes * 60, time.time())
-    say(f'{len(doomed)} NOOP chat(s) in "{args.folder}"' + (" (dry run)." if args.dry_run else "."))
+    doomed = find_noop_chats(session, base_url, folder_id, args.min_age_minutes * 60, time.time(),
+                             include_empty=args.also_empty)
+    what = "NOOP/empty" if args.also_empty else "NOOP"
+    say(f'{len(doomed)} {what} chat(s) in "{args.folder}"' + (" (dry run)." if args.dry_run else "."))
     for chat in doomed:
-        say(f"  - {chat['id'][:8]}  {(chat.get('title') or '')[:60]}")
+        kind = "NOOP" if is_noop(chat) else "empty"
+        say(f"  - {chat['id'][:8]}  {kind:5}  {(chat.get('title') or '')[:60]}")
     if args.dry_run or not doomed:
         return 0
     if not args.yes:

@@ -80,7 +80,26 @@ class IsNoopTests(unittest.TestCase):
         self.assertFalse(mod.is_noop({}))
 
 
+class EmptyEndingTests(unittest.TestCase):
+    def test_finished_empty_message(self):
+        self.assertTrue(mod.is_empty_ending(make_chat("a", "")))
+        self.assertTrue(mod.is_empty_ending(make_chat("a", "  \n")))
+
+    def test_running_or_texty_or_user_last_is_not_empty_ending(self):
+        self.assertFalse(mod.is_empty_ending(make_chat("a", "", done=False)))
+        self.assertFalse(mod.is_empty_ending(make_chat("a", "NOOP")))
+        self.assertFalse(mod.is_empty_ending(make_chat("a", "I did a thing.")))
+        self.assertFalse(mod.is_empty_ending(make_chat("a", "", role="user")))
+
+
 class FindTests(unittest.TestCase):
+    def test_empty_endings_only_with_flag(self):
+        s = FakeSession([make_chat("stopped", ""), make_chat("noop", "NOOP"), make_chat("running", "", done=False)])
+        default = mod.find_noop_chats(s, "http://x", FOLDER, 3600, NOW)
+        self.assertEqual([c["id"] for c in default], ["noop"])
+        both = mod.find_noop_chats(s, "http://x", FOLDER, 3600, NOW, include_empty=True)
+        self.assertEqual(sorted(c["id"] for c in both), ["noop", "stopped"])
+
     def test_finds_only_old_noop_chats_in_folder(self):
         s = FakeSession([
             make_chat("noop-old", "NOOP"),
@@ -139,6 +158,19 @@ class MainTests(unittest.TestCase):
         s = self.make_session()
         self.assertEqual(self.run_main(s, "--yes"), 0)
         self.assertEqual(s.deleted, ["n1"])
+
+    def test_also_empty_deletes_stopped_ticks(self):
+        s = self.make_session()
+        stopped = make_chat("stopped", "")
+        stopped["updated_at"] = time.time() - 7200
+        s.chats["stopped"] = stopped
+        self.assertEqual(self.run_main(s, "--yes"), 0)
+        self.assertEqual(s.deleted, ["n1"])
+        s.deleted.clear()
+        s.chats["n1"] = make_chat("n1", "NOOP")
+        s.chats["n1"]["updated_at"] = time.time() - 7200
+        self.assertEqual(self.run_main(s, "--yes", "--also-empty"), 0)
+        self.assertEqual(sorted(s.deleted), ["n1", "stopped"])
 
     def test_no_tty_without_yes_aborts(self):
         s = self.make_session()

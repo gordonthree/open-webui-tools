@@ -458,7 +458,15 @@ with `automation_prompt.md`, on the companion model, filed into that folder.
 (`--folder`, default `Companion ticks`), at least `--min-age-minutes` old (default 60), whose last message
 is a finished assistant message that is exactly `NOOP`. `--dry-run` previews, `--yes` skips the prompt for
 cron, `--log FILE` appends each run's output with UTC timestamps. Suggested crontab (every 6 hours) is in
-the script's header. Tests: `cd scripts && python3 -m unittest test_cleanup_noop_chats -v`. Deliberately a human-run /
+the script's header. `--also-empty` additionally deletes finished ticks that ended with no text (stopped by hand);
+opt-in, since an empty ending can also be a real failure - check `tick_report.py` first.
+Tests: `cd scripts && python3 -m unittest test_cleanup_noop_chats -v`.
+
+`scripts/tick_report.py` is a read-only review of the tick folder: outcome counts (NOOP / message /
+SILENT / running / conversation), tool calls per tick, `notify`/`send_email` calls per day against the
+charter caps, and a flagged list - SILENT (finished with no text), NO-LOG (no write to `autonomy-log`),
+REPEAT (one tool called 8+ times in a tick, i.e. a retry loop). `--since YYYY-MM-DD`, `--all`,
+`--repeat-threshold N`. Tests: `cd scripts && python3 -m unittest test_tick_report -v`. Deliberately a human-run /
 cron script: **the model has no tool to delete chats** (pinned by the project owner 2026-10-06 as too risky
 for now).
 
