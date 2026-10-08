@@ -421,12 +421,56 @@ model --(Open Terminal)--> ./companion-docs  --(oikb, one-way)-->  Knowledge Bas
 - **Model instructions** (system prompt): `/companion` is the source of truth; edit files with the
   terminal, not through the KB; the KB lags up to 12 h unless a sync is triggered, so read just-edited
   files directly; don't delete or rename unless asked (deletes propagate).
-- **Backups.** `backup_companion.sh` writes timestamped `companion-docs-*.tgz` files and prunes
+- **Backups (deprecated - see "Backup of the whole project" below).** `backup_companion.sh` writes timestamped `companion-docs-*.tgz` files and prunes
   those older than `KEEP_DAYS` (default 30). Defaults assume `~/docker/open-webui/`; override with
   `SRC_DIR` / `BACKUP_DIR`. Keep `BACKUP_DIR` outside the synced folder. Run daily from cron.
 - **Gotchas seen.** Starting everything at once can make oikb's first sync fail with "connection
   refused" because OWUI is still starting; retry the sync manually. Adding oikb under the OpenAI
   API connections gives a generic "OpenAI Network Problem"; it must be a Tool Server.
+
+## Backup of the whole project
+
+`scripts/backup_project.sh` snapshots the entire docker project folder (`~/docker/open-webui`: databases,
+`data/`, `companion-docs/`, `open-terminal/`, compose files and `.env`) once a day, locally and on another
+host. It supersedes `backup_companion.sh` (deprecated: it only tars `companion-docs/` and doesn't touch the
+databases, but it still works and is handy stand-alone).
+
+Each run: `docker compose stop` -> `rsync` to a dated snapshot directory -> `docker compose start` (also on
+any error, via a trap) -> prune -> `rsync` the snapshot to the remote host -> prune there. Snapshots are
+named `YYYY-MM-DD` (`_HHMM` appended for a second run the same day). Unchanged files are hard links to the
+previous snapshot (`--link-dest`), so each directory looks like a full copy but only changed files take
+space; restoring is just copying a directory back, and deleting any old snapshot never breaks the others.
+`data/cache/` (3+ GB of re-downloadable embedding and whisper models) is excluded.
+
+- **Settings** (environment overrides at the top of the script): local `/home/gordon/backup/openwebui`
+  (must be outside the project folder), keep 7; remote `gordon@docker-server:/home/gordon/backup/openwebui`,
+  keep 30. Snapshot directories are mode 700 because they contain `.env` (API keys).
+- **Runs as root** (`sudo crontab -e`): the project holds root- and uid-1001-owned files gordon can't read,
+  and ownership must be recorded. Cron line (06:15, after the hourly tick, which fires at :00):
+  `15 6 * * * /home/gordon/dev/open-webui-tools/scripts/backup_project.sh >> /home/gordon/backup/backup_project.log 2>&1`
+- **Remote copy** is rsync over ssh, not scp: same key, but only changed data is sent, and the same
+  `--link-dest` trick keeps the remote snapshots small. Root's ssh would log in as root, so the script
+  passes `gordon@`, `-F /home/gordon/.ssh/config` and `-i /home/gordon/.ssh/id_rsa` explicitly (the key has
+  no passphrase, so cron needs no agent). The remote user isn't root, so ownership is kept in extended
+  attributes with `--fake-super` and is restored when pulling back with it (below). A remote failure leaves
+  the good local snapshot in place.
+- **Dry run:** `sudo scripts/backup_project.sh --dry-run` leaves the stack running and does `rsync -n`
+  against the real folder (checks that root can read everything). `--no-remote` takes the local snapshot
+  only. Downtime is the local copy only (about a minute for ~780 MB).
+- **A tick that is still running at 06:15 is cut off** when the stack stops: it ends as an empty chat
+  (`tick_report.py` shows it as SILENT; `cleanup_noop_chats.py --also-empty` removes it).
+
+Restore (stop the stack first, then as root; add `--delete` only to make the folder match the snapshot exactly):
+```
+# from a local snapshot
+sudo rsync -aHAX --numeric-ids /home/gordon/backup/openwebui/2026-10-08/ ~/docker/open-webui/
+# from the remote (--fake-super on the sending side puts the real ownership back)
+sudo rsync -aHAX --numeric-ids -e "ssh -i /home/gordon/.ssh/id_rsa" --rsync-path="rsync --fake-super" \
+    gordon@docker-server:/home/gordon/backup/openwebui/2026-10-08/ ~/docker/open-webui/
+```
+A snapshot made with `data/cache/` excluded restores without it; the models download again on first use.
+Tested with a scratch tree (root-, 1001- and gordon-owned files): hard links, pruning and a remote round trip
+all behaved; the restored tree was identical.
 
 ## Companion autonomy (scheduled ticks)
 
