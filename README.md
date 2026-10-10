@@ -347,6 +347,30 @@ Browse, search, create, append, edit/delete entries, rename/re-comment and delet
 HTML, stdlib only apart from the `pydantic` that importing `agent_notes` needs. No auth and no CSRF
 protection by design — trusted LAN only. Tests: `cd scripts && python3 -m unittest test_notes_web -v`.
 
+### Host access to the databases (ACLs)
+
+Both SQLite databases (`agent_notes.sqlite3`, `comfy_jobs.sqlite3`) live in OWUI's data volume,
+`<install>/data/comfy_outputs/` (e.g. `~/docker/open-webui/...` or `~/nvme/open-webui/...`). The OWUI container
+runs as root, so that folder and anything it creates are `root:root`, and an unprivileged host user can't
+write there. `notes_web.py`, `init_job_db.py`, `import_server_history.py` and plain `sqlite3` need
+read/write access as the host user, and writing needs the *folder* too: the databases run in WAL mode, so
+every connection can create `-wal`/`-shm` files beside the database, and root-owned ones would lock the
+host user out. Private single-user setup, so the fix is an ACL for that user (shown for `gordon`; substitute yours),
+done once as root on the docker host:
+
+```
+sudo apt install acl            # getfacl/setfacl; Ubuntu doesn't always ship it (ext4 and xfs need no mount options)
+D=~/docker/open-webui/data/comfy_outputs
+sudo setfacl -m  u:gordon:rwx "$D"    # the folder: lets gordon create/delete the -wal/-shm files
+sudo setfacl -d -m u:gordon:rwx "$D"  # default ACL: files the container creates later come with gordon's access too
+sudo chown gordon: "$D"/agent_notes.sqlite3 "$D"/comfy_jobs.sqlite3   # existing database files (skip any that don't exist yet)
+```
+
+Check with `getfacl "$D"`: it should list `user:gordon:rwx` and `default:user:gordon:rwx`. The container (root)
+ignores the file owner, so giving a database file to `gordon` doesn't stop OWUI writing to it; it would only
+matter if the container were ever switched to a non-root user. The `companion-docs` folder needs the same kind of
+setup (see above); `scripts/backup_project.sh` runs as root and needs none of this.
+
 ## Testing
 
 Each tool has a matching `test_*.py` file that simulates ComfyUI's HTTP API with a fake `requests`
