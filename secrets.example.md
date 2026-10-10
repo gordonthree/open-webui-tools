@@ -14,6 +14,15 @@ OWUI_API_KEY: paste-your-personal-api-key-here
 Generate the API key in OWUI: Settings -> Account -> API Keys. The account needs to own (or be
 admin over) each tool below, since updating tool content requires write access.
 
+## Other OWUI servers (optional)
+
+Push to more than one server with `push_tool.py --server NAME` (or `--server all`). A server `NAME` needs both
+lines below, same API-key rules as above; its tool ids are looked up on the server unless you add
+`NAME_<tool>: <id>` lines (e.g. `HANNAH_agent_notes: <tool-id>`).
+
+OWUI_HANNAH_URL: https://your-other-owui-host.example.com
+OWUI_HANNAH_KEY: paste-that-servers-api-key-here
+
 ## Tool IDs
 
 Each tool's id in your OWUI instance. Find it in the URL when editing the tool under

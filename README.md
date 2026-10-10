@@ -414,6 +414,15 @@ re-importing through the OWUI web UI. It reads connection details and per-tool i
 `secrets.md` and fill it in (once per machine, since it's not checked into git). Usage:
 `python scripts/push_tool.py <tool_name|all> [--dry-run]`.
 
+**Several servers.** The default target is the one in `OWUI_BASE_URL`/`OWUI_API_KEY` ("local"). Any other server
+`X` is configured with `OWUI_X_URL` and `OWUI_X_KEY` lines in `secrets.md` (e.g. `OWUI_HANNAH_URL`,
+`OWUI_HANNAH_KEY` for `--server hannah`); `--server` can be repeated and `--server all` means local plus every
+configured one. On those servers a tool's id is looked up from the server (the tool whose id equals its file name,
+e.g. `agent_notes`), or set with an `X_<tool>: <id>` line (`HANNAH_agent_notes`) if the ids differ. One server
+failing doesn't stop the others; the exit status reports it. Backups of a non-local server's tool are named
+`tmp/<tool>_<server>_<timestamp>.py`. Note that pushing a tool that migrates its database (like `agent_notes`)
+upgrades the notes database on *that* server the first time it runs there.
+
 **`push_tool.py` only updates a tool that already exists in OWUI — it can't create one.** For a
 brand-new tool (like `comfy_sdxl_poses` the first time), import it once through OWUI's web UI
 (Workspace → Tools → "+" → paste `src/<name>.py`'s content, or Import), copy the id OWUI assigns
