@@ -351,8 +351,9 @@ and deletes the throwaway chat (only ones the pipe itself created). Each agent s
 and everything else as `user` messages prefixed `[Name]:`, plus a short turn-taking note.
 
 Round rules: up to `MAX_TURNS` agent turns per human message, alternating; whichever agent the human's message
-names (alone) goes first, else `FIRST_SPEAKER`. An agent can end the round by replying exactly `[PASS]`
-(`END_MARKER`). Title/tag/follow-up tasks Open WebUI sends to the selected model get a canned answer, so they
+names (alone) goes first, else `FIRST_SPEAKER`. An agent can end the round by making her whole reply exactly `[PASS]`
+(`END_MARKER`); the marker mixed into other text is just removed (v1.1.1 - before that, a model that echoed `[PASS]`
+at the start of a real reply ended the round, so the other agent never spoke). Title/tag/follow-up tasks Open WebUI sends to the selected model get a canned answer, so they
 don't wake the agents (set a separate Task Model if you'd like real titles). A failure on either side is shown
 in the chat as an italic note and ends the round.
 

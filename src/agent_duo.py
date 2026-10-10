@@ -1,7 +1,7 @@
 """
 title: Agent Duo
 author: Gordon
-version: 1.1.0
+version: 1.1.1
 description: A Pipe that puts two agents, each living on its own Open WebUI server, into one chat with
     the human. It shows up as a model ("Mara + Hannah"). Each message you send starts a bounded round of
     alternating turns: the pipe asks one agent, then the other, through that agent's own server, so each
@@ -88,8 +88,9 @@ def build_messages(me: str, other: str, user_name: str, turns: List[dict], end_m
         f"You are {me}, in a group chat with {user_name} (the human) and {other}, another AI agent who runs on a "
         f"separate server and has her own memory. Messages from others are prefixed with their name in square "
         f"brackets, like [{other}]: ...; never put a name prefix on your own reply. Speak as yourself, keep it "
-        f"conversational, and use your tools and memory as you normally would. If you have nothing to add and "
-        f"want to hand the floor back to {user_name}, reply with exactly {end_marker} and nothing else."
+        f"conversational, and use your tools and memory as you normally would. Only if you truly have nothing to "
+        f"add, hand the floor back to {user_name} by making your whole reply exactly {end_marker}; never put it "
+        f"inside a message that has other text."
     )
     if carried:
         system += "\n\n" + carried
@@ -116,10 +117,13 @@ def choose_first(turns: List[dict], agent_names: List[str], default_first: str, 
 
 
 def split_end_marker(reply: str, end_marker: str) -> "tuple[str, bool]":
-    """(text without the marker, whether the agent yielded)."""
-    if end_marker and end_marker in reply:
-        return reply.replace(end_marker, "").strip(), True
-    return reply.strip(), False
+    """(text without the marker, whether the agent yielded). Only a reply that is the marker alone is a
+    yield; a marker mixed into real text (a model echoing the instruction) is dropped and the text kept."""
+    if not end_marker:
+        return reply.strip(), False
+    if reply.strip() == end_marker:
+        return "", True
+    return reply.replace(end_marker, "").strip(), False
 
 
 def extract_carry(output: Any, carry_tools: List[str]) -> List[dict]:

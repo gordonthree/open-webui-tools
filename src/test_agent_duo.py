@@ -170,7 +170,8 @@ class HistoryTests(unittest.TestCase):
     def test_strip_details_and_marker(self):
         self.assertEqual(mod.strip_details('<details type="tool_calls">x\ny</details>\nHello'), "Hello")
         self.assertEqual(mod.split_end_marker("[PASS]", "[PASS]"), ("", True))
-        self.assertEqual(mod.split_end_marker("ok [PASS]", "[PASS]"), ("ok", True))
+        self.assertEqual(mod.split_end_marker("  [PASS]\n", "[PASS]"), ("", True))
+        self.assertEqual(mod.split_end_marker("ok [PASS]", "[PASS]"), ("ok", False))  # mixed into text: not a yield
         self.assertEqual(mod.split_end_marker("ok", "[PASS]"), ("ok", False))
 
 
@@ -295,6 +296,14 @@ class PipeTests(unittest.TestCase):
         self.assertIn("**Mara:** m1", out)
         self.assertIn("Hannah has nothing to add", out)
         self.assertEqual(len(mara.completions), 1)  # round ended, Mara never got a second turn
+
+    def test_marker_inside_a_real_reply_does_not_end_the_round(self):
+        mara = FakeOWUI(["[PASS]\n\nHello Hannah, welcome.", "m2"])
+        hannah = FakeOWUI(["h1", "h2"])
+        out = run_pipe(make_pipe(MAX_TURNS=2), [{"role": "user", "content": "hi"}], Router(**{MARA: mara, HANNAH: hannah}))
+        self.assertIn("**Mara:** Hello Hannah, welcome.", out)
+        self.assertNotIn("[PASS]", out)
+        self.assertIn("**Hannah:** h1", out)  # Hannah still got her turn
 
     def test_named_agent_speaks_first(self):
         mara = FakeOWUI(["m"])
