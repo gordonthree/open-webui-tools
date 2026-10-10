@@ -33,6 +33,10 @@ comfy_sdxl_graph: <tool-id>
 comfy_sdxl_retrieve: <tool-id>
 comfy_sdxl_poses: <tool-id>
 agent_notes: <tool-id>
+agent_duo: <function-id>
+
+`agent_duo` is an Open WebUI *Function* (a Pipe), not a Tool: find its id under Admin -> Functions
+(or `GET /api/v1/functions/`). It lives on the default server only and isn't included in `push_tool.py all`.
 
 Note: push_tool.py only UPDATES a tool that already exists in OWUI - it can't create one. For a
 brand-new tool (e.g. comfy_sdxl_poses the first time), import it once through OWUI's web UI

@@ -47,6 +47,10 @@ Current tools:
   same folder). Notes are addressed by name (unique, case-insensitive) and entries by number; there
   are no UUIDs, since a model reproduces a plain-language name more reliably than an opaque id.
 
+- `agent_duo.py` — an Open WebUI **Pipe** (a Function, not a Tool) that shows up as one model, "Mara + Hannah",
+  and puts two agents living on **two different OWUI servers** into one chat with the human. See "Two-agent
+  chat (agent_duo)" below. Unrelated to ComfyUI.
+
 The four ComfyUI files share a `GPU_SERVERS` valve list and a `resolve_server`/`resolve_checkpoint`-style
 matching approach, and are meant to be used together — see each tool's own `TOOLKIT` docstring
 paragraph for how they hand off to one another.
@@ -328,6 +332,46 @@ hundreds of notes. `agent_notes_read` includes the summary; `notes_web.py` shows
 older tool copy keeps working against the upgraded database. `notes_web.py` attributes its writes
 to `--author` (default `Gordon`).
 
+## Two-agent chat (agent_duo)
+
+`src/agent_duo.py` is a Pipe installed on one server (open-webui). Pick the "Mara + Hannah" model there and
+send a message: the pipe runs a bounded round of alternating turns, Mara on her own server and Hannah on hers,
+and streams both into the chat as `**Mara:** ...` / `**Hannah:** ...`. Each agent keeps her own persona,
+tools (`agent_notes`, mail, ...) and knowledge because every turn really runs on her server. The speaker
+labels in the saved chat are how the pipe works out who said what on your next message, so don't edit them.
+
+How a turn works (found by spiking against the live servers, 2026-10-10): a bare `POST /api/chat/completions`
+does **not** apply a preset's `toolIds` and does **not** execute tool calls (it hands raw `tool_calls` back). The
+UI gets tools because it sends `tool_ids` itself and names a chat. So per turn the pipe, on the agent's own server:
+reads the preset's `meta.toolIds`; creates a throwaway chat (`[agent_duo] <name>`); posts to `/api/chat/completions`
+with `chat_id`, `id` (the empty assistant message), `session_id`, `tool_ids` and the shared transcript as
+`messages` (the server then runs the whole tool loop in the background); polls `GET /api/v1/chats/{id}` until the
+message is `done`; takes its `content` (tool detail is in `output`, and any `<details>` block is stripped anyway);
+and deletes the throwaway chat (only ones the pipe itself created). Each agent sees her own turns as `assistant`
+and everything else as `user` messages prefixed `[Name]:`, plus a short turn-taking note.
+
+Round rules: up to `MAX_TURNS` agent turns per human message, alternating; whichever agent the human's message
+names (alone) goes first, else `FIRST_SPEAKER`. An agent can end the round by replying exactly `[PASS]`
+(`END_MARKER`). Title/tag/follow-up tasks Open WebUI sends to the selected model get a canned answer, so they
+don't wake the agents (set a separate Task Model if you'd like real titles). A failure on either side is shown
+in the chat as an italic note and ends the round.
+
+| Valve | Meaning |
+|---|---|
+| `MARA_URL` / `HANNAH_URL` | That agent's OWUI base URL as the *pipe's server* reaches it (`http://localhost:8080` for the local one) |
+| `MARA_KEY` / `HANNAH_KEY` | An API key (Settings -> Account -> API Keys) on that server, able to use the agent's model. Keep these only in the Function's valves |
+| `MARA_MODEL_ID` / `HANNAH_MODEL_ID` | The agent's model preset id on her server (defaults `medium-mara`, `hannah-long`) |
+| `MARA_TOOL_IDS` / `HANNAH_TOOL_IDS` | Comma-separated override; blank reads the preset's own `toolIds` |
+| `MARA_NAME` / `HANNAH_NAME` / `USER_NAME` | Speaker labels (default Mara, Hannah, Gordon) |
+| `MAX_TURNS` (4), `FIRST_SPEAKER`, `END_MARKER`, `TURN_TIMEOUT_SECONDS` (300), `POLL_SECONDS` (2) | Round controls |
+| `KEEP_BACKING_CHATS` | Leave each turn's throwaway chat in place (to inspect tool calls) instead of deleting it |
+
+Caveats: a turn takes as long as the model does (two turns measured about 73 s); a stopped chat stops waiting but
+the remote agent may finish its turn; images and files in the human's message aren't forwarded to the agents.
+Deploy: create the Function once in OWUI (Admin -> Functions -> "+", paste `src/agent_duo.py`), enable it, fill the
+valves, then add its id to `secrets.md` as `agent_duo: <id>` so `python scripts/push_tool.py agent_duo` can update
+it. Tests: `cd src && python -m unittest test_agent_duo -v`.
+
 ## Job database
 
 Every render attempt across `comfy_sdxl_direct.py`/`comfy_sdxl_graph.py` — including ones ComfyUI
@@ -391,7 +435,7 @@ Each tool has a matching `test_*.py` file that simulates ComfyUI's HTTP API with
 module — no live ComfyUI or Open WebUI server needed. Run all of them from `src/`:
 
 ```
-python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes -v
+python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes test_agent_duo -v
 ```
 
 `scripts/import_server_history.py` has its own test file the same way — run from `scripts/`:
@@ -565,6 +609,14 @@ Note on OWUI's API: `GET /api/v1/chats/` returns only summary fields (no `folder
 membership has to be asked for via `GET /api/v1/chats/folder/{id}` or the full `GET /api/v1/chats/{id}`.
 
 ## Status notes
+
+### 2026-10-10
+Added `agent_duo.py` v1.0.0 (see "Two-agent chat (agent_duo)"): one chat, two agents on two OWUI servers, via a
+Pipe. Design agreed with the project owner: a Pipe (not a tool Mara calls), bounded auto-rounds per human message,
+full tools/RAG on both sides. The bare completions API doesn't run tools, so each turn uses a throwaway chat on the
+agent's own server (spike-verified on `hannah-long`). 17 tests in `src/test_agent_duo.py`; a live two-turn run of the
+pipe against both real servers worked. `push_tool.py` now also pushes Functions (`agent_duo`), not part of `all`.
+**Not deployed:** the Function has to be created once in OWUI by hand and its valves (API keys) filled in.
 
 ### 2026-10-02
 `agent_notes.py` v1.5.0: every tool method now carries an `agent_notes_` prefix (`agent_notes_list`,

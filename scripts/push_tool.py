@@ -19,6 +19,10 @@ OWUI_HANNAH_URL / OWUI_HANNAH_KEY -> --server hannah). Its tool ids are looked u
 HANNAH_agent_notes) to override that. --server may be repeated, and --server all means local plus
 every configured server. One server failing doesn't stop the others; the exit status says so.
 
+Functions: `agent_duo` is an Open WebUI *Function* (a Pipe), not a Tool, so it goes through
+/api/v1/functions/ instead of /api/v1/tools/. Its id is the bare `agent_duo: <id>` line like a tool's
+(on the default server only - it isn't part of `all`, and other servers only get it when asked for by name).
+
 Usage:
     python scripts/push_tool.py comfy_sdxl_direct
     python scripts/push_tool.py comfy_sdxl_graph comfy_sdxl_retrieve
@@ -26,6 +30,7 @@ Usage:
     python scripts/push_tool.py all --dry-run
     python scripts/push_tool.py agent_notes --server all
     python scripts/push_tool.py agent_notes --server hannah --dry-run
+    python scripts/push_tool.py agent_duo
 """
 import argparse
 import datetime
@@ -41,6 +46,7 @@ DEFAULT_SECRETS_FILE = REPO_ROOT / "secrets.md"
 BACKUP_DIR = REPO_ROOT / "tmp"
 
 TOOL_NAMES = ["comfy_sdxl_direct", "comfy_sdxl_graph", "comfy_sdxl_retrieve", "comfy_sdxl_poses", "agent_notes"]
+FUNCTION_NAMES = ["agent_duo"]  # Open WebUI Functions (Pipes), pushed via /api/v1/functions/ - not part of 'all'
 
 _KV_RE = re.compile(r"^([A-Za-z0-9_]+):\s*(.+?)\s*$")
 
@@ -82,7 +88,13 @@ def backup_current_content(tool_name: str, content: str, server: str = "local") 
     return backup_path
 
 
+def api_kind(name: str) -> str:
+    """The Open WebUI API collection a source file is pushed to."""
+    return "functions" if name in FUNCTION_NAMES else "tools"
+
+
 def push_one(tool_name: str, base_url: str, api_key: str, tool_id: str, dry_run: bool, server: str = "local") -> None:
+    kind = api_kind(tool_name)
     tag = tool_name if server == "local" else f"{server}/{tool_name}"
     local_path = SRC_DIR / f"{tool_name}.py"
     if not local_path.exists():
@@ -90,10 +102,10 @@ def push_one(tool_name: str, base_url: str, api_key: str, tool_id: str, dry_run:
     new_content = local_path.read_text(encoding="utf-8")
 
     headers = {"Authorization": f"Bearer {api_key}"}
-    get_resp = requests.get(f"{base_url}/api/v1/tools/id/{tool_id}", headers=headers, timeout=15)
+    get_resp = requests.get(f"{base_url}/api/v1/{kind}/id/{tool_id}", headers=headers, timeout=15)
     if get_resp.status_code != 200:
         sys.exit(
-            f"[{tag}] Could not fetch tool {tool_id!r} ({get_resp.status_code}): {get_resp.text[:300]}\n"
+            f"[{tag}] Could not fetch {kind[:-1]} {tool_id!r} ({get_resp.status_code}): {get_resp.text[:300]}\n"
             "Check the id in secrets.md and that your API key's account owns (or is admin over) this tool."
         )
     current = get_resp.json()
@@ -123,10 +135,11 @@ def push_one(tool_name: str, base_url: str, api_key: str, tool_id: str, dry_run:
         "name": current.get("name", tool_name),
         "content": new_content,
         "meta": current.get("meta") or {},
-        "access_grants": current.get("access_grants"),
     }
+    if kind == "tools":  # a Function has no access_grants; sending one would be rejected or ignored
+        body["access_grants"] = current.get("access_grants")
     post_resp = requests.post(
-        f"{base_url}/api/v1/tools/id/{tool_id}/update", headers=headers, json=body, timeout=30
+        f"{base_url}/api/v1/{kind}/id/{tool_id}/update", headers=headers, json=body, timeout=30
     )
     if post_resp.status_code != 200:
         sys.exit(f"[{tag}] Update failed ({post_resp.status_code}): {post_resp.text[:500]}")
@@ -164,9 +177,10 @@ def resolve_tool_id(values: dict, server: str, tool_name: str, base_url: str, ap
     override = values.get(f"{server.upper()}_{tool_name}")
     if override and not override.startswith("<"):
         return override
-    resp = requests.get(f"{base_url}/api/v1/tools/", headers={"Authorization": f"Bearer {api_key}"}, timeout=15)
+    kind = api_kind(tool_name)
+    resp = requests.get(f"{base_url}/api/v1/{kind}/", headers={"Authorization": f"Bearer {api_key}"}, timeout=15)
     if resp.status_code != 200:
-        sys.exit(f"[{server}/{tool_name}] Could not list tools on {server} ({resp.status_code}): {resp.text[:300]}")
+        sys.exit(f"[{server}/{tool_name}] Could not list {kind} on {server} ({resp.status_code}): {resp.text[:300]}")
     ids = [t.get("id") for t in resp.json() if isinstance(t, dict)]
     if tool_name in ids:
         return tool_name
@@ -178,7 +192,7 @@ def resolve_tool_id(values: dict, server: str, tool_name: str, base_url: str, ap
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("tools", nargs="+", help=f"One or more of {TOOL_NAMES}, or 'all'.")
+    parser.add_argument("tools", nargs="+", help=f"One or more of {TOOL_NAMES + FUNCTION_NAMES}, or 'all' (the tools).")
     parser.add_argument("--server", action="append", metavar="NAME", help="Server to push to: local (the default), a name configured as OWUI_<NAME>_URL/_KEY, or 'all'. May be repeated.")
     parser.add_argument("--secrets-file", type=Path, default=DEFAULT_SECRETS_FILE)
     parser.add_argument("--dry-run", action="store_true", help="Show what would change without pushing.")
@@ -190,9 +204,9 @@ def main() -> None:
         names = TOOL_NAMES
     else:
         names = args.tools
-        unknown = [n for n in names if n not in TOOL_NAMES]
+        unknown = [n for n in names if n not in TOOL_NAMES + FUNCTION_NAMES]
         if unknown:
-            parser.error(f"Unknown tool name(s) {unknown}; choose from {TOOL_NAMES} or 'all'.")
+            parser.error(f"Unknown tool name(s) {unknown}; choose from {TOOL_NAMES + FUNCTION_NAMES} or 'all'.")
 
     values = parse_secrets(args.secrets_file)
     extras = configured_servers(values)
