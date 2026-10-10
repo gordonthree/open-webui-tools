@@ -333,6 +333,162 @@ class ListAndSearchTests(NotesTestCase):
         self.assertEqual([e["continues_at"] if isinstance(e, dict) and "continues_at" in e else None for e in entries[1:]], [3, None])
         self.assertEqual(entries[2]["continues_from"], 2)
 
+    # ---- popularity counters and weights ----
+
+    def hits(self, name="n"):
+        return self.sql("SELECT hits FROM note_id WHERE note_name = ?", (name,))[0][0], [r[0] for r in self.sql("SELECT d.hits FROM note_data d JOIN note_id n USING (note_pk) WHERE n.note_name = ? ORDER BY entry_no", (name,))]
+
+    def test_read_counts_the_note_and_only_the_entries_returned(self):
+        self.create("n", "one")
+        for t in ("two", "three"):
+            self.run_async(self.tool.agent_notes_append("n", t))
+        self.run_async(self.tool.agent_notes_read("n", limit="2"))  # entries 2 and 3
+        self.run_async(self.tool.agent_notes_read("n", limit="1"))  # entry 3
+        self.assertEqual(self.hits(), (2, [0, 1, 2]))
+
+    def test_search_counts_entries_not_notes_and_leaves_updated_at_alone(self):
+        self.create("n", "needle")
+        before = self.sql("SELECT updated_at FROM note_id")
+        self.run_async(self.tool.agent_notes_search("needle"))
+        self.assertEqual(self.hits(), (0, [1]))
+        self.assertEqual(self.sql("SELECT updated_at FROM note_id"), before)
+
+    def test_read_tagged_counts_what_it_delivered(self):
+        self.create("a", "a1")
+        self.run_async(self.tool.agent_notes_append("a", "a2"))
+        self.run_async(self.tool.agent_notes_add_tags("a", "t", create=True))
+        self.run_async(self.tool.agent_notes_read_tagged("t"))
+        self.assertEqual(self.hits("a"), (1, [1, 1]))
+        self.tool.valves.MAX_TAGGED_CHARS = 500  # budget minus 300 leaves room for the heading but not for long entries
+        self.run_async(self.tool.agent_notes_append("a", "x" * 400))
+        self.run_async(self.tool.agent_notes_read_tagged("t"))
+        note, entries = self.hits("a")
+        self.assertEqual(note, 2)
+        self.assertEqual(entries[2], 0)  # the 400-character entry did not fit, so it was not delivered
+
+    def test_rank_and_web_style_reads_do_not_count(self):
+        self.create("n", "one")
+        self.run_async(self.tool.agent_notes_rank_entries("n", "most_popular"))
+        import agent_notes as m
+        m.read_note_db(self.db, "n", 50)  # what notes_web uses
+        self.assertEqual(self.hits(), (0, [0]))
+
+    def test_a_failed_count_does_not_spoil_the_read(self):
+        self.create("n", "one")
+        def boom(*a, **k):
+            raise sqlite3.OperationalError("database is locked")
+        original, mod.record_hits_db = mod.record_hits_db, boom
+        try:
+            self.assertTrue(self.run_async(self.tool.agent_notes_read("n"))["success"])
+        finally:
+            mod.record_hits_db = original
+
+    def test_reset_hits_for_an_entry_or_a_whole_note(self):
+        self.create("n", "one")
+        self.run_async(self.tool.agent_notes_append("n", "two"))
+        for _ in range(2):
+            self.run_async(self.tool.agent_notes_read("n"))
+        self.assertEqual(self.run_async(self.tool.agent_notes_reset_hits("n", "#2"))["reset"], "entry")
+        self.assertEqual(self.hits(), (2, [2, 0]))
+        out = self.run_async(self.tool.agent_notes_reset_hits("N"))
+        self.assertEqual((out["reset"], out["entries_reset"]), ("note", 2))
+        self.assertEqual(self.hits(), (0, [0, 0]))
+        self.assertFalse(self.run_async(self.tool.agent_notes_reset_hits("n", "9"))["success"])
+        self.assertFalse(self.run_async(self.tool.agent_notes_reset_hits("missing"))["success"])
+
+    def test_weight_defaults_to_50_and_can_be_set_or_nudged_within_0_to_100(self):
+        self.create("n", "one")
+        self.assertEqual(self.sql("SELECT weight FROM note_data")[0][0], 50)
+        self.assertEqual(self.run_async(self.tool.agent_notes_set_weight("n", "1", weight="80"))["weight"], 80)
+        out = self.run_async(self.tool.agent_notes_set_weight("n", "#1", change="-30"))
+        self.assertEqual((out["old_weight"], out["weight"]), (80, 50))
+        out = self.run_async(self.tool.agent_notes_set_weight("n", "1", change="+70"))
+        self.assertEqual(out["weight"], 100)
+        self.assertIn("note", out)  # said it clamped
+        for bad in ({"weight": "101"}, {"weight": "-1"}, {}, {"weight": "5", "change": "5"}, {"weight": "high"}):
+            self.assertFalse(self.run_async(self.tool.agent_notes_set_weight("n", "1", **bad))["success"], bad)
+        self.assertFalse(self.run_async(self.tool.agent_notes_set_weight("n", "7", weight="5"))["success"])
+
+    def test_weight_is_shown_plain_only_when_not_neutral_and_does_not_make_summaries_stale(self):
+        self.create("n", "one")
+        self.run_async(self.tool.agent_notes_append("n", "two"))
+        self.run_async(self.tool.agent_notes_update_summary("n", "about stuff"))
+        self.run_async(self.tool.agent_notes_set_weight("n", "2", weight="20"))
+        out = self.run_async(self.tool.agent_notes_read("n"))
+        self.assertEqual([e.get("weight") for e in out["entries"]], [None, 20])
+        self.assertFalse(out["summary"]["stale"])
+        self.assertEqual(self.run_async(self.tool.agent_notes_read("n", verbose=True))["entries"][0]["weight"], 50)
+
+    def test_edit_keeps_weight_and_hits(self):
+        self.create("n", "one")
+        self.run_async(self.tool.agent_notes_set_weight("n", "1", weight="10"))
+        self.run_async(self.tool.agent_notes_read("n"))
+        self.run_async(self.tool.agent_notes_edit_entry("n", "1", "changed"))
+        self.assertEqual(self.sql("SELECT weight, hits FROM note_data"), [(10, 1)])
+
+    def make_ranked(self):
+        self.create("n", "e1")
+        for t in ("e2", "e3", "e4"):
+            self.run_async(self.tool.agent_notes_append("n", t))
+        for no, w in (("1", 90), ("2", 20), ("3", 60)):  # e4 stays 50
+            self.run_async(self.tool.agent_notes_set_weight("n", no, weight=str(w)))
+        conn = sqlite3.connect(self.db)
+        for no, count in ((1, 3), (3, 1), (4, 1)):  # e2 never read
+            conn.execute("UPDATE note_data SET hits = ? WHERE entry_no = ?", (count, no))
+        conn.commit(); conn.close()
+
+    def rank(self, **kw):
+        out = self.run_async(self.tool.agent_notes_rank_entries("n", **kw))
+        self.assertTrue(out["success"], out)
+        return [e["entry_no"] for e in out["entries"]], out
+
+    def test_rank_by_popularity_ties_go_to_the_newest(self):
+        self.make_ranked()
+        self.assertEqual(self.rank(by="most_popular", limit="3")[0], [1, 4, 3])
+        self.assertEqual(self.rank(by="least_popular", limit="2")[0], [2, 4])
+
+    def test_rank_by_weight_is_strict_and_ordered(self):
+        self.make_ranked()
+        self.assertEqual(self.rank(by="above_weight", weight="50")[0], [1, 3])
+        self.assertEqual(self.rank(by="below_weight", weight="50")[0], [2])
+        self.assertEqual(self.rank(by="above_weight", weight="50", limit="1")[0], [1])
+        ids, out = self.rank(by="above_weight", weight="50", limit="1")
+        self.assertEqual(out["total_matching"], 2)
+        self.assertIn("note", out)
+        self.assertEqual(self.rank(by="Below Weight", weight="100")[0], [2, 4, 3, 1])
+        self.assertEqual(self.rank(by="above_weight", weight="95")[0], [])
+        entry = self.run_async(self.tool.agent_notes_rank_entries("n", "most_popular", limit="1"))["entries"][0]
+        self.assertEqual((entry["weight"], entry["hits"]), (90, 3))
+
+    def test_rank_arguments_are_checked(self):
+        self.make_ranked()
+        for kw in ({"by": "newest"}, {"by": "above_weight"}, {"by": "below_weight", "weight": "101"}, {"by": "most_popular", "limit": "0"}):
+            self.assertFalse(self.run_async(self.tool.agent_notes_rank_entries("n", **kw))["success"], kw)
+        self.assertFalse(self.run_async(self.tool.agent_notes_rank_entries("nope", "most_popular"))["success"])
+        self.assertTrue(self.run_async(self.tool.agent_notes_rank_entries("n", "most_popular", weight="999"))["success"])  # weight ignored
+
+    def test_upgrade_adds_the_score_columns_and_old_rows_get_defaults(self):
+        self.create("old", "plain")
+        conn = sqlite3.connect(self.db)
+        for table, col in (("note_id", "hits"), ("note_data", "hits"), ("note_data", "weight")):
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
+        conn.commit(); conn.close()
+        mod._schema_ready.discard(self.db)
+        mod.notes_db_connect(self.db).close()  # connecting is what upgrades
+        self.assertEqual(self.hits("old"), (0, [0]))
+        self.assertEqual(self.sql("SELECT weight FROM note_data"), [(50,)])
+        self.assertTrue(self.run_async(self.tool.agent_notes_set_weight("old", "1", weight="70"))["success"])
+
+    def test_database_rejects_out_of_range_weight(self):
+        self.create("n", "one")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.sql("UPDATE note_data SET weight = 101")
+
+    def test_list_verbose_shows_note_reads(self):
+        self.create("n", "one")
+        self.run_async(self.tool.agent_notes_read("n"))
+        self.assertIn("| Reads |", self.run_async(self.tool.agent_notes_list(verbose=True))["table"])
+
     def test_deleting_or_editing_a_piece_keeps_the_chain_consistent(self):
         self.run_async(self.tool.agent_notes_create("n", "word " * 400, continues=True))  # entries 1-4
         self.run_async(self.tool.agent_notes_delete_entry("n", "2"))
@@ -867,7 +1023,7 @@ class VerboseTests(NotesTestCase):
 
     def test_read_verbose_has_everything(self):
         res = self.run_async(self.tool.agent_notes_read("n", verbose=True))
-        self.assertEqual(set(res["entries"][0]), {"entry_no", "author", "created_at", "text"})
+        self.assertEqual(set(res["entries"][0]), {"entry_no", "author", "created_at", "text", "hits", "weight"})
         self.assertIn("summarized_by", res["summary"])
         self.assertIn("started_by", res)
 

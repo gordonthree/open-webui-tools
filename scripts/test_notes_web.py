@@ -57,6 +57,31 @@ class HandlerTests(unittest.TestCase):
         self.assertLess(body.index("<pre>newest</pre>"), body.index("<pre>middle</pre>"))
         self.assertLess(body.index("<pre>middle</pre>"), body.index("<pre>oldest</pre>"))
 
+    def test_scores_are_shown_reset_works_and_viewing_does_not_count(self):
+        self.post("/create", name="Ideas", text="first")
+        self.post("/append", name="Ideas", text="second")
+        notes = web.notes
+        notes.record_hits_db(self.db, ["Ideas"], [("Ideas", 1), ("Ideas", 1), ("Ideas", 2)])  # what the tool does on reads
+        notes.set_weight_db(self.db, "Ideas", 2, 15, None)
+        _, _, body = self.get("/note", name="Ideas")
+        self.assertIn("read 1 time", body)
+        self.assertIn("weight 50 &middot; read 2x", body)
+        self.assertIn("weight 15 &middot; read 1x", body)
+        self.get("/note", name="Ideas")
+        self.get("/")
+        self.assertEqual(notes.list_notes_db(self.db, 10)[1][0]["hits"], 1)  # unchanged by browsing
+        self.assertIn("<th>Reads</th>", self.get("/")[2])
+        status, headers, _ = self.post("/reset_hits", name="Ideas", entry_no="1")
+        self.assertEqual((status, headers["Location"]), (303, "/note?name=Ideas#e1"))
+        _, _, body = self.get("/note", name="Ideas")
+        self.assertIn("weight 50 &middot; read 0x", body)
+        self.assertIn("weight 15 &middot; read 1x", body)
+        self.post("/reset_hits", name="Ideas")
+        _, _, body = self.get("/note", name="Ideas")
+        self.assertIn("read 0 times", body)
+        self.assertNotIn("read 1x", body)
+        self.assertEqual(self.post("/reset_hits", name="Ideas", entry_no="9")[0], 400)
+
     def test_rename_and_comment_then_delete_note(self):
         self.post("/create", name="a", text="x")
         status, headers, _ = self.post("/update", name="a", new_name="b", comment="hello")

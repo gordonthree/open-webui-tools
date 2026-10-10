@@ -127,8 +127,8 @@ def render_index(db: str, q: str, tag: str = "") -> str:
     shown = f" tagged {e(tag)} (<a href='/'>show all</a>)" if tag else ""
     body += f"<p class='muted'>{total} note{'s' if total != 1 else ''}{shown}, most recently updated first.</p>"
     if rows:
-        body += "<table><tr><th>Note</th><th>Entries</th><th>Updated</th><th>Started by</th><th>Tags</th><th>Comment</th></tr>" + "".join(
-            f"<tr><td><a href='{note_url(r['note_name'])}'>{e(r['note_name'])}</a></td><td>{r['entries']}</td>"
+        body += "<table><tr><th>Note</th><th>Entries</th><th>Reads</th><th>Updated</th><th>Started by</th><th>Tags</th><th>Comment</th></tr>" + "".join(
+            f"<tr><td><a href='{note_url(r['note_name'])}'>{e(r['note_name'])}</a></td><td>{r['entries']}</td><td>{r['hits']}</td>"
             f"<td class='muted'>{e(when(r['updated_at']))}</td><td>{e(r['author_name'] or 'unknown')}</td>"
             f"<td>{' '.join(tag_link(t) for t in (r['tags'] or '').split(', ') if t)}</td><td>{e(notes._truncate(r['note_comment'], 100))}</td></tr>"
             for r in rows
@@ -151,7 +151,7 @@ def render_note(db: str, name: str) -> str:
     body = search_form() + f"<h2>{e(n)}</h2>"
     if note["note_comment"]:
         body += f"<p>{e(note['note_comment'])}</p>"
-    body += f"<p class='muted'>{result['total']} entries; started by {e(result['started_by'] or 'unknown')}, created {e(when(note['created_at']))}, updated {e(when(note['updated_at']))}</p>"
+    body += f"<p class='muted'>{result['total']} entries; started by {e(result['started_by'] or 'unknown')}, created {e(when(note['created_at']))}, updated {e(when(note['updated_at']))}; read {note['hits']} time{'s' if note['hits'] != 1 else ''}</p>"
     chips = "".join(
         f"<span class='tag'><a href='/?tag={quote(t)}' style='text-decoration:none'>{e(t)}</a>"
         f"<form method='post' action='/remove_tag'>{hidden}<input type='hidden' name='tag' value='{e(t)}'><button title='remove tag'>&times;</button></form></span>"
@@ -171,11 +171,13 @@ def render_note(db: str, name: str) -> str:
     for r in reversed(entries):  # read_note_db returns oldest first; the page shows the newest on top
         edited = f" &middot; edited {e(when(r['edited_at']))}" if r["edited_at"] else ""
         body += (
-            f"<div class='entry' id='e{r['entry_no']}'><span class='muted'>#{r['entry_no']} &middot; {e(r['author_name'] or 'unknown')} &middot; {e(when(r['created_at']))}{edited}{links(r)}</span>"
+            f"<div class='entry' id='e{r['entry_no']}'><span class='muted'>#{r['entry_no']} &middot; {e(r['author_name'] or 'unknown')} &middot; {e(when(r['created_at']))}{edited}{links(r)} &middot; weight {r['weight']} &middot; read {r['hits']}x</span>"
             f"<pre>{e(r['note_text'])}</pre>"
             f"<details><summary>edit / delete</summary>"
             f"<form method='post' action='/edit'>{hidden}<input type='hidden' name='entry_no' value='{r['entry_no']}'>"
             f"<textarea name='text' rows='3' maxlength='{notes.NOTE_TEXT_MAX}'>{e(r['note_text'])}</textarea><button>Save</button></form>"
+            f"<form method='post' action='/reset_hits'>{hidden}<input type='hidden' name='entry_no' value='{r['entry_no']}'>"
+            f"<button>Reset this entry's read count</button></form>"
             f"<form method='post' action='/delete_entry'>{hidden}<input type='hidden' name='entry_no' value='{r['entry_no']}'>"
             f"<button class='danger'>Delete entry #{r['entry_no']}</button></form></details></div>"
         )
@@ -187,6 +189,7 @@ def render_note(db: str, name: str) -> str:
         f"<p><input type='text' name='comment' value='{e(note['note_comment'])}' maxlength='{notes.NOTE_COMMENT_MAX}'></p>"
         f"<p><input type='text' name='author' value='{e(result['started_by'] or '')}' maxlength='{notes.AUTHOR_NAME_MAX}' placeholder='author'></p>"
         f"<button>Save</button></form></details>"
+        f"<form method='post' action='/reset_hits'>{hidden}<button>Reset read counts (this note and all its entries)</button></form>"
         f"<details><summary class='danger'>delete note</summary><form method='post' action='/delete_note'>{hidden}"
         f"<button class='danger'>Permanently delete '{e(n)}' and its {result['total']} entries</button></form></details>"
     )
@@ -235,6 +238,9 @@ def handle_post(db: str, path: str, form: Dict[str, str], author: str = DEFAULT_
         if path == "/delete_entry":
             done = notes.delete_entry_db(db, name(), entry)
             return redirect(note_url(done["note_name"]))
+        if path == "/reset_hits":  # with entry_no: that entry only; without: the note and all its entries
+            done = notes.reset_hits_db(db, name(), entry)
+            return redirect(note_url(done["note_name"]) + (f"#e{entry}" if entry is not None else ""))
         if path == "/update":
             new_name = notes.validate_name(form.get("new_name"))
             author_text = (form.get("author") or "").strip()

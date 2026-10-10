@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.8.0
+version: 1.9.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -16,6 +16,11 @@ description: A persistent notebook for agents, easier to use than Open WebUI's b
     Notes can be tagged (agent_notes_add_tags/agent_notes_remove_tag/agent_notes_list_tags/agent_notes_rename_tag) so related notes can be found
     together. Tags are short, lowercase, and shared across notes; when a new tag looks like an
     existing one the tool says so instead of creating a near-duplicate.
+
+    Notes and entries count how often they are read (a popularity score; agent_notes_reset_hits clears it), and
+    each entry has a weight from 0 to 100 (50 = neutral) that a model can lower for entries it judges negative and
+    raise for positive ones (agent_notes_set_weight). agent_notes_rank_entries lists a note's most or least
+    popular entries, or the entries above or below a given weight.
 
     Every note and entry records its author: pass author_name when writing, or the tool uses the
     name of the model Open WebUI says is calling it. Entries are stamped with the current time
@@ -54,6 +59,11 @@ NOTE_COMMENT_MAX = 500
 NOTE_TEXT_MAX = 500
 SUMMARY_MAX = 500
 AUTHOR_NAME_MAX = 60
+DEFAULT_WEIGHT = 50
+WEIGHT_MIN = 0
+WEIGHT_MAX = 100
+HITS_DDL = "INTEGER NOT NULL DEFAULT 0 CHECK (hits >= 0)"
+WEIGHT_DDL = f"INTEGER NOT NULL DEFAULT {DEFAULT_WEIGHT} CHECK (weight BETWEEN {WEIGHT_MIN} AND {WEIGHT_MAX})"
 TAG_MAX = 40
 MAX_TAGS_PER_NOTE = 10
 TAGS_SHOWN = 40  # how many in-use tags agent_notes_list lists for the model to choose from
@@ -74,7 +84,8 @@ CREATE TABLE IF NOT EXISTS note_id (
     next_entry_no INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    author_id INTEGER REFERENCES note_author(author_id)
+    author_id INTEGER REFERENCES note_author(author_id),
+    hits {HITS_DDL}
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_note_name ON note_id(lower(note_name));
 CREATE TABLE IF NOT EXISTS note_data (
@@ -85,6 +96,8 @@ CREATE TABLE IF NOT EXISTS note_data (
     edited_at TEXT,
     author_id INTEGER REFERENCES note_author(author_id),
     chain_id INTEGER,
+    hits {HITS_DDL},
+    weight {WEIGHT_DDL},
     PRIMARY KEY (note_pk, entry_no)
 );
 CREATE INDEX IF NOT EXISTS idx_note_data_time ON note_data(note_pk, created_at);
@@ -128,6 +141,7 @@ def notes_db_connect(db_path: str) -> sqlite3.Connection:
         conn.executescript(NOTES_SCHEMA)
         _migrate_authors(conn)
         _migrate_chains(conn)
+        _migrate_scores(conn)
         _schema_ready.add(db_path)
     return conn
 
@@ -189,6 +203,15 @@ def _migrate_chains(conn: sqlite3.Connection) -> None:
             conn.execute("UPDATE note_data SET note_text = ? WHERE note_pk = ? AND entry_no = ?", (r["note_text"][: m.start()], r["note_pk"], r["entry_no"]))
         for (note_pk, entry_no), first in chain.items():
             conn.execute("UPDATE note_data SET chain_id = ? WHERE note_pk = ? AND entry_no = ?", (first, note_pk, entry_no))
+
+
+def _migrate_scores(conn: sqlite3.Connection) -> None:
+    """Add the popularity counters (note_id.hits, note_data.hits) and note_data.weight to a database made before them. All are
+    NOT NULL with a default, so an older copy of the tool that doesn't know about them can still insert rows."""
+    with _write_txn(conn):
+        for table, column, ddl in (("note_id", "hits", HITS_DDL), ("note_data", "hits", HITS_DDL), ("note_data", "weight", WEIGHT_DDL)):
+            if column not in [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def _author_id(conn: sqlite3.Connection, author_name: str, now: str) -> int:
@@ -450,6 +473,13 @@ def _chain_marks(row: Any) -> Dict[str, Any]:
     return out
 
 
+def _score_marks(row: Any, verbose: bool) -> Dict[str, Any]:
+    """An entry's weight and read count for the model: both when verbose, otherwise only a weight someone deliberately set."""
+    if verbose:
+        return {"hits": row["hits"], "weight": row["weight"]}
+    return {} if row["weight"] == DEFAULT_WEIGHT else {"weight": row["weight"]}
+
+
 def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: str, author: str, created_at: Optional[str] = None) -> Dict[str, Any]:
     conn = notes_db_connect(db_path)
     try:
@@ -569,7 +599,7 @@ def read_note_db(db_path: str, name: str, limit: int) -> Dict[str, Any]:
         note = _get_note(conn, name)
         total = conn.execute("SELECT COUNT(*) FROM note_data WHERE note_pk = ?", (note["note_pk"],)).fetchone()[0]
         rows = conn.execute(
-            f"SELECT d.entry_no, d.note_text, d.created_at, d.edited_at, a.author_name, {_CHAIN_SQL} FROM note_data d "
+            f"SELECT d.entry_no, d.note_text, d.created_at, d.edited_at, d.hits, d.weight, a.author_name, {_CHAIN_SQL} FROM note_data d "
             "LEFT JOIN note_author a ON a.author_id = d.author_id WHERE d.note_pk = ? "
             "ORDER BY d.created_at DESC, d.entry_no DESC LIMIT ?",
             (note["note_pk"], limit),
@@ -605,7 +635,7 @@ def list_notes_db(db_path: str, limit: int, needs_summary: bool = False, tag: Op
                 raise NoteError(f"No note is tagged {tag!r}." + (f" Similar tags: {', '.join(repr(n) for n in similar)}." if similar else " Use agent_notes_list_tags to see the tags in use."))
             tag = match
         rows = conn.execute(
-            "SELECT * FROM (SELECT n.note_pk, n.note_name, n.note_comment, n.updated_at, COUNT(d.entry_no) AS entries, a.author_name, "
+            "SELECT * FROM (SELECT n.note_pk, n.note_name, n.note_comment, n.updated_at, n.hits, COUNT(d.entry_no) AS entries, a.author_name, "
             f"CASE WHEN s.note_pk IS NULL THEN CASE WHEN (SELECT COALESCE(SUM(length(x.note_text)), 0) FROM note_data x WHERE x.note_pk = n.note_pk) < {int(min_summary_chars)} THEN 'short' ELSE 'none' END "
             f"WHEN {_STALE_SQL} THEN 'stale' ELSE 'current' END AS summary_state, "
             "(SELECT group_concat(tag_name, ', ') FROM (SELECT t.tag_name FROM note_tag nt JOIN tag t ON t.tag_id = nt.tag_id WHERE nt.note_pk = n.note_pk ORDER BY t.tag_name)) AS tags "
@@ -633,12 +663,98 @@ def search_notes_db(db_path: str, query: str, limit: int) -> "tuple[List[Any], L
             (like, like, like, limit),
         ).fetchall()
         entries = conn.execute(
-            f"SELECT n.note_name, d.entry_no, d.note_text, a.author_name, {_CHAIN_SQL} FROM note_data d JOIN note_id n ON n.note_pk = d.note_pk "
+            f"SELECT n.note_name, d.entry_no, d.note_text, d.hits, d.weight, a.author_name, {_CHAIN_SQL} FROM note_data d JOIN note_id n ON n.note_pk = d.note_pk "
             "LEFT JOIN note_author a ON a.author_id = d.author_id "
             "WHERE d.note_text LIKE ? ESCAPE '\\' ORDER BY d.created_at DESC, d.entry_no DESC LIMIT ?",
             (like, limit),
         ).fetchall()
         return notes, entries
+    finally:
+        conn.close()
+
+
+def record_hits_db(db_path: str, note_names: List[str], entries: "List[tuple[str, int]]") -> None:
+    """Count one read of each named note and of each (note name, entry number). Deliberately leaves updated_at alone: a read
+    isn't a change, so it must not make a summary stale."""
+    if not note_names and not entries:
+        return
+    conn = notes_db_connect(db_path)
+    try:
+        with _write_txn(conn):
+            for name in note_names:
+                conn.execute("UPDATE note_id SET hits = hits + 1 WHERE lower(note_name) = lower(?)", (name,))
+            for name, entry_no in entries:
+                conn.execute(
+                    "UPDATE note_data SET hits = hits + 1 WHERE entry_no = ? AND note_pk = (SELECT note_pk FROM note_id WHERE lower(note_name) = lower(?))",
+                    (entry_no, name),
+                )
+    finally:
+        conn.close()
+
+
+def reset_hits_db(db_path: str, name: str, entry_no: Optional[int] = None) -> Dict[str, Any]:
+    """Zero one entry's read count, or (no entry_no) the note's own count and all of its entries'."""
+    conn = notes_db_connect(db_path)
+    try:
+        with _write_txn(conn):
+            note = _get_note(conn, name)
+            if entry_no is not None:
+                _get_entry(conn, note, entry_no)
+                conn.execute("UPDATE note_data SET hits = 0 WHERE note_pk = ? AND entry_no = ?", (note["note_pk"], entry_no))
+                return {"note_name": note["note_name"], "entry_no": entry_no, "reset": "entry"}
+            conn.execute("UPDATE note_id SET hits = 0 WHERE note_pk = ?", (note["note_pk"],))
+            count = conn.execute("UPDATE note_data SET hits = 0 WHERE note_pk = ?", (note["note_pk"],)).rowcount
+            return {"note_name": note["note_name"], "reset": "note", "entries_reset": count}
+    finally:
+        conn.close()
+
+
+def set_weight_db(db_path: str, name: str, entry_no: int, weight: Optional[int], change: Optional[int]) -> Dict[str, Any]:
+    """Set an entry's weight outright, or move it by a signed amount (kept within WEIGHT_MIN..WEIGHT_MAX). Not a content
+    change: updated_at is left alone."""
+    if (weight is None) == (change is None):
+        raise NoteError("Give exactly one of weight (the new value, 0-100) or change (an amount to add, such as 10 or -10).")
+    if weight is not None and not WEIGHT_MIN <= weight <= WEIGHT_MAX:
+        raise NoteError(f"weight must be between {WEIGHT_MIN} and {WEIGHT_MAX}, got {weight}.")
+    conn = notes_db_connect(db_path)
+    try:
+        with _write_txn(conn):
+            note = _get_note(conn, name)
+            entry = _get_entry(conn, note, entry_no)
+            wanted = weight if weight is not None else entry["weight"] + change
+            new = max(WEIGHT_MIN, min(WEIGHT_MAX, wanted))
+            conn.execute("UPDATE note_data SET weight = ? WHERE note_pk = ? AND entry_no = ?", (new, note["note_pk"], entry_no))
+        out = {"note_name": note["note_name"], "entry_no": entry_no, "old_weight": entry["weight"], "weight": new}
+        if new != wanted:
+            out["note"] = f"{wanted} is outside {WEIGHT_MIN}-{WEIGHT_MAX}, so the weight was set to {new}."
+        return out
+    finally:
+        conn.close()
+
+
+# by -> (extra WHERE on the entry, ORDER BY); ties always put the newest entry first
+RANK_MODES = {
+    "most_popular": ("", "d.hits DESC"),
+    "least_popular": ("", "d.hits ASC"),
+    "above_weight": ("AND d.weight > ?", "d.weight DESC"),
+    "below_weight": ("AND d.weight < ?", "d.weight ASC"),
+}
+
+
+def rank_entries_db(db_path: str, name: str, by: str, limit: int, weight: Optional[int] = None) -> Dict[str, Any]:
+    where, order = RANK_MODES[by]
+    extra = [weight] if where else []
+    conn = notes_db_connect(db_path)
+    try:
+        note = _get_note(conn, name)
+        total = conn.execute(f"SELECT COUNT(*) FROM note_data d WHERE d.note_pk = ? {where}", [note["note_pk"]] + extra).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT d.entry_no, d.note_text, d.created_at, d.hits, d.weight, a.author_name, {_CHAIN_SQL} FROM note_data d "
+            f"LEFT JOIN note_author a ON a.author_id = d.author_id WHERE d.note_pk = ? {where} "
+            f"ORDER BY {order}, d.created_at DESC, d.entry_no DESC LIMIT ?",
+            [note["note_pk"]] + extra + [limit],
+        ).fetchall()
+        return {"note": note, "total": total, "entries": rows}
     finally:
         conn.close()
 
@@ -857,7 +973,7 @@ def tagged_notes_db(db_path: str, tags: List[str], match_all: bool) -> "tuple[Li
             raise NoteError(f"No note is tagged {named}. Use agent_notes_list_tags to see the tags in use.")
         marks = ",".join("?" for _ in found)
         rows = conn.execute(
-            f"SELECT n.note_pk, n.note_name, n.updated_at, COUNT(DISTINCT t.tag_id) AS matched FROM note_id n "
+            f"SELECT n.note_pk, n.note_name, n.updated_at, n.hits, COUNT(DISTINCT t.tag_id) AS matched FROM note_id n "
             f"JOIN note_tag nt ON nt.note_pk = n.note_pk JOIN tag t ON t.tag_id = nt.tag_id WHERE t.tag_name IN ({marks}) "
             f"GROUP BY n.note_pk HAVING matched >= ? ORDER BY matched DESC, n.updated_at DESC, n.note_pk DESC",
             found + [len(found) if match_all else 1],
@@ -867,14 +983,15 @@ def tagged_notes_db(db_path: str, tags: List[str], match_all: bool) -> "tuple[Li
             note_tags = _note_tags(conn, r["note_pk"])
             summary = conn.execute("SELECT summary_text FROM note_summary WHERE note_pk = ?", (r["note_pk"],)).fetchone()
             entries = conn.execute(
-                f"SELECT d.entry_no, d.note_text, d.created_at, a.author_name, {_CHAIN_SQL} FROM note_data d LEFT JOIN note_author a ON a.author_id = d.author_id "
+                f"SELECT d.entry_no, d.note_text, d.created_at, d.hits, d.weight, a.author_name, {_CHAIN_SQL} FROM note_data d LEFT JOIN note_author a ON a.author_id = d.author_id "
                 "WHERE d.note_pk = ? ORDER BY d.created_at DESC, d.entry_no DESC",
                 (r["note_pk"],),
             ).fetchall()
             notes.append({
                 "note_name": r["note_name"], "tags": note_tags, "matched_tags": [t for t in note_tags if t in found],
                 "summary": summary["summary_text"] if summary else None,
-                "entries": [{"entry_no": e["entry_no"], "author": e["author_name"] or "unknown", "created_at": e["created_at"], "text": e["note_text"], **_chain_marks(e)} for e in entries],
+                "entries": [{"entry_no": e["entry_no"], "author": e["author_name"] or "unknown", "created_at": e["created_at"], "text": e["note_text"], "hits": e["hits"], "weight": e["weight"], **_chain_marks(e)} for e in entries],
+                "hits": r["hits"],
             })
         return notes, found, missing
     finally:
@@ -897,7 +1014,12 @@ def _shape_tagged(note: Dict[str, Any], verbose: bool) -> Dict[str, Any]:
     if note["summary"]:
         shaped["summary"] = note["summary"]
     # a piece of a long text keeps its links, so it's a small object; every other entry stays a bare string
-    shaped["entries"] = [{"text": e["text"], **{k: e[k] for k in ("continues_from", "continues_at") if k in e}} if ("continues_at" in e or "continues_from" in e) else e["text"] for e in note["entries"]]
+    shaped["entries"] = []
+    for e in note["entries"]:
+        extras = {k: e[k] for k in ("continues_from", "continues_at") if k in e}
+        if e["weight"] != DEFAULT_WEIGHT:
+            extras["weight"] = e["weight"]
+        shaped["entries"].append({"text": e["text"], **extras} if extras else e["text"])
     return shaped
 
 
@@ -1012,10 +1134,10 @@ class Tools:
                 out_empty["tags_in_use"] = tag_line
             return out_empty
         if _to_bool(verbose):
-            lines = ["| Note | Entries | Last updated (UTC) | Started by | Summary | Tags | Comment |", "|---|---|---|---|---|---|---|"]
+            lines = ["| Note | Entries | Reads | Last updated (UTC) | Started by | Summary | Tags | Comment |", "|---|---|---|---|---|---|---|---|"]
             for r in rows:
                 lines.append(
-                    f"| {_cell(r['note_name'], NOTE_NAME_MAX)} | {r['entries']} | {r['updated_at'][:16].replace('T', ' ')} "
+                    f"| {_cell(r['note_name'], NOTE_NAME_MAX)} | {r['entries']} | {r['hits']} | {r['updated_at'][:16].replace('T', ' ')} "
                     f"| {_cell(r['author_name'] or 'unknown', AUTHOR_NAME_MAX)} | {r['summary_state']} | {_cell(r['tags'] or '')} | {_cell(r['note_comment'])} |"
                 )
         else:
@@ -1050,9 +1172,9 @@ class Tools:
         full = _to_bool(verbose)
         entries = []
         for r in result["entries"]:
-            item = {"entry_no": r["entry_no"], "text": r["note_text"], **_chain_marks(r)}  # the number stays: edit_entry/delete_entry need it
+            item = {"entry_no": r["entry_no"], "text": r["note_text"], **_score_marks(r, False), **_chain_marks(r)}  # the number stays: edit_entry/delete_entry need it
             if full:
-                item = {"entry_no": r["entry_no"], "author": r["author_name"] or "unknown", "created_at": r["created_at"], "text": r["note_text"], **_chain_marks(r)}
+                item = {"entry_no": r["entry_no"], "author": r["author_name"] or "unknown", "created_at": r["created_at"], "text": r["note_text"], **_score_marks(r, True), **_chain_marks(r)}
                 if r["edited_at"]:
                     item["edited_at"] = r["edited_at"]
             entries.append(item)
@@ -1066,6 +1188,8 @@ class Tools:
         }
         if full:
             out["started_by"] = result["started_by"] or "unknown"
+            out["hits"] = result["note"]["hits"]
+        await self._count_reads([result["note"]["note_name"]], [(result["note"]["note_name"], r["entry_no"]) for r in result["entries"]])
         if result["summary"]:
             sm = result["summary"]
             out["summary"] = {"text": sm["summary_text"], "stale": bool(sm["stale"])}
@@ -1322,6 +1446,11 @@ class Tools:
         full = _to_bool(verbose)
         shaped = [_shape_tagged(n, full) for n in notes]
         packed, left_out = pack_tagged(shaped, max(500, v.MAX_TAGGED_CHARS) - 300)  # 300: the reply's own keys and remarks
+        # packed is a prefix of notes, and each shows the newest few of its entries (see pack_tagged), so what was delivered is known
+        await self._count_reads(
+            [p["note_name"] for p in packed],
+            [(n["note_name"], e["entry_no"]) for n, p in zip(notes, packed) for e in n["entries"][: len(p["entries"])]],
+        )
         out: Dict[str, Any] = {"success": True, "notes": packed}
         if full:
             out.update({"tags": found, "match": mode, "notes_found": len(notes)})
@@ -1357,16 +1486,105 @@ class Tools:
             notes, entries = await asyncio.to_thread(search_notes_db, v.NOTES_DB_PATH, str(query).strip(), cap)
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
+        await self._count_reads([], [(r["note_name"], r["entry_no"]) for r in entries])
         return {
             "success": True,
             "matching_notes": [{"note_name": r["note_name"], "note_comment": r["note_comment"]} for r in notes],
             "matching_entries": [
-                {"note_name": r["note_name"], "entry_no": r["entry_no"], "text": r["note_text"], **_chain_marks(r)}
+                {"note_name": r["note_name"], "entry_no": r["entry_no"], "text": r["note_text"], **_score_marks(r, False), **_chain_marks(r)}
                 if not _to_bool(verbose)
-                else {"note_name": r["note_name"], "entry_no": r["entry_no"], "author": r["author_name"] or "unknown", "text": r["note_text"], **_chain_marks(r)}
+                else {"note_name": r["note_name"], "entry_no": r["entry_no"], "author": r["author_name"] or "unknown", "text": r["note_text"], **_score_marks(r, True), **_chain_marks(r)}
                 for r in entries
             ],
         }
+
+    async def _count_reads(self, note_names: List[str], entries: "List[tuple[str, int]]") -> None:
+        """Bump the popularity counters for what a call just returned. A failure here (say the database is locked) must never
+        spoil the read it was counting."""
+        try:
+            await asyncio.to_thread(record_hits_db, self.valves.NOTES_DB_PATH, note_names, entries)
+        except sqlite3.Error as e:
+            logger.warning("agent_notes: couldn't count reads: %s", e)
+
+    async def agent_notes_set_weight(self, name: str, entry_no: str, weight: Optional[str] = None, change: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Rate one entry. Every entry has a weight from 0 to 100 and starts at 50 (neutral). Lower it for an
+        entry you consider negative, unfavourable or unreliable; raise it for one you consider positive or
+        reliable. Give either weight (the new value) or change (an amount to add, such as 10 or -10, kept within 0-100).
+        This does not alter the entry's text.
+
+        :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
+        :param entry_no: The entry's number, as shown by agent_notes_read (e.g. 3 or "#3").
+        :param weight: The new weight, 0 to 100 (50 is neutral). Pass "" (or omit) to use change instead.
+        :param change: An amount to add to the current weight, e.g. 10 or -10. Pass "" (or omit) to use weight instead.
+        """
+        try:
+            number = _to_int(entry_no, None, "entry_no")
+            if number is None:
+                raise NoteError("entry_no is required - agent_notes_read shows each entry's number.")
+            new = _to_int(weight, None, "weight", minimum=WEIGHT_MIN)
+            delta = _to_int(change, None, "change", minimum=-WEIGHT_MAX)
+            result = await asyncio.to_thread(set_weight_db, self.valves.NOTES_DB_PATH, validate_name(name), number, new, delta)
+        except (ValueError, sqlite3.Error) as e:
+            return _error(e)
+        return {"success": True, **result}
+
+    async def agent_notes_reset_hits(self, name: str, entry_no: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Reset popularity counters to zero. Notes and entries count how often they are read; use this
+        when that history no longer means anything. With entry_no, only that entry's counter is reset;
+        without it, the note's counter and all of its entries' counters are. Weights and text are not touched.
+
+        :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
+        :param entry_no: One entry's number (e.g. 3 or "#3") to reset only that entry. Pass "" (or omit) to reset the whole note.
+        """
+        try:
+            number = _to_int(entry_no, None, "entry_no")
+            result = await asyncio.to_thread(reset_hits_db, self.valves.NOTES_DB_PATH, validate_name(name), number)
+        except (ValueError, sqlite3.Error) as e:
+            return _error(e)
+        return {"success": True, **result}
+
+    async def agent_notes_rank_entries(self, name: str, by: str, limit: Optional[str] = None, weight: Optional[str] = None, verbose: bool = False) -> Dict[str, Any]:
+        """
+        Pick out entries of one note by popularity or weight. by is one of:
+        "most_popular" (the most-read entries), "least_popular" (the least-read), "above_weight"
+        (entries weighted higher than the weight you give, highest first) or "below_weight"
+        (entries weighted lower than it, lowest first). Weight 50 is neutral, so above_weight with
+        weight 50 finds the entries someone rated positive and below_weight with 50 the negative ones.
+        Looking entries up here does not count as reading them.
+
+        :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
+        :param by: "most_popular", "least_popular", "above_weight" or "below_weight".
+        :param limit: How many entries to return, default 10. Pass "" (or omit) for the default.
+        :param weight: The weight W to compare against, 0 to 100; required for above_weight and below_weight, ignored otherwise. Pass "" (or omit) for the other two.
+        :param verbose: true to include authors and timestamps. Pass false (the normal choice) to get just the text, weight and read count.
+        """
+        v = self.valves
+        try:
+            mode = str(by or "").strip().lower().replace("-", "_").replace(" ", "_")
+            if mode not in RANK_MODES:
+                raise NoteError(f'by must be one of {", ".join(repr(m) for m in RANK_MODES)}, got {by!r}.')
+            level = _to_int(weight, None, "weight", minimum=WEIGHT_MIN)
+            if mode.endswith("_weight") and (level is None or level > WEIGHT_MAX):
+                raise NoteError(f"{mode} needs weight, a number from {WEIGHT_MIN} to {WEIGHT_MAX}.")
+            cap = min(_to_int(limit, 10, "limit"), v.MAX_SEARCH_RESULTS)
+            result = await asyncio.to_thread(rank_entries_db, v.NOTES_DB_PATH, validate_name(name), mode, cap, level if mode.endswith("_weight") else None)
+        except (ValueError, sqlite3.Error) as e:
+            return _error(e)
+        full = _to_bool(verbose)
+        entries = []
+        for r in result["entries"]:
+            item = {"entry_no": r["entry_no"], "text": r["note_text"], "weight": r["weight"], "hits": r["hits"], **_chain_marks(r)}
+            if full:
+                item.update({"author": r["author_name"] or "unknown", "created_at": r["created_at"]})
+            entries.append(item)
+        out: Dict[str, Any] = {"success": True, "note_name": result["note"]["note_name"], "by": mode, "total_matching": result["total"], "entries": entries}
+        if result["total"] > len(entries):
+            out["note"] = f"Showing {len(entries)} of {result['total']} matching entries; pass a larger limit (max {v.MAX_SEARCH_RESULTS}) for more."
+        elif not entries:
+            out["note"] = "No entries match."
+        return out
 
     async def agent_notes_update_summary(
         self, name: str, summary: str, author_name: Optional[str] = None, __model__: Optional[dict] = None

@@ -40,7 +40,7 @@ Current tools:
 
 - `agent_notes.py` → `agent_notes_list`, `agent_notes_read`, `agent_notes_create`, `agent_notes_append`, `agent_notes_edit_entry`,
   `agent_notes_delete_entry`, `agent_notes_update`, `agent_notes_delete`, `agent_notes_search`, `agent_notes_add_tags`, `agent_notes_remove_tag`, `agent_notes_list_tags`, `agent_notes_read_tagged`,
-  `agent_notes_rename_tag` (plus the summary methods) — a persistent notebook for agents,
+  `agent_notes_rename_tag`, `agent_notes_set_weight`, `agent_notes_reset_hits`, `agent_notes_rank_entries` (plus the summary methods) — a persistent notebook for agents,
   an easier-to-drive alternative to Open WebUI's built-in `note` tool. Unrelated to ComfyUI. A note
   is a name plus an append-only log of short numbered entries, in its **own** SQLite file
   (`agent_notes.sqlite3`, `NOTES_DB_PATH` valve — not the job database, though it defaults to the
@@ -246,6 +246,17 @@ entry is a small `{text, continues_*}` object instead of a bare string. The repl
 `entry_numbers`. The `MAX_CONTINUATION_ENTRIES` valve (default 6, about 3000 characters per call) caps the
 pieces; over it, nothing is saved. `notes_web.py` shows the links beside each entry.
 
+Popularity and weight (v1.9.0): `note_id.hits` and `note_data.hits` count reads; `note_data.weight` (0–100, default
+50, enforced by a `CHECK`) is a rating a model sets with `agent_notes_set_weight` — lower for entries it judges
+negative, higher for positive. A "read" is counted by `agent_notes_read` (the note, plus each entry returned),
+`agent_notes_read_tagged` (each note and entry actually delivered, after the size limit) and `agent_notes_search`
+(each matching entry; not the note). `agent_notes_rank_entries` and `notes_web.py` never count, so asking for the most
+popular entries doesn't make them more popular. A failed count is logged and never fails the read. Neither
+counter nor weight touches `updated_at`, so summaries don't go stale. Plain replies show an entry's `weight` only when it
+isn't 50; `verbose=true` adds `hits` and `weight` everywhere (and a Reads column in `agent_notes_list`). The web viewer
+shows each note's and entry's read count and weight and has reset buttons (per entry, and per note), no search yet.
+All three columns are added in place on first connect with defaults, so an older copy of the tool still works.
+
 `chain_id` is added in place on first connect (nullable, so an older copy of the tool can still write to the
 database; back it up first if it matters). v1.7.x briefly marked pieces with a trailing ` [continues at entry #N]`
 in the text; that upgrade converts such entries to chains and strips the marker.
@@ -272,6 +283,9 @@ summaries and bare entry-text strings. `verbose=true` restores the full detail.
 | `agent_notes_add_tags` | `name`, `tags` (one, or comma-separated) required; `create=true` to make a new tag that resembles existing ones. Refuses a new tag that looks like an existing one (returns the similar tags), reuses one that matches ignoring case/hyphens/plurals; nothing is saved if any tag is refused. Max 10 tags per note, 40 chars each. Punctuation is cleaned rather than refused (`&` becomes `and`, apostrophes dropped, other symbols become hyphens) and the reply lists the change under `adjusted` |
 | `agent_notes_remove_tag` | `name`, `tag` required. A tag no note carries any more is deleted |
 | `agent_notes_read_tagged` | `tags` required (one or comma-separated); `match` = `any` (default, best match first) or `all`. Returns each matching note's tags, summary and newest entries within the `MAX_TAGGED_CHARS` valve (default 6000 characters): whole strings only, headings for all notes first, then entries newest-first rotating across the notes so one long note can't starve the rest. Reports `entries_not_shown` per note and `notes_left_out` |
+| `agent_notes_set_weight` | `name`, `entry_no` required, plus exactly one of `weight` (0–100) or `change` (signed amount, e.g. `-10`, clamped to 0–100). Doesn't alter text or `updated_at` |
+| `agent_notes_reset_hits` | `name` required; `entry_no` resets just that entry's read count, otherwise the note's count and all its entries' |
+| `agent_notes_rank_entries` | `name`, `by` required: `most_popular`, `least_popular`, `above_weight` or `below_weight` (the last two need `weight`; strict comparison, so `above_weight 50` = rated positive). `limit` (default `10`, capped by `MAX_SEARCH_RESULTS`). Ties go to the newest entry. Returns `weight` and `hits` with each entry and `total_matching`. Does not count as a read |
 | `agent_notes_list_tags` | optional `query`. Tags in use with note counts. `agent_notes_list` also takes `tag=` to filter, shows a Tags column and lists the tags in use |
 | `agent_notes_rename_tag` | `tag`, `new_tag` required; merges into `new_tag` if it already exists |
 
