@@ -168,7 +168,7 @@ def render_note(db: str, name: str) -> str:
             f"<div class='entry'><span class='muted'>Summary by {e(sm['author_name'] or 'unknown')} &middot; "
             f"{e(when(sm['last_summarized']))}{flag}</span><pre>{e(sm['summary_text'])}</pre></div>"
         )
-    for r in entries:
+    for r in reversed(entries):  # read_note_db returns oldest first; the page shows the newest on top
         edited = f" &middot; edited {e(when(r['edited_at']))}" if r["edited_at"] else ""
         body += (
             f"<div class='entry' id='e{r['entry_no']}'><span class='muted'>#{r['entry_no']} &middot; {e(r['author_name'] or 'unknown')} &middot; {e(when(r['created_at']))}{edited}{links(r)}</span>"

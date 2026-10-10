@@ -49,6 +49,14 @@ class HandlerTests(unittest.TestCase):
         _, _, body = self.get("/note", name="Ideas")
         self.assertNotIn("<pre>first</pre>", body)
 
+    def test_note_page_shows_newest_entries_first(self):
+        self.post("/create", name="Ideas", text="oldest")
+        self.post("/append", name="Ideas", text="middle")
+        self.post("/append", name="Ideas", text="newest")
+        _, _, body = self.get("/note", name="Ideas")
+        self.assertLess(body.index("<pre>newest</pre>"), body.index("<pre>middle</pre>"))
+        self.assertLess(body.index("<pre>middle</pre>"), body.index("<pre>oldest</pre>"))
+
     def test_rename_and_comment_then_delete_note(self):
         self.post("/create", name="a", text="x")
         status, headers, _ = self.post("/update", name="a", new_name="b", comment="hello")
