@@ -24,8 +24,9 @@ class FakeResponse:
 class FakeOWUI:
     """One simulated Open WebUI server: model presets, backing chats, and a scripted agent."""
 
-    def __init__(self, replies, tool_ids=("agent_notes",), fail_new_chat=False, never_done=False):
+    def __init__(self, replies, tool_ids=("agent_notes",), fail_new_chat=False, never_done=False, outputs=None):
         self.replies = list(replies)  # one scripted reply per turn
+        self.outputs = list(outputs or [])  # optional tool-call `output` per turn (same order as replies)
         self.tool_ids = list(tool_ids)
         self.fail_new_chat = fail_new_chat
         self.never_done = never_done
@@ -41,6 +42,8 @@ class FakeOWUI:
             chat = self.chats[path.rsplit("/", 1)[1]]
             reply = None if self.never_done else self.replies[chat["turn"]]
             msg = {"content": reply or "", "done": reply is not None}
+            if chat["turn"] < len(self.outputs):
+                msg["output"] = self.outputs[chat["turn"]]
             return FakeResponse(200, {"chat": {"history": {"messages": {chat["asst_id"]: msg}}}})
         return FakeResponse(404)
 
@@ -100,10 +103,10 @@ def make_pipe(**overrides):
     return pipe
 
 
-def run_pipe(pipe, messages, router):
+def run_pipe(pipe, messages, router, chat_id=None):
     async def go():
         with patch.object(mod, "requests", router):
-            gen = await pipe.pipe({"messages": messages})
+            gen = await pipe.pipe({"messages": messages}, __metadata__={"chat_id": chat_id} if chat_id else None)
             return "".join([chunk async for chunk in gen])
 
     return asyncio.run(go())
@@ -169,6 +172,91 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(mod.split_end_marker("[PASS]", "[PASS]"), ("", True))
         self.assertEqual(mod.split_end_marker("ok [PASS]", "[PASS]"), ("ok", True))
         self.assertEqual(mod.split_end_marker("ok", "[PASS]"), ("ok", False))
+
+
+def tool_output(name, args, text, call_id="call-1"):
+    """A saved message's `output`, in the shape Open WebUI stores tool calls."""
+    return [
+        {"type": "reasoning", "id": "r1"},
+        {"type": "function_call", "id": call_id, "call_id": call_id, "name": name, "arguments": args, "status": "completed"},
+        {"type": "function_call_output", "id": "fco-" + call_id, "call_id": call_id, "output": [{"type": "input_text", "text": text}], "status": "completed"},
+        {"type": "message", "id": "m1", "role": "assistant", "content": []},
+    ]
+
+
+class CarryTests(unittest.TestCase):
+    def test_extract_keeps_only_wanted_tools_and_pairs_by_call_id(self):
+        out = tool_output("agent_notes_read_tagged", '{"tags":"x"}', "PERSONA", "c1") + tool_output("get_current_timestamp", "{}", "12:00", "c2")
+        got = mod.extract_carry(out, ["agent_notes_read_tagged"])
+        self.assertEqual(got, [{"name": "agent_notes_read_tagged", "arguments": '{"tags":"x"}', "text": "PERSONA"}])
+        self.assertEqual(mod.extract_carry(None, ["agent_notes_read_tagged"]), [])
+        self.assertEqual(mod.extract_carry([{"type": "function_call_output", "call_id": "nope", "output": []}], ["a"]), [])
+
+    def test_format_is_stable_and_empty_when_nothing(self):
+        items = [{"name": "t", "arguments": "{}", "text": "BODY"}]
+        self.assertEqual(mod.format_carry(items), mod.format_carry(list(items)))
+        self.assertIn("BODY", mod.format_carry(items))
+        self.assertEqual(mod.format_carry([]), "")
+
+    def test_carried_block_goes_into_system_message_only(self):
+        msgs = mod.build_messages("Mara", "Hannah", "Gordon", [{"speaker": "Gordon", "text": "q"}], "[PASS]", "CARRIED-BLOCK")
+        self.assertEqual([m["role"] for m in msgs], ["system", "user"])
+        self.assertIn("CARRIED-BLOCK", msgs[0]["content"])
+        self.assertNotIn("CARRIED-BLOCK", mod.build_messages("Mara", "Hannah", "Gordon", [{"speaker": "Gordon", "text": "q"}], "[PASS]")[0]["content"])
+
+    def _pair(self, **kw):
+        persona = tool_output("agent_notes_read_tagged", '{"tags":"mara-core"}', "MARA-PERSONA-TEXT") + tool_output("get_current_timestamp", "{}", "NOW-TEXT", "c9")
+        mara = FakeOWUI(["m1", "m2", "m3"], outputs=[persona], **kw)
+        hannah = FakeOWUI(["h1", "h2", "h3"])
+        return mara, hannah
+
+    def test_second_turn_of_same_agent_gets_first_turns_results(self):
+        mara, hannah = self._pair()
+        run_pipe(make_pipe(MAX_TURNS=4), [{"role": "user", "content": "hi"}], Router(**{MARA: mara, HANNAH: hannah}), chat_id="front1")
+        first = mara.completions[0]["messages"][0]["content"]
+        second = mara.completions[1]["messages"][0]["content"]
+        self.assertNotIn("MARA-PERSONA-TEXT", first)
+        self.assertIn("MARA-PERSONA-TEXT", second)
+        self.assertNotIn("NOW-TEXT", second)  # timestamps are redone every turn, not carried
+        self.assertNotIn("MARA-PERSONA-TEXT", hannah.completions[0]["messages"][0]["content"])
+        self.assertNotIn("MARA-PERSONA-TEXT", hannah.completions[1]["messages"][0]["content"])
+
+    def test_carried_text_is_identical_every_turn(self):
+        mara, hannah = self._pair()
+        run_pipe(make_pipe(MAX_TURNS=6), [{"role": "user", "content": "hi"}], Router(**{MARA: mara, HANNAH: hannah}), chat_id="front1")
+        self.assertEqual(mara.completions[1]["messages"][0], mara.completions[2]["messages"][0])
+
+    def test_results_survive_to_the_next_human_message_in_the_same_chat_only(self):
+        pipe = make_pipe(MAX_TURNS=1)
+        mara, hannah = self._pair()
+        router = Router(**{MARA: mara, HANNAH: hannah})
+        run_pipe(pipe, [{"role": "user", "content": "hi"}], router, chat_id="front1")
+        history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "\n\n**Mara:** m1\n\n"}, {"role": "user", "content": "again"}]
+        run_pipe(pipe, history, router, chat_id="front1")
+        self.assertIn("MARA-PERSONA-TEXT", mara.completions[1]["messages"][0]["content"])
+        run_pipe(pipe, history, router, chat_id="another-chat")
+        self.assertNotIn("MARA-PERSONA-TEXT", mara.completions[2]["messages"][0]["content"])
+
+    def test_off_over_cap_and_ttl_do_not_carry(self):
+        for overrides in ({"CARRY_CONTEXT": False}, {"CARRY_MAX_CHARS": 10}):
+            mara, hannah = self._pair()
+            run_pipe(make_pipe(MAX_TURNS=4, **overrides), [{"role": "user", "content": "hi"}], Router(**{MARA: mara, HANNAH: hannah}), chat_id="c")
+            self.assertNotIn("MARA-PERSONA-TEXT", mara.completions[1]["messages"][0]["content"], overrides)
+        pipe = make_pipe(MAX_TURNS=1, CARRY_TTL_MINUTES=0)
+        pipe._carry_put(("c", "Mara"), "BLOCK")
+        self.assertEqual(pipe._carry_get(("c", "Mara")), "")
+
+    def test_nothing_carried_means_it_tries_again_next_turn(self):
+        mara = FakeOWUI(["m1", "m2", "m3"], outputs=[[], tool_output("agent_notes_read_tagged", "{}", "LATE-PERSONA")])
+        run_pipe(make_pipe(MAX_TURNS=6), [{"role": "user", "content": "hi"}], Router(**{MARA: mara, HANNAH: FakeOWUI(["h1", "h2", "h3"])}), chat_id="c")
+        self.assertNotIn("LATE-PERSONA", mara.completions[1]["messages"][0]["content"])  # her first turn loaded nothing, so nothing to show yet
+        self.assertIn("LATE-PERSONA", mara.completions[2]["messages"][0]["content"])  # caught on the second try and carried from then on
+
+    def test_cache_is_bounded(self):
+        pipe = make_pipe()
+        for i in range(60):
+            pipe._carry_put((f"c{i}", "Mara"), "B")
+        self.assertLessEqual(len(pipe._carry), 50)
 
 
 class PipeTests(unittest.TestCase):

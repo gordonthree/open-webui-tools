@@ -1,12 +1,17 @@
 """
 title: Agent Duo
 author: Gordon
-version: 1.0.0
+version: 1.1.0
 description: A Pipe that puts two agents, each living on its own Open WebUI server, into one chat with
     the human. It shows up as a model ("Mara + Hannah"). Each message you send starts a bounded round of
     alternating turns: the pipe asks one agent, then the other, through that agent's own server, so each
     keeps her own persona, tools (agent_notes etc.) and knowledge. Both replies stream into this chat under
     a bold speaker label. An agent can hand the floor back by replying with just the END_MARKER.
+
+    Carry-forward (v1.1.0): every turn is a fresh call, so tool results from an agent's session-start
+    protocol would be lost after her first turn. The pipe keeps those results (CARRY_TOOLS, default
+    agent_notes_read_tagged) and shows them to her again, unchanged, at the front of her later turns, so
+    she doesn't reload her persona every turn and a local model can reuse its cached prompt prefix.
 """
 
 import asyncio
@@ -76,7 +81,7 @@ def parse_history(messages: List[dict], agent_names: List[str], user_name: str) 
     return turns
 
 
-def build_messages(me: str, other: str, user_name: str, turns: List[dict], end_marker: str) -> List[dict]:
+def build_messages(me: str, other: str, user_name: str, turns: List[dict], end_marker: str, carried: str = "") -> List[dict]:
     """The message list one agent is shown: its own turns as `assistant`, everyone else's as `user`
     (labelled `[Name]: ...`), consecutive same-role messages merged, led by a short turn-taking note."""
     system = (
@@ -86,6 +91,8 @@ def build_messages(me: str, other: str, user_name: str, turns: List[dict], end_m
         f"conversational, and use your tools and memory as you normally would. If you have nothing to add and "
         f"want to hand the floor back to {user_name}, reply with exactly {end_marker} and nothing else."
     )
+    if carried:
+        system += "\n\n" + carried
     out: List[dict] = [{"role": "system", "content": system}]
     for turn in turns:
         if turn["speaker"] == me:
@@ -113,6 +120,38 @@ def split_end_marker(reply: str, end_marker: str) -> "tuple[str, bool]":
     if end_marker and end_marker in reply:
         return reply.replace(end_marker, "").strip(), True
     return reply.strip(), False
+
+
+def extract_carry(output: Any, carry_tools: List[str]) -> List[dict]:
+    """The tool calls (name, arguments, result text) in a finished message's `output` whose tool is in
+    `carry_tools`. Open WebUI links each result to its call by call_id."""
+    calls: Dict[str, dict] = {}
+    found: List[dict] = []
+    for item in output if isinstance(output, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "function_call":
+            calls[item.get("call_id") or item.get("id") or ""] = item
+        elif item.get("type") == "function_call_output":
+            call = calls.get(item.get("call_id") or "")
+            if not call or call.get("name") not in carry_tools:
+                continue
+            parts = item.get("output")
+            text = "\n".join(p.get("text", "") for p in parts if isinstance(p, dict)) if isinstance(parts, list) else str(parts or "")
+            if text.strip():
+                found.append({"name": call.get("name"), "arguments": call.get("arguments") or "", "text": text.strip()})
+    return found
+
+
+def format_carry(items: List[dict]) -> str:
+    """The text block shown to an agent for results she already has. Kept byte-for-byte stable between turns
+    so a local model server can reuse its cached prompt prefix."""
+    if not items:
+        return ""
+    lines = ["Already loaded earlier in this conversation (do not call these tools again just to reload them):"]
+    for it in items:
+        lines.append(f"\n### {it['name']}({it['arguments']}) returned:\n{it['text']}")
+    return "\n".join(lines)
 
 
 class AgentError(Exception):
@@ -196,10 +235,30 @@ class Pipe:
         END_MARKER: str = Field(default="[PASS]", description="Reply an agent uses to hand the floor back to the human.")
         TURN_TIMEOUT_SECONDS: int = Field(default=300, description="Give up on one agent turn after this long.")
         POLL_SECONDS: float = Field(default=2.0, description="How often to check whether a turn has finished.")
+        CARRY_CONTEXT: bool = Field(default=True, description="Keep each agent's session-start tool results and show them to her again on her later turns (this chat), so she doesn't reload them every turn.")
+        CARRY_TOOLS: str = Field(default="agent_notes_read_tagged", description="Comma-separated tool names whose results are carried (the persona/memory loaders). Other tool results, like timestamps, are redone each turn.")
+        CARRY_MAX_CHARS: int = Field(default=80000, description="Don't carry more than this many characters per agent; over it, she reloads each turn instead.")
+        CARRY_TTL_MINUTES: int = Field(default=240, description="Forget a chat's carried results after this long without use (also lost if the server restarts; she then reloads once).")
         KEEP_BACKING_CHATS: bool = Field(default=False, description="Keep each turn's throwaway chat on the agent's server (titled '[agent_duo] ...') instead of deleting it; handy for seeing tool calls.")
 
     def __init__(self):
         self.valves = self.Valves()
+        self._carry: Dict[tuple, dict] = {}  # (front chat id, agent name) -> {"block": str, "at": monotonic seconds}
+
+    def _carry_get(self, key: tuple) -> str:
+        entry = self._carry.get(key)
+        if not entry:
+            return ""
+        if time.monotonic() - entry["at"] > self.valves.CARRY_TTL_MINUTES * 60:
+            del self._carry[key]
+            return ""
+        entry["at"] = time.monotonic()
+        return entry["block"]
+
+    def _carry_put(self, key: tuple, block: str) -> None:
+        self._carry[key] = {"block": block, "at": time.monotonic()}
+        while len(self._carry) > 50:  # bounded: drop the least recently used
+            del self._carry[min(self._carry, key=lambda k: self._carry[k]["at"])]
 
     def pipes(self) -> List[dict]:
         return [{"id": "agent_duo", "name": f"{self.valves.MARA_NAME} + {self.valves.HANNAH_NAME}"}]
@@ -211,8 +270,8 @@ class Pipe:
             {"name": v.HANNAH_NAME, "url": v.HANNAH_URL.rstrip("/"), "key": v.HANNAH_KEY, "model": v.HANNAH_MODEL_ID, "tools": v.HANNAH_TOOL_IDS},
         ]
 
-    async def _run_turn(self, agent: dict, messages: List[dict]) -> str:
-        """One agent turn on her own server; returns her reply text. Raises AgentError."""
+    async def _run_turn(self, agent: dict, messages: List[dict]) -> "tuple[str, list]":
+        """One agent turn on her own server; returns (her reply text, the message's tool-call `output`). Raises AgentError."""
         v = self.valves
         url, key, model = agent["url"], agent["key"], agent["model"]
         if is_unset(key) or is_unset(url) or is_unset(model):
@@ -235,7 +294,7 @@ class Pipe:
                     err = msg["error"]
                     raise AgentError(str(err.get("content") if isinstance(err, dict) else err)[:300])
                 if msg.get("done"):
-                    return strip_details(msg.get("content") or "")
+                    return strip_details(msg.get("content") or ""), msg.get("output") or []
                 if time.monotonic() > deadline:
                     raise AgentError(f"no reply within {v.TURN_TIMEOUT_SECONDS} seconds")
         except requests.RequestException as ex:
@@ -250,6 +309,7 @@ class Pipe:
         __user__: Optional[dict] = None,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
         __task__: Optional[str] = None,
+        __metadata__: Optional[dict] = None,
     ):
         # Open WebUI also calls the selected model for titles, tags and follow-ups; answer those
         # cheaply instead of waking both agents.
@@ -260,10 +320,12 @@ class Pipe:
                 "follow_up_generation": json.dumps({"follow_ups": []}),
             }
             return canned.get(str(__task__), "")
-        return self._converse(body, __event_emitter__)
+        chat_id = str((__metadata__ or {}).get("chat_id") or body.get("chat_id") or "") or f"round-{uuid.uuid4()}"
+        return self._converse(body, __event_emitter__, chat_id)
 
-    async def _converse(self, body: dict, __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None):
+    async def _converse(self, body: dict, __event_emitter__: Optional[Callable[[dict], Awaitable[None]]], chat_id: str):
         v = self.valves
+        carry_tools = [t.strip() for t in v.CARRY_TOOLS.split(",") if t.strip()]
         agents = self._agents()
         names = [a["name"] for a in agents]
         by_name = {a["name"]: a for a in agents}
@@ -282,11 +344,17 @@ class Pipe:
             agent = by_name[speaker]
             other = names[1] if speaker == names[0] else names[0]
             await status(f"{speaker} is thinking... (turn {n + 1} of {v.MAX_TURNS})")
+            key = (chat_id, speaker)
+            carried = self._carry_get(key) if v.CARRY_CONTEXT else ""
             try:
-                reply = await self._run_turn(agent, build_messages(speaker, other, v.USER_NAME, turns, v.END_MARKER))
+                reply, output = await self._run_turn(agent, build_messages(speaker, other, v.USER_NAME, turns, v.END_MARKER, carried))
             except AgentError as ex:
                 yield f"\n\n*{speaker} couldn't answer: {ex}*\n\n"
                 break
+            if v.CARRY_CONTEXT and not carried:  # her first turn here (or the cache was lost): keep what she just loaded
+                block = format_carry(extract_carry(output, carry_tools))
+                if block and len(block) <= v.CARRY_MAX_CHARS:
+                    self._carry_put(key, block)
             text, yielded = split_end_marker(reply, v.END_MARKER)
             if text:
                 yield f"\n\n**{speaker}:** {text}\n\n"

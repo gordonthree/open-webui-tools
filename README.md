@@ -364,7 +364,21 @@ in the chat as an italic note and ends the round.
 | `MARA_TOOL_IDS` / `HANNAH_TOOL_IDS` | Comma-separated override; blank reads the preset's own `toolIds` |
 | `MARA_NAME` / `HANNAH_NAME` / `USER_NAME` | Speaker labels (default Mara, Hannah, Gordon) |
 | `MAX_TURNS` (4), `FIRST_SPEAKER`, `END_MARKER`, `TURN_TIMEOUT_SECONDS` (300), `POLL_SECONDS` (2) | Round controls |
+| `CARRY_CONTEXT` (on), `CARRY_TOOLS` (`agent_notes_read_tagged`), `CARRY_MAX_CHARS` (80000), `CARRY_TTL_MINUTES` (240) | Carry-forward, below |
 | `KEEP_BACKING_CHATS` | Leave each turn's throwaway chat in place (to inspect tool calls) instead of deleting it |
+
+**Carry-forward (v1.1.0).** Every turn is a fresh call that sees only the *text* of earlier turns, so an agent's
+session-start reads (her persona and memories) would be lost after her first turn and reloaded every turn - far
+too heavy for a local model (a measured Mara startup read was ~20k tokens, ~157k processed over one reply's tool
+round trips). So after an agent's first turn in a chat, the pipe takes the results of the tools in `CARRY_TOOLS`
+from that turn's saved `output` (pairing each result with its call by `call_id`) and puts them, unchanged, at the
+end of her system note on her later turns, headed "Already loaded earlier in this conversation". Her own "skip if
+already visible" rule then holds. Tools not in `CARRY_TOOLS` (timestamps) are redone each turn. The block is
+byte-identical every turn and sits before the changing transcript, so a model server that caches the prompt
+prefix (Ollama normally does - *not yet verified here*) only has to process the new part. Results are kept in the
+pipe's memory per front chat and agent: gone after `CARRY_TTL_MINUTES` idle or a server restart (the agent then
+reloads once and it is caught again), at most 50 chats, and not carried at all if over `CARRY_MAX_CHARS`. The
+persona is still in her context on every turn; this removes the repeated reads, not the 20k tokens.
 
 Caveats: a turn takes as long as the model does (two turns measured about 73 s); a stopped chat stops waiting but
 the remote agent may finish its turn; images and files in the human's message aren't forwarded to the agents.
@@ -617,6 +631,12 @@ full tools/RAG on both sides. The bare completions API doesn't run tools, so eac
 agent's own server (spike-verified on `hannah-long`). 17 tests in `src/test_agent_duo.py`; a live two-turn run of the
 pipe against both real servers worked. `push_tool.py` now also pushes Functions (`agent_duo`), not part of `all`.
 **Not deployed:** the Function has to be created once in OWUI by hand and its valves (API keys) filled in.
+
+Later the same day: `agent_duo.py` v1.1.0 adds carry-forward (see the valve table above). Findings from testing with the
+project owner: the agents' session-start rules must name the tag tool outright (`agent_notes_read_tagged`; "search
+agent_notes" doesn't map to it), `agent_notes_read_tagged` has no paging and its `MAX_TAGGED_CHARS` cap (6000
+default) truncated Hannah's persona to summaries plus 4 entries until raised (41,000 characters then returned all
+73 entries), and `verbose=true` on that read adds timestamps/hits/weights. 26 tests in `test_agent_duo.py`.
 
 ### 2026-10-02
 `agent_notes.py` v1.5.0: every tool method now carries an `agent_notes_` prefix (`agent_notes_list`,
