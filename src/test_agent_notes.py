@@ -489,6 +489,32 @@ class ListAndSearchTests(NotesTestCase):
         self.run_async(self.tool.agent_notes_read("n"))
         self.assertIn("| Reads |", self.run_async(self.tool.agent_notes_list(verbose=True))["table"])
 
+    def test_create_append_and_edit_can_set_the_weight(self):
+        made = self.run_async(self.tool.agent_notes_create("n", "one", weight="80"))
+        self.assertEqual(made["weight"], 80)
+        self.run_async(self.tool.agent_notes_append("n", "two"))  # no weight: neutral
+        self.assertEqual(self.run_async(self.tool.agent_notes_append("n", "three", weight=" 10 "))["weight"], 10)
+        self.run_async(self.tool.agent_notes_append("n", "word " * 300, continues=True, weight="30"))  # 3 pieces
+        self.assertEqual([r[0] for r in self.sql("SELECT weight FROM note_data ORDER BY entry_no")], [80, 50, 10, 30, 30, 30])
+        out = self.run_async(self.tool.agent_notes_edit_entry("n", "2", "two, revised", weight="95"))
+        self.assertEqual(out["weight"], 95)
+        self.run_async(self.tool.agent_notes_edit_entry("n", "2", "two, again"))  # no weight: kept
+        self.run_async(self.tool.agent_notes_edit_entry("n", "2", "two, again", weight=""))
+        self.assertEqual(self.sql("SELECT weight, note_text FROM note_data WHERE entry_no = 2"), [(95, "two, again")])
+
+    def test_bad_weight_on_write_saves_nothing(self):
+        self.create("n", "one")
+        for call in (
+            lambda: self.tool.agent_notes_append("n", "x", weight="101"),
+            lambda: self.tool.agent_notes_append("n", "x", weight="-5"),
+            lambda: self.tool.agent_notes_append("n", "x", weight="heavy"),
+            lambda: self.tool.agent_notes_create("m", "x", weight="500"),
+            lambda: self.tool.agent_notes_edit_entry("n", "1", "changed", weight="101"),
+        ):
+            self.assertFalse(self.run_async(call())["success"])
+        self.assertEqual(self.sql("SELECT note_text, weight FROM note_data"), [("one", 50)])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM note_id")[0][0], 1)
+
     def test_deleting_or_editing_a_piece_keeps_the_chain_consistent(self):
         self.run_async(self.tool.agent_notes_create("n", "word " * 400, continues=True))  # entries 1-4
         self.run_async(self.tool.agent_notes_delete_entry("n", "2"))

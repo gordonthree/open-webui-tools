@@ -270,9 +270,9 @@ summaries and bare entry-text strings. `verbose=true` restores the full detail.
 |---|---|
 | `agent_notes_list` | `limit` (default `20`, capped by `MAX_LIST_RESULTS`); `needs_summary=true` lists only notes with no summary or a stale one, skipping notes under the `MIN_SUMMARY_CHARS` valve (default 1000 characters of entry text). The table has a Summary column: none/current/stale/short (short = too small to need one) |
 | `agent_notes_read` | `name` (required); `limit` — most recent N entries, default/max `MAX_READ_ENTRIES` |
-| `agent_notes_create` | `name`, `text` (first entry) required; `comment` optional; `continues=true` saves a text over 500 characters verbatim as several consecutive entries. Refuses if the name already exists — use `agent_notes_append` |
-| `agent_notes_append` | `name`, `text` required; `continues=true` as for create |
-| `agent_notes_edit_entry` | `name`, `entry_no` (e.g. `3` or `"#3"`), `text` — all required |
+| `agent_notes_create` | `name`, `text` (first entry) required; `comment` optional; `weight` (0–100, default 50) rates the entry; `continues=true` saves a text over 500 characters verbatim as several consecutive entries. Refuses if the name already exists — use `agent_notes_append` |
+| `agent_notes_append` | `name`, `text` required; `continues=true` and `weight` as for create (every piece of a long text gets the weight) |
+| `agent_notes_edit_entry` | `name`, `entry_no` (e.g. `3` or `"#3"`), `text` — all required; `weight` optional (omitted = keep the current one) |
 | `agent_notes_delete_entry` | `name`, `entry_no` — both required. Other entries keep their numbers; numbers are never reused |
 | `agent_notes_update` | `name` required; any of `new_name`, `comment`, `clear_comment=true` (an empty `comment` means "unchanged", so clearing needs the flag), or `author_name` (re-attributes the note's starter, not its entries; alone it leaves `updated_at` alone so summaries stay current) |
 | `agent_notes_delete` | `name` required. Removes the note and all its entries, no confirmation |

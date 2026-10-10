@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.9.0
+version: 1.9.1
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -367,6 +367,14 @@ def validate_timestamp(value: Any) -> Optional[str]:
     return moment.isoformat()
 
 
+def validate_weight(value: Any) -> Optional[int]:
+    """The weight a caller gave (0-100), or None when it was left out."""
+    number = _to_int(value, None, "weight", minimum=WEIGHT_MIN)
+    if number is not None and number > WEIGHT_MAX:
+        raise NoteError(f"weight must be between {WEIGHT_MIN} and {WEIGHT_MAX}, got {number}.")
+    return number
+
+
 def validate_comment(comment: Any) -> str:
     cleaned = "" if is_unset(comment) else str(comment).strip()
     if len(cleaned) > NOTE_COMMENT_MAX:
@@ -480,7 +488,7 @@ def _score_marks(row: Any, verbose: bool) -> Dict[str, Any]:
     return {} if row["weight"] == DEFAULT_WEIGHT else {"weight": row["weight"]}
 
 
-def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: str, author: str, created_at: Optional[str] = None) -> Dict[str, Any]:
+def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: str, author: str, created_at: Optional[str] = None, weight: Optional[int] = None) -> Dict[str, Any]:
     conn = notes_db_connect(db_path)
     try:
         now = created_at or _now_iso()  # the note's and first entry's time; the new author row always gets the real time
@@ -503,12 +511,12 @@ def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: st
                     (name, comment, len(parts) + 1, now, now, author_id),
                 )
                 conn.executemany(
-                    "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id, chain_id) VALUES (?, ?, ?, ?, ?, ?)",
-                    [(cur.lastrowid, i, part, now, author_id, 1 if len(parts) > 1 else None) for i, part in enumerate(parts, 1)],
+                    "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id, chain_id, weight) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [(cur.lastrowid, i, part, now, author_id, 1 if len(parts) > 1 else None, DEFAULT_WEIGHT if weight is None else weight) for i, part in enumerate(parts, 1)],
                 )
         except sqlite3.IntegrityError:  # lost a race with another writer creating the same name
             raise _name_taken_error(name)
-        return {"note_name": name, **_entry_numbers(1, len(parts)), "created_at": now, "author": author}
+        return {"note_name": name, **_entry_numbers(1, len(parts)), "created_at": now, "author": author, **({"weight": weight} if weight is not None else {})}
     finally:
         conn.close()
 
@@ -517,7 +525,7 @@ def _entry_numbers(first: int, count: int) -> Dict[str, Any]:
     return {"entry_no": first} if count == 1 else {"entry_no": first, "entries_saved": count, "entry_numbers": f"{first}-{first + count - 1}"}
 
 
-def append_entry_db(db_path: str, name: str, text: "str | List[str]", author: str, created_at: Optional[str] = None) -> Dict[str, Any]:
+def append_entry_db(db_path: str, name: str, text: "str | List[str]", author: str, created_at: Optional[str] = None, weight: Optional[int] = None) -> Dict[str, Any]:
     conn = notes_db_connect(db_path)
     try:
         with _write_txn(conn):
@@ -527,14 +535,14 @@ def append_entry_db(db_path: str, name: str, text: "str | List[str]", author: st
             parts = [text] if isinstance(text, str) else list(text)
             author_id = _author_id(conn, author, _now_iso())
             conn.executemany(
-                "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id, chain_id) VALUES (?, ?, ?, ?, ?, ?)",
-                [(note["note_pk"], entry_no + i, part, now, author_id, entry_no if len(parts) > 1 else None) for i, part in enumerate(parts)],
+                "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id, chain_id, weight) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(note["note_pk"], entry_no + i, part, now, author_id, entry_no if len(parts) > 1 else None, DEFAULT_WEIGHT if weight is None else weight) for i, part in enumerate(parts)],
             )
             # a backdated entry never moves the note's last-updated time backwards
             conn.execute(
                 "UPDATE note_id SET next_entry_no = ?, updated_at = max(updated_at, ?) WHERE note_pk = ?", (entry_no + len(parts), now, note["note_pk"])
             )
-        return {"note_name": note["note_name"], **_entry_numbers(entry_no, len(parts)), "created_at": now, "author": author}
+        return {"note_name": note["note_name"], **_entry_numbers(entry_no, len(parts)), "created_at": now, "author": author, **({"weight": weight} if weight is not None else {})}
     finally:
         conn.close()
 
@@ -759,7 +767,8 @@ def rank_entries_db(db_path: str, name: str, by: str, limit: int, weight: Option
         conn.close()
 
 
-def edit_entry_db(db_path: str, name: str, entry_no: str, text: str) -> Dict[str, Any]:
+def edit_entry_db(db_path: str, name: str, entry_no: str, text: str, weight: Optional[int] = None) -> Dict[str, Any]:
+    """Replace an entry's text; with weight, also re-rate it (otherwise its weight is kept)."""
     conn = notes_db_connect(db_path)
     try:
         with _write_txn(conn):
@@ -767,8 +776,10 @@ def edit_entry_db(db_path: str, name: str, entry_no: str, text: str) -> Dict[str
             _get_entry(conn, note, entry_no)
             now = _now_iso()
             conn.execute("UPDATE note_data SET note_text = ?, edited_at = ? WHERE note_pk = ? AND entry_no = ?", (text, now, note["note_pk"], entry_no))
+            if weight is not None:
+                conn.execute("UPDATE note_data SET weight = ? WHERE note_pk = ? AND entry_no = ?", (weight, note["note_pk"], entry_no))
             conn.execute("UPDATE note_id SET updated_at = ? WHERE note_pk = ?", (now, note["note_pk"]))
-        return {"note_name": note["note_name"], "entry_no": entry_no, "edited_at": now}
+        return {"note_name": note["note_name"], "entry_no": entry_no, "edited_at": now, **({"weight": weight} if weight is not None else {})}
     finally:
         conn.close()
 
@@ -1204,7 +1215,7 @@ class Tools:
 
     async def agent_notes_create(
         self, name: str, text: str, comment: Optional[str] = None, author_name: Optional[str] = None,
-        created_at: Optional[str] = None, continues: bool = False, __model__: Optional[dict] = None
+        created_at: Optional[str] = None, continues: bool = False, weight: Optional[str] = None, __model__: Optional[dict] = None
     ) -> Dict[str, Any]:
         """
         Start a brand-new note with its first entry. Names are unique (ignoring case): if a note
@@ -1220,6 +1231,7 @@ class Tools:
         :param author_name: Who is writing this, at most 60 characters. Pass "" (or omit) to be recorded under your model's name.
         :param created_at: Only when copying in an older note: when it was originally written, as ISO 8601 (2026-03-01T14:30:00Z, or just 2026-03-01) or a Unix epoch number. Pass "" (or omit) for the current time, which is right for anything new.
         :param continues: Pass true when text is longer than 500 characters and must be kept verbatim: the tool saves it, unchanged, as several consecutive entries, linked together (the reply gives their numbers, and agent_notes_read then shows continues_at on each piece that carries on). Pass false (the normal choice) otherwise.
+        :param weight: Optional rating of the entry, 0 to 100, where 50 (the default) is neutral: lower for something negative or unreliable, higher for something positive or reliable. Pass "" (or omit) for 50. agent_notes_set_weight changes it later.
         """
         try:
             result = await asyncio.to_thread(
@@ -1230,13 +1242,14 @@ class Tools:
                 validate_comment(comment),
                 resolve_author(author_name, __model__),
                 validate_timestamp(created_at),
+                validate_weight(weight),
             )
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
         return {"success": True, **result, "note": "Created. Use agent_notes_append to add more entries."}
 
     async def agent_notes_append(
-        self, name: str, text: str, author_name: Optional[str] = None, created_at: Optional[str] = None, continues: bool = False, __model__: Optional[dict] = None
+        self, name: str, text: str, author_name: Optional[str] = None, created_at: Optional[str] = None, continues: bool = False, weight: Optional[str] = None, __model__: Optional[dict] = None
     ) -> Dict[str, Any]:
         """
         Add a new entry to the end of an existing note. This never changes earlier entries - use
@@ -1252,6 +1265,7 @@ class Tools:
         :param author_name: Who is writing this, at most 60 characters. Pass "" (or omit) to be recorded under your model's name.
         :param created_at: Only when copying in an older note: when this entry was originally written, as ISO 8601 (2026-03-01T14:30:00Z, or just 2026-03-01) or a Unix epoch number. Pass "" (or omit) for the current time, which is right for anything new. Entries read back in time order, so a backdated entry appears before newer ones even though its number is higher.
         :param continues: Pass true when text is longer than 500 characters and must be kept verbatim: the tool saves it, unchanged, as several consecutive entries, linked together (the reply gives their numbers, and agent_notes_read then shows continues_at on each piece that carries on). Pass false (the normal choice) otherwise.
+        :param weight: Optional rating of the entry, 0 to 100, where 50 (the default) is neutral: lower for something negative or unreliable, higher for something positive or reliable. Pass "" (or omit) for 50. With continues=true every piece gets it. agent_notes_set_weight changes it later.
         """
         try:
             result = await asyncio.to_thread(
@@ -1261,12 +1275,13 @@ class Tools:
                 entry_parts(text, continues, self.valves.MAX_CONTINUATION_ENTRIES),
                 resolve_author(author_name, __model__),
                 validate_timestamp(created_at),
+                validate_weight(weight),
             )
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
         return {"success": True, **result}
 
-    async def agent_notes_edit_entry(self, name: str, entry_no: str, text: str) -> Dict[str, Any]:
+    async def agent_notes_edit_entry(self, name: str, entry_no: str, text: str, weight: Optional[str] = None) -> Dict[str, Any]:
         """
         Replace the text of one existing entry, keeping its number and its place in the note.
 
@@ -1276,12 +1291,13 @@ class Tools:
         :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
         :param entry_no: The entry's number, as shown by agent_notes_read (e.g. 3 or "#3").
         :param text: The entry's new text, at most 500 characters.
+        :param weight: Optional new rating of the entry, 0 to 100 (50 is neutral). Pass "" (or omit) to keep its current weight.
         """
         try:
             number = _to_int(entry_no, None, "entry_no")
             if number is None:
                 raise NoteError("entry_no is required - agent_notes_read shows each entry's number.")
-            result = await asyncio.to_thread(edit_entry_db, self.valves.NOTES_DB_PATH, validate_name(name), number, validate_text(text))
+            result = await asyncio.to_thread(edit_entry_db, self.valves.NOTES_DB_PATH, validate_name(name), number, validate_text(text), validate_weight(weight))
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
         return {"success": True, **result}
