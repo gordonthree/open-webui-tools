@@ -359,7 +359,7 @@ involved: `python3 scripts/notes_web.py --db /path/to/agent_notes.sqlite3 [--hos
 Browse, search, create, append, edit/delete entries, rename/re-comment and delete notes, tag notes (filter by tag, `/tags` page to rename/merge), all through
 `agent_notes.py`'s own `*_db` functions (same limits and transactions as the tool). Server-rendered
 HTML, stdlib only apart from the `pydantic` that importing `agent_notes` needs. No auth and no CSRF
-protection by design — trusted LAN only. A note page lists its entries newest first. Tests: `cd scripts && python3 -m unittest test_notes_web -v`.
+protection by design — trusted LAN only. Each row of the home page has two small buttons, each behind a browser confirmation: a red ✕ that deletes the note and a trash can that deletes all its entries but keeps the note (name, comment, tags; its summary goes stale; entry numbers carry on) — the latter is `empty_note_db`, deliberately not a model tool. A note page lists its entries newest first. Tests: `cd scripts && python3 -m unittest test_notes_web -v`.
 
 ### Host access to the databases (ACLs)
 

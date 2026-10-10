@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.9.1
+version: 1.9.2
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -1068,6 +1068,20 @@ def pack_tagged(notes: List[Dict[str, Any]], budget: int) -> "tuple[List[Dict[st
         if hidden or verbose:
             note["entries_not_shown"] = hidden
     return packed, [n["note_name"] for n in notes[len(packed):]]
+
+
+def empty_note_db(db_path: str, name: str) -> Dict[str, Any]:
+    """Delete every entry of a note but keep the note itself: its name, comment, tags and summary (which the change makes
+    stale). Entry numbers carry on from where they were - they are never reused. Only notes_web.py offers this."""
+    conn = notes_db_connect(db_path)
+    try:
+        with _write_txn(conn):
+            note = _get_note(conn, name)
+            removed = conn.execute("DELETE FROM note_data WHERE note_pk = ?", (note["note_pk"],)).rowcount
+            conn.execute("UPDATE note_id SET updated_at = ? WHERE note_pk = ?", (_now_iso(), note["note_pk"]))
+        return {"note_name": note["note_name"], "entries_removed": removed}
+    finally:
+        conn.close()
 
 
 def delete_note_db(db_path: str, name: str) -> Dict[str, Any]:

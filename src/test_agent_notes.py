@@ -515,6 +515,18 @@ class ListAndSearchTests(NotesTestCase):
         self.assertEqual(self.sql("SELECT note_text, weight FROM note_data"), [("one", 50)])
         self.assertEqual(self.sql("SELECT COUNT(*) FROM note_id")[0][0], 1)
 
+    def test_empty_note_keeps_the_note_makes_the_summary_stale_and_is_not_a_model_tool(self):
+        self.create("n", "one")
+        self.run_async(self.tool.agent_notes_append("n", "two"))
+        self.run_async(self.tool.agent_notes_update_summary("n", "about stuff"))
+        self.assertEqual(mod.empty_note_db(self.db, "N")["entries_removed"], 2)
+        out = self.run_async(self.tool.agent_notes_read("n"))
+        self.assertEqual((out["total_entries"], out["entries"], out["summary"]["stale"]), (0, [], True))
+        self.assertEqual(self.run_async(self.tool.agent_notes_append("n", "three"))["entry_no"], 3)
+        self.assertFalse([m for m in dir(self.tool) if "empty" in m])
+        with self.assertRaises(mod.NoteError):
+            mod.empty_note_db(self.db, "missing")
+
     def test_deleting_or_editing_a_piece_keeps_the_chain_consistent(self):
         self.run_async(self.tool.agent_notes_create("n", "word " * 400, continues=True))  # entries 1-4
         self.run_async(self.tool.agent_notes_delete_entry("n", "2"))

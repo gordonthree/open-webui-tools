@@ -49,6 +49,9 @@ table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:.35rem .
 .entry pre{white-space:pre-wrap;word-wrap:break-word;margin:.3rem 0;font:inherit}
 textarea,input[type=text]{width:100%;box-sizing:border-box;font:inherit;padding:.3rem}
 form{margin:.4rem 0}button{font:inherit;padding:.25rem .7rem}.danger{color:#a00}
+td.act{white-space:nowrap}td.act form{display:inline;margin:0 .1rem}
+.mini{padding:0 .4rem;line-height:1.4;cursor:pointer;background:#fff;border:1px solid #bbb;border-radius:3px}
+.mini.x{color:#c00;font-weight:bold;border-color:#d99}
 details{margin:.3rem 0}summary{cursor:pointer;color:#0b5cad}
 """
 
@@ -102,6 +105,24 @@ def render_tags(db: str) -> str:
     return page("Tags", body)
 
 
+def row_buttons(r) -> str:
+    """The two small buttons on a note's row of the home page, each asking the browser to confirm first: a red X that deletes
+    the note, and a trash can that deletes its entries but keeps the note. The question travels in a data attribute so a
+    quote in the note's name can't break out of it."""
+    def button(action: str, label: str, css: str, title: str, question: str) -> str:
+        return (
+            f"<form method='post' action='/{action}' data-msg='{e(question)}' onsubmit='return confirm(this.dataset.msg)'>"
+            f"<input type='hidden' name='name' value='{e(r['note_name'])}'>"
+            f"<button class='mini {css}' title='{e(title)}' aria-label='{e(title)}'>{label}</button></form>"
+        )
+    n = r["entries"]
+    noun = f"{n} entr{'y' if n == 1 else 'ies'}"
+    return (
+        button("empty_note", "&#128465;", "", "Empty this note (keep the note)", f"Delete all {noun} in '{r['note_name']}'? The note itself stays. This cannot be undone.")
+        + button("delete_note", "&#10005;", "x", "Delete this note", f"Permanently delete the note '{r['note_name']}' and its {noun}? This cannot be undone.")
+    )
+
+
 def render_index(db: str, q: str, tag: str = "") -> str:
     body = search_form(q)
     if q:
@@ -127,10 +148,11 @@ def render_index(db: str, q: str, tag: str = "") -> str:
     shown = f" tagged {e(tag)} (<a href='/'>show all</a>)" if tag else ""
     body += f"<p class='muted'>{total} note{'s' if total != 1 else ''}{shown}, most recently updated first.</p>"
     if rows:
-        body += "<table><tr><th>Note</th><th>Entries</th><th>Reads</th><th>Updated</th><th>Started by</th><th>Tags</th><th>Comment</th></tr>" + "".join(
+        body += "<table><tr><th>Note</th><th>Entries</th><th>Reads</th><th>Updated</th><th>Started by</th><th>Tags</th><th>Comment</th><th></th></tr>" + "".join(
             f"<tr><td><a href='{note_url(r['note_name'])}'>{e(r['note_name'])}</a></td><td>{r['entries']}</td><td>{r['hits']}</td>"
             f"<td class='muted'>{e(when(r['updated_at']))}</td><td>{e(r['author_name'] or 'unknown')}</td>"
-            f"<td>{' '.join(tag_link(t) for t in (r['tags'] or '').split(', ') if t)}</td><td>{e(notes._truncate(r['note_comment'], 100))}</td></tr>"
+            f"<td>{' '.join(tag_link(t) for t in (r['tags'] or '').split(', ') if t)}</td><td>{e(notes._truncate(r['note_comment'], 100))}</td>"
+            f"<td class='act'>{row_buttons(r)}</td></tr>"
             for r in rows
         ) + "</table>"
     body += (
@@ -255,6 +277,9 @@ def handle_post(db: str, path: str, form: Dict[str, str], author: str = DEFAULT_
         if path == "/rename_tag":
             done = notes.rename_tag_db(db, notes.normalize_tag(form.get("tag")), notes.normalize_tag(form.get("new_tag")))
             return redirect("/?tag=" + quote(done["tag"]))
+        if path == "/empty_note":  # delete the entries, keep the note
+            notes.empty_note_db(db, name())
+            return redirect("/")
         if path == "/delete_note":
             notes.delete_note_db(db, name())
             return redirect("/")

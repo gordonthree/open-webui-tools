@@ -82,6 +82,37 @@ class HandlerTests(unittest.TestCase):
         self.assertNotIn("read 1x", body)
         self.assertEqual(self.post("/reset_hits", name="Ideas", entry_no="9")[0], 400)
 
+    def test_home_rows_have_confirmed_empty_and_delete_buttons(self):
+        self.post("/create", name="It's \"mine\"", text="first")
+        self.post("/append", name="It's \"mine\"", text="second")
+        _, _, body = self.get("/")
+        self.assertEqual(body.count("action='/empty_note'"), 1)
+        self.assertEqual(body.count("action='/delete_note'"), 1)
+        self.assertEqual(body.count("onsubmit='return confirm(this.dataset.msg)'"), 2)
+        self.assertIn("Delete all 2 entries in &#x27;It&#x27;s &quot;mine&quot;&#x27;?", body)  # quotes can't break the attribute
+        self.assertIn("&#10005;", body)
+        self.assertIn("&#128465;", body)
+
+    def test_empty_note_removes_entries_but_keeps_the_note_its_tags_and_numbering(self):
+        self.post("/create", name="Ideas", text="first", comment="keep me")
+        self.post("/append", name="Ideas", text="second")
+        self.post("/add_tag", name="Ideas", tags="alpha")
+        status, headers, _ = self.post("/empty_note", name="Ideas")
+        self.assertEqual((status, headers["Location"]), (303, "/"))
+        _, _, body = self.get("/note", name="Ideas")
+        self.assertIn("keep me", body)
+        self.assertIn("0 entries", body)
+        self.assertNotIn("<pre>first</pre>", body)
+        self.assertIn("alpha", self.get("/", tag="alpha")[2])
+        self.post("/append", name="Ideas", text="after")
+        self.assertIn("#3", self.get("/note", name="Ideas")[2])  # numbers aren't reused
+        self.assertEqual(self.post("/empty_note", name="nope")[0], 400)
+
+    def test_delete_from_the_home_page_removes_the_note(self):
+        self.post("/create", name="Ideas", text="first")
+        self.assertEqual(self.post("/delete_note", name="Ideas")[1]["Location"], "/")
+        self.assertIn("0 notes", self.get("/")[2])
+
     def test_rename_and_comment_then_delete_note(self):
         self.post("/create", name="a", text="x")
         status, headers, _ = self.post("/update", name="a", new_name="b", comment="hello")
