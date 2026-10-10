@@ -45,7 +45,7 @@ SRC_DIR = REPO_ROOT / "src"
 DEFAULT_SECRETS_FILE = REPO_ROOT / "secrets.md"
 BACKUP_DIR = REPO_ROOT / "tmp"
 
-TOOL_NAMES = ["comfy_sdxl_direct", "comfy_sdxl_graph", "comfy_sdxl_retrieve", "comfy_sdxl_poses", "agent_notes"]
+TOOL_NAMES = ["comfy_sdxl_direct", "comfy_sdxl_graph", "comfy_sdxl_retrieve", "comfy_sdxl_poses", "agent_notes", "nextcloud_mail"]
 FUNCTION_NAMES = ["agent_duo"]  # Open WebUI Functions (Pipes), pushed via /api/v1/functions/ - not part of 'all'
 
 _KV_RE = re.compile(r"^([A-Za-z0-9_]+):\s*(.+?)\s*$")
