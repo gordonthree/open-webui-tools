@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.9.2
+version: 1.10.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -21,6 +21,8 @@ description: A persistent notebook for agents, easier to use than Open WebUI's b
     each entry has a weight from 0 to 100 (50 = neutral) that a model can lower for entries it judges negative and
     raise for positive ones (agent_notes_set_weight). agent_notes_rank_entries lists a note's most or least
     popular entries, or the entries above or below a given weight.
+
+    A model that is unsure how to use the toolbox can call agent_notes_help, which explains it in short topic guides.
 
     Every note and entry records its author: pass author_name when writing, or the tool uses the
     name of the model Open WebUI says is calling it. Entries are stamped with the current time
@@ -1105,6 +1107,87 @@ def _error(e: Exception) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# agent_notes_help: the toolbox explained to the model that is using it
+# --------------------------------------------------------------------------- #
+
+HELP_ORDER = ["overview", "find", "read", "write", "long_text", "organize", "summaries", "rating"]
+
+
+def help_topics(read_cap: int, tagged_chars: int, search_cap: int, continuation: int, min_summary: int) -> Dict[str, "tuple[str, str]"]:
+    """topic -> (what it covers, the guide). Numbers come from the limits in force, so the guide can't drift from the code.
+    Each guide is short on purpose: the models reading it have small context windows."""
+    return {
+        "overview": (
+            "what agent notes are and the usual order of calls",
+            f"Agent notes is a persistent notebook. A NOTE has a unique plain-language name, an optional comment, tags and an optional summary. "
+            f"Its content is a numbered list of ENTRIES, each at most {NOTE_TEXT_MAX} characters; entries are added at the end and are not rewritten unless you edit one.\n"
+            "Usual flow: 1) agent_notes_list or agent_notes_search to see whether a note on the subject exists. "
+            "2) agent_notes_read to read it. 3) agent_notes_append to add to it, or agent_notes_create if there is none. "
+            "4) agent_notes_edit_entry only to correct an entry.\n"
+            'Tips: for any optional argument you do not need, pass "" or leave it out. Numbers can be written 3 or "#3". '
+            "A reply that has success=false tells you exactly what to change; fix it and call again. "
+            "Replies are kept short; verbose=true adds authors, timestamps and read counts.",
+        ),
+        "find": (
+            "locating notes and entries",
+            "agent_notes_list: every note, most recently changed first (tag= narrows it; needs_summary=true is for a summarizing agent).\n"
+            "agent_notes_search query: notes whose name, comment or tags match, and entries whose text matches, newest entries first.\n"
+            "agent_notes_search_summary query: finds the right note from words in its name or summary; the cheapest way to locate a note.\n"
+            f"agent_notes_list_tags, then agent_notes_read_tagged tags: gathers everything about a subject (say tags \"identity, speech\") in one reply of at most about {tagged_chars} characters; "
+            "it says what it left out.\n"
+            f"agent_notes_rank_entries: within ONE note, picks entries by popularity or weight (see topic rating). Search lists hold at most {search_cap} results; limit= asks for fewer.",
+        ),
+        "read": (
+            "agent_notes_read and how to interpret its reply",
+            f"agent_notes_read name returns the comment, tags, summary and the entries oldest to newest, each with its entry_no. "
+            f"You get at most the {read_cap} most recent entries (limit= asks for fewer); the reply says when some were left out.\n"
+            "continues_at N on an entry means its text carries on in entry N; continues_from M means it follows entry M. Read such entries together as one text.\n"
+            "weight appears on an entry only when it is not the neutral 50. summary.stale=true means the note changed after the summary was written.\n"
+            "Reading counts toward the note's and the entries' popularity (see topic rating).",
+        ),
+        "write": (
+            "creating notes and adding, fixing or removing entries",
+            f"agent_notes_create name, text: a new note with its first entry (refused if the name exists; comment= describes the note). "
+            f"agent_notes_append name, text: a new last entry. agent_notes_edit_entry name, entry_no, text: replaces one entry's text. agent_notes_delete_entry name, entry_no: removes one entry for good; other entries keep their numbers.\n"
+            f"Limits: note name {NOTE_NAME_MAX} characters, comment {NOTE_COMMENT_MAX}, each entry {NOTE_TEXT_MAX}; a longer one is refused and nothing is saved. "
+            "For longer text see topic long_text.\n"
+            "author_name= records who wrote it (blank = your model name). created_at= is only for copying in an older note with its real date; leave it blank for anything new. "
+            "weight= (0-100) rates an entry as you write it (see topic rating).",
+        ),
+        "long_text": (
+            "saving text longer than one entry, word for word",
+            f"If text is longer than {NOTE_TEXT_MAX} characters and must be kept exactly as written, pass continues=true to agent_notes_create or agent_notes_append. "
+            f"The tool saves it unchanged as several consecutive entries (cut at a paragraph, line or word boundary) and the reply lists their numbers (entry_numbers).\n"
+            f"At most {continuation} entries (about {continuation * NOTE_TEXT_MAX} characters) per call; more than that is refused and nothing is saved, so save the first part, then append the rest with continues=true again.\n"
+            "Readers see the pieces linked by continues_at and continues_from. Without continues=true, a text over the limit is refused. "
+            "To shorten or summarize instead, just write the shorter text.",
+        ),
+        "organize": (
+            "tags, renaming and deleting",
+            "Tags group related notes. agent_notes_add_tags name, tags (one, or comma-separated) - a new tag that looks like an existing one is refused and the similar tags are listed; "
+            "use the existing one, or pass create=true if the new tag really is different. agent_notes_remove_tag, agent_notes_list_tags and agent_notes_rename_tag (merges into an existing tag) keep them tidy.\n"
+            "agent_notes_update name: rename the note (new_name=), change its comment (comment=; clear_comment=true removes it) or the author shown (author_name=).\n"
+            "agent_notes_delete name removes the whole note and all its entries permanently, with no confirmation: use it only when asked to.",
+        ),
+        "summaries": (
+            "the per-note summary",
+            f"A note can carry one summary of at most {SUMMARY_MAX} characters, written to describe what the note contains so other agents can find it by searching. "
+            "agent_notes_update_summary name, summary creates or replaces it; agent_notes_search_summary finds notes by it; agent_notes_delete_summary removes it.\n"
+            "A summary goes stale when the note changes; agent_notes_list needs_summary=true lists notes whose summary is missing or stale "
+            f"(notes under {min_summary} characters of text are shown as short and left out: just read them). Describe the note, do not copy it.",
+        ),
+        "rating": (
+            "weight, popularity and ranking entries",
+            f"WEIGHT: every entry has a weight from {WEIGHT_MIN} to {WEIGHT_MAX}, starting at {DEFAULT_WEIGHT} (neutral). Lower it for entries you judge negative, unfavourable or unreliable; raise it for positive or reliable ones. "
+            'agent_notes_set_weight name, entry_no with weight= (new value) or change= (add or subtract, e.g. -10); you can also pass weight= when you create, append or edit.\n'
+            "POPULARITY: notes and entries count how often they are read (agent_notes_read, agent_notes_read_tagged, and search results). agent_notes_reset_hits name clears a note's counts, or one entry's with entry_no=.\n"
+            'RANKING: agent_notes_rank_entries name, by= "most_popular", "least_popular", "above_weight" or "below_weight" (the last two need weight=; the comparison is strict, so above_weight 50 means rated positive), limit= how many. '
+            "Looking entries up this way does not count as reading them.",
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Open WebUI tool
 # --------------------------------------------------------------------------- #
 
@@ -1128,6 +1211,25 @@ class Tools:
     def __init__(self):
         self.valves = self.Valves()
         self.citation = False
+
+    async def agent_notes_help(self, topic: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Explain how to use the agent_notes tools. Call it when you are unsure which tool to use or how
+        to use one. With no topic it gives the overview and lists the topics; ask for a topic to get a
+        short guide to just that part.
+
+        :param topic: One of overview, find, read, write, long_text, organize, summaries, rating. Pass "" (or omit) for the overview. A unique beginning such as "long" or "sum" is enough.
+        """
+        v = self.valves
+        guides = help_topics(v.MAX_READ_ENTRIES, v.MAX_TAGGED_CHARS, v.MAX_SEARCH_RESULTS, v.MAX_CONTINUATION_ENTRIES, v.MIN_SUMMARY_CHARS)
+        wanted = "overview" if is_unset(topic) else str(topic).strip().lower().replace("-", "_").replace(" ", "_")
+        matches = [t for t in HELP_ORDER if t == wanted] or [t for t in HELP_ORDER if t.startswith(wanted)]
+        if len(matches) != 1:
+            return _error(NoteError(f"No help topic {topic!r}. Topics: " + "; ".join(f"{t} ({guides[t][0]})" for t in HELP_ORDER) + "."))
+        name = matches[0]
+        out: Dict[str, Any] = {"success": True, "topic": name, "guide": guides[name][1]}
+        out["other_topics"] = ", ".join(t for t in HELP_ORDER if t != name)
+        return out
 
     async def agent_notes_list(self, limit: Optional[str] = None, needs_summary: bool = False, tag: Optional[str] = None, verbose: bool = False) -> Dict[str, Any]:
         """

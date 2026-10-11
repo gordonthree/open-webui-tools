@@ -527,6 +527,46 @@ class ListAndSearchTests(NotesTestCase):
         with self.assertRaises(mod.NoteError):
             mod.empty_note_db(self.db, "missing")
 
+    # ---- agent_notes_help ----
+
+    def help_guides(self):
+        return {t: self.run_async(self.tool.agent_notes_help(t)) for t in mod.HELP_ORDER}
+
+    def test_help_overview_is_the_default_and_every_topic_works(self):
+        default = self.run_async(self.tool.agent_notes_help())
+        self.assertEqual((default["success"], default["topic"]), (True, "overview"))
+        self.assertEqual(self.run_async(self.tool.agent_notes_help("")), default)
+        for topic, out in self.help_guides().items():
+            self.assertTrue(out["success"] and out["guide"], topic)
+            self.assertNotIn(topic, out["other_topics"].split(", "))
+            self.assertLess(len(out["guide"]), 1600, f"{topic} is too long for a small model")
+
+    def test_every_tool_method_is_explained_by_some_topic(self):
+        text = " ".join(g["guide"] for g in self.help_guides().values())
+        methods = [m for m in dir(self.tool) if m.startswith("agent_notes_") and m != "agent_notes_help"]
+        self.assertGreaterEqual(len(methods), 20)  # a floor, so the check can't pass by finding nothing
+        self.assertEqual([m for m in methods if m not in text], [])
+
+    def test_help_topic_matching_and_unknown_topics(self):
+        self.assertEqual(self.run_async(self.tool.agent_notes_help("long"))["topic"], "long_text")
+        self.assertEqual(self.run_async(self.tool.agent_notes_help(" Long-Text "))["topic"], "long_text")
+        self.assertEqual(self.run_async(self.tool.agent_notes_help("sum"))["topic"], "summaries")
+        for bad in ("nonsense", "o"):  # "o" is ambiguous: overview, organize
+            out = self.run_async(self.tool.agent_notes_help(bad))
+            self.assertFalse(out["success"])
+            self.assertIn("long_text", out["error"])
+
+    def test_help_quotes_the_limits_and_valves_actually_in_force(self):
+        self.tool.valves.MAX_CONTINUATION_ENTRIES = 3
+        self.tool.valves.MAX_READ_ENTRIES = 17
+        self.assertIn("At most 3 entries (about 1500 characters)", self.run_async(self.tool.agent_notes_help("long_text"))["guide"])
+        self.assertIn("17 most recent", self.run_async(self.tool.agent_notes_help("read"))["guide"])
+        self.assertIn(str(mod.NOTE_TEXT_MAX), self.run_async(self.tool.agent_notes_help("write"))["guide"])
+
+    def test_help_does_not_touch_the_database(self):
+        self.run_async(self.tool.agent_notes_help("write"))
+        self.assertFalse(Path(self.db).exists())
+
     def test_deleting_or_editing_a_piece_keeps_the_chain_consistent(self):
         self.run_async(self.tool.agent_notes_create("n", "word " * 400, continues=True))  # entries 1-4
         self.run_async(self.tool.agent_notes_delete_entry("n", "2"))

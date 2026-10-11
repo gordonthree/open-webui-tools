@@ -40,7 +40,7 @@ Current tools:
 
 - `agent_notes.py` → `agent_notes_list`, `agent_notes_read`, `agent_notes_create`, `agent_notes_append`, `agent_notes_edit_entry`,
   `agent_notes_delete_entry`, `agent_notes_update`, `agent_notes_delete`, `agent_notes_search`, `agent_notes_add_tags`, `agent_notes_remove_tag`, `agent_notes_list_tags`, `agent_notes_read_tagged`,
-  `agent_notes_rename_tag`, `agent_notes_set_weight`, `agent_notes_reset_hits`, `agent_notes_rank_entries` (plus the summary methods) — a persistent notebook for agents,
+  `agent_notes_rename_tag`, `agent_notes_set_weight`, `agent_notes_reset_hits`, `agent_notes_rank_entries`, `agent_notes_help` (plus the summary methods) — a persistent notebook for agents,
   an easier-to-drive alternative to Open WebUI's built-in `note` tool. Unrelated to ComfyUI. A note
   is a name plus an append-only log of short numbered entries, in its **own** SQLite file
   (`agent_notes.sqlite3`, `NOTES_DB_PATH` valve — not the job database, though it defaults to the
@@ -272,6 +272,7 @@ summaries and bare entry-text strings. `verbose=true` restores the full detail.
 
 | Method | Arguments |
 |---|---|
+| `agent_notes_help` | optional `topic`: `overview` (default), `find`, `read`, `write`, `long_text`, `organize`, `summaries` or `rating`; a unique prefix works. Returns a short guide (under ~1600 characters, written for small context windows) plus the other topic names. Limits and valve values in the text come from the code in force, and a test fails if any tool method isn't covered by some topic — so adding a method means adding it to `help_topics()` in `agent_notes.py` |
 | `agent_notes_list` | `limit` (default `20`, capped by `MAX_LIST_RESULTS`); `needs_summary=true` lists only notes with no summary or a stale one, skipping notes under the `MIN_SUMMARY_CHARS` valve (default 1000 characters of entry text). The table has a Summary column: none/current/stale/short (short = too small to need one) |
 | `agent_notes_read` | `name` (required); `limit` — most recent N entries, default/max `MAX_READ_ENTRIES` |
 | `agent_notes_create` | `name`, `text` (first entry) required; `comment` optional; `weight` (0–100, default 50) rates the entry; `continues=true` saves a text over 500 characters verbatim as several consecutive entries. Refuses if the name already exists — use `agent_notes_append` |
