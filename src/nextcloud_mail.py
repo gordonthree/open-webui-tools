@@ -1,7 +1,7 @@
 """
 title: Nextcloud Mail
 description: Read (and optionally send) email through the Nextcloud Mail app's OCS API, using a Nextcloud app password.
-version: 0.3.1
+version: 0.4.0
 requirements: requests
 """
 
@@ -44,6 +44,10 @@ class Tools:
             default=True,
             description="read_email marks the email as read (like opening it in the Mail app)",
         )
+        SYNC_BEFORE_LIST: bool = Field(
+            default=True,
+            description="Ask Nextcloud Mail to fetch new mail from the mail server before listing (the web GUI does this on open)",
+        )
         MARK_ALL_LIMIT: int = Field(
             default=500, description="Most emails mark_all_read will flag in one call"
         )
@@ -71,6 +75,22 @@ class Tools:
             )
         except requests.RequestException as e:
             raise MailError(f"Could not reach Nextcloud at {url}: {e}", -1)
+
+    def _sync_mailbox(self, mailbox_id: int) -> str:
+        """Ask the Mail app to pull new mail from IMAP into its cache. Returns "" or a note on failure."""
+        if not self.valves.SYNC_BEFORE_LIST:
+            return ""
+        url = (
+            f"{self.valves.NEXTCLOUD_URL.rstrip('/')}"
+            f"/index.php/apps/mail/api/mailboxes/{int(mailbox_id)}/sync"
+        )
+        try:
+            r = self._request("POST", url, json={"ids": [], "init": True})
+            if r.status_code >= 400:
+                return f"[Note: could not refresh from the mail server (HTTP {r.status_code}); the list may be missing the newest mail.]\n"
+        except Exception as e:
+            return f"[Note: could not refresh from the mail server ({e}); the list may be missing the newest mail.]\n"
+        return ""
 
     def _set_seen(self, message_id: int, seen: bool = True) -> None:
         """Set or clear the read flag via the Mail app's own flags route."""
@@ -238,14 +258,14 @@ class Tools:
             params = {"limit": max(1, min(int(count), 50)), "view": "singleton"}
             if search:
                 params["filter"] = search
+            mailbox_id = self._mailbox_id(mailbox)
+            note = self._sync_mailbox(mailbox_id)
             msgs = self._ocs(
-                "GET",
-                f"/ocs/mailboxes/{self._mailbox_id(mailbox)}/messages",
-                params=params,
+                "GET", f"/ocs/mailboxes/{mailbox_id}/messages", params=params
             )
             if not msgs:
-                return "No emails found."
-            lines = []
+                return note + "No emails found."
+            lines = [note.rstrip()] if note else []
             for m in msgs:
                 flags = m.get("flags", {})
                 state = "read" if flags.get("seen") else "UNREAD"

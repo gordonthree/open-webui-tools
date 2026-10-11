@@ -26,6 +26,7 @@ class FakeNC:
         self.unread = list(unread)
         self.fail = set(fail_flag_ids)
         self.calls = []
+        self.sync_status = 200
 
     def __call__(self, method, url, params=None, json=None, **kw):
         self.calls.append((method, url, params, json))
@@ -39,6 +40,10 @@ class FakeNC:
             )
         if "/message/" in url and method == "GET":
             return Resp({"subject": "Hi", "body": "hello", "from": [], "to": []})
+        if url.endswith("/sync") and method == "POST":
+            if self.sync_status >= 400:
+                return Resp("x", self.sync_status)
+            return Resp("ok")
         if url.endswith("/flags") and method == "PUT":
             mid = int(url.split("/messages/")[1].split("/")[0])
             if mid in self.fail:
@@ -132,6 +137,33 @@ class GuideTests(Base):
         self.assertIn("DISABLED", g)
         self.tool.valves.ALLOW_SEND = True
         self.assertIn("ENABLED", self.tool.mail_guide())
+
+
+class ListSyncTests(Base):
+    def synced_before_list(self, fake):
+        urls = [c[1] for c in fake.calls]
+        sync = next(i for i, u in enumerate(urls) if u.endswith("/sync"))
+        lst = next(i for i, u in enumerate(urls) if u.endswith("/messages"))
+        return sync < lst
+
+    def test_syncs_before_listing(self):
+        fake = self.run_with(FakeNC())
+        out = self.tool.list_emails()
+        self.assertTrue(self.synced_before_list(fake))
+        self.assertNotIn("Note:", out)
+
+    def test_sync_failure_is_reported_but_list_still_returned(self):
+        fake = self.run_with(FakeNC())
+        fake.sync_status = 500
+        out = self.tool.list_emails()
+        self.assertIn("could not refresh", out)
+        self.assertIn("id 1", out.replace("id 1 ", "id 1 "))
+
+    def test_valve_disables_sync(self):
+        fake = self.run_with(FakeNC())
+        self.tool.valves.SYNC_BEFORE_LIST = False
+        self.tool.list_emails()
+        self.assertFalse([c for c in fake.calls if c[1].endswith("/sync")])
 
 
 class ErrorTests(Base):
