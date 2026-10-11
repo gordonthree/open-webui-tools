@@ -394,6 +394,14 @@ persona is still in her context on every turn; this removes the repeated reads, 
 
 Caveats: a turn takes as long as the model does (two turns measured about 73 s); a stopped chat stops waiting but
 the remote agent may finish its turn; images and files in the human's message aren't forwarded to the agents.
+
+Each turn's `[agent_duo] <name>` chat is deleted right after it finishes unless `KEEP_BACKING_CHATS` is on, or the
+delete call itself fails. Either way they can pile up on both agents' servers; `scripts/cleanup_duo_chats.py`
+deletes ones past `--min-age-minutes` (default 60) across every server `secrets.md` configures (same `--server`
+flag as `push_tool.py`), human-run only, same reasoning as `cleanup_noop_chats.py` - deleting a model's own chats
+stays off the model-callable surface. `--dry-run` previews; `--yes` skips the prompt for cron; `--log FILE` appends
+each run's output with UTC timestamps. Tests: `cd scripts && python3 -m unittest test_cleanup_duo_chats -v`.
+
 Deploy: create the Function once in OWUI (Admin -> Functions -> "+", paste `src/agent_duo.py`), enable it, fill the
 valves, then add its id to `secrets.md` as `agent_duo: <id>` so `python scripts/push_tool.py agent_duo` can update
 it. Tests: `cd src && python -m unittest test_agent_duo -v`.
@@ -643,6 +651,12 @@ full tools/RAG on both sides. The bare completions API doesn't run tools, so eac
 agent's own server (spike-verified on `hannah-long`). 17 tests in `src/test_agent_duo.py`; a live two-turn run of the
 pipe against both real servers worked. `push_tool.py` now also pushes Functions (`agent_duo`), not part of `all`.
 **Not deployed:** the Function has to be created once in OWUI by hand and its valves (API keys) filled in.
+
+### 2026-10-11
+Added `scripts/cleanup_duo_chats.py` (see "Two-agent chat (agent_duo)" above): deletes leftover
+`[agent_duo]` backing chats across both agents' servers, same pattern as `cleanup_noop_chats.py`. Testing with
+`KEEP_BACKING_CHATS` on to inspect tool calls (see the directive-mentoring finding above) had left 46 of them
+behind across the two servers. 9 tests in `test_cleanup_duo_chats.py`.
 
 Later the same day: `agent_duo.py` v1.1.0 adds carry-forward (see the valve table above). Findings from testing with the
 project owner: the agents' session-start rules must name the tag tool outright (`agent_notes_read_tagged`; "search
