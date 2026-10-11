@@ -1,7 +1,7 @@
 """
 title: Nextcloud Mail
 description: Read (and optionally send) email through the Nextcloud Mail app's OCS API, using a Nextcloud app password.
-version: 0.3.0
+version: 0.3.1
 requirements: requests
 """
 
@@ -11,6 +11,14 @@ from datetime import datetime, timezone
 
 import requests
 from pydantic import BaseModel, Field
+
+
+class MailError(RuntimeError):
+    """A failed Nextcloud call, keeping the HTTP status so errors can be explained."""
+
+    def __init__(self, message: str, status: int = 0):
+        super().__init__(message)
+        self.status = status
 
 
 class Tools:
@@ -62,7 +70,7 @@ class Tools:
                 timeout=30,
             )
         except requests.RequestException as e:
-            raise RuntimeError(f"Could not reach Nextcloud at {url}: {e}")
+            raise MailError(f"Could not reach Nextcloud at {url}: {e}", -1)
 
     def _set_seen(self, message_id: int, seen: bool = True) -> None:
         """Set or clear the read flag via the Mail app's own flags route."""
@@ -72,7 +80,9 @@ class Tools:
         )
         r = self._request("PUT", url, json={"flags": {"seen": bool(seen)}})
         if r.status_code >= 400:
-            raise RuntimeError(f"HTTP {r.status_code} setting read flag: {r.text[:200]}")
+            raise MailError(
+                f"HTTP {r.status_code} setting read flag: {r.text[:200]}", r.status_code
+            )
 
     def _ocs(self, method: str, path: str, params=None, json=None):
         url = f"{self.valves.NEXTCLOUD_URL.rstrip('/')}/ocs/v2.php/apps/mail{path}"
@@ -80,10 +90,13 @@ class Tools:
         try:
             payload = r.json()["ocs"]
         except Exception:
-            raise RuntimeError(f"HTTP {r.status_code} from {url}: {r.text[:300]}")
+            raise MailError(
+                f"HTTP {r.status_code} from {url}: {r.text[:300]}", r.status_code
+            )
         if r.status_code >= 400:
-            raise RuntimeError(
-                f"HTTP {r.status_code}: {payload.get('data') or payload.get('meta')}"
+            raise MailError(
+                f"HTTP {r.status_code}: {payload.get('data') or payload.get('meta')}",
+                r.status_code,
             )
         return payload["data"]
 
@@ -105,6 +118,36 @@ class Tools:
         raise RuntimeError(
             f"Mailbox '{name}' not found. Available: {', '.join(b['name'] for b in boxes)}"
         )
+
+    @staticmethod
+    def _fail(e: Exception) -> str:
+        """Turn an exception into an error message that tells the model what to do next."""
+        text = f"Error: {e}"
+        status = getattr(e, "status", 0)
+        if isinstance(e, ValueError) and "invalid literal" in str(e):
+            hint = (
+                "message_id must be a plain number, copied exactly from the 'id' shown "
+                "by list_emails."
+            )
+        elif status in (400, 404):
+            hint = (
+                "Nextcloud did not accept this request. If you passed a message_id, "
+                "that id does not exist in this mailbox account: do not guess ids (1, 2, 3...). "
+                "Call list_emails and use an 'id' it printed, exactly as shown. If you passed a "
+                "mailbox name, call list_mailboxes for the exact names."
+            )
+        elif status in (401, 403):
+            hint = (
+                "Nextcloud rejected the login or permission. This is a configuration problem "
+                "(user name or app password in the tool's valves). Tell the user; retrying will not help."
+            )
+        elif status >= 500:
+            hint = "The Nextcloud server had an internal error. Wait a moment and retry once, then tell the user."
+        elif status == -1:
+            hint = "The Nextcloud server could not be reached. Retrying once is fine; if it fails again, tell the user."
+        else:
+            return text
+        return f"{text}\nWhat to do: {hint}"
 
     # ---------- formatting helpers ----------
 
@@ -180,7 +223,7 @@ class Tools:
                 or "No mailboxes."
             )
         except Exception as e:
-            return f"Error: {e}"
+            return self._fail(e)
 
     def list_emails(
         self, mailbox: str = "INBOX", count: int = 10, search: str = ""
@@ -216,7 +259,7 @@ class Tools:
                 )
             return "\n".join(lines)
         except Exception as e:
-            return f"Error: {e}"
+            return self._fail(e)
 
     def read_email(self, message_id: int, mark_read: bool = True) -> str:
         """
@@ -248,7 +291,7 @@ class Tools:
                     out += f"\n\n[Note: could not mark the email as read: {e}]"
             return out
         except Exception as e:
-            return f"Error: {e}"
+            return self._fail(e)
 
     def mark_read(self, message_id: int, read: bool = True) -> str:
         """
@@ -260,7 +303,7 @@ class Tools:
             self._set_seen(int(message_id), bool(read))
             return f"Email {int(message_id)} marked {'read' if read else 'unread'}."
         except Exception as e:
-            return f"Error: {e}"
+            return self._fail(e)
 
     def mark_all_read(self, mailbox: str = "INBOX") -> str:
         """
@@ -301,7 +344,7 @@ class Tools:
                 out += f" Stopped at the limit of {limit}; run again for more."
             return out
         except Exception as e:
-            return f"Error: {e}"
+            return self._fail(e)
 
     def send_email(
         self,
@@ -324,7 +367,14 @@ class Tools:
         try:
             account_id = self._account_id()
             accounts = self._ocs("GET", "/account/list")
-            from_email = next(a["email"] for a in accounts if a["id"] == account_id)
+            from_email = next(
+                (a["email"] for a in accounts if a["id"] == account_id), None
+            )
+            if not from_email:
+                return (
+                    f"Error: mail account id {account_id} was not found. "
+                    "What to do: tell the user to check the ACCOUNT_ID valve."
+                )
 
             def split(s):
                 return [{"email": x.strip()} for x in s.split(",") if x.strip()]
@@ -343,4 +393,4 @@ class Tools:
             self._ocs("POST", "/message/send", json=payload)
             return f"Sent to {to}."
         except Exception as e:
-            return f"Error: {e}"
+            return self._fail(e)

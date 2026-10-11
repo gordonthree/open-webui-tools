@@ -135,6 +135,47 @@ class GuideTests(Base):
 
 
 class ErrorTests(Base):
+    def flag_fails(self, status):
+        class F(FakeNC):
+            def __call__(self, method, url, params=None, json=None, **kw):
+                if url.endswith("/flags"):
+                    return Resp("x", status)
+                return super().__call__(method, url, params, json, **kw)
+
+        self.run_with(F())
+
+    def test_unknown_id_hint(self):
+        self.flag_fails(400)
+        out = self.tool.mark_read(1)
+        self.assertIn("HTTP 400", out)
+        self.assertIn("list_emails", out)
+
+    def test_auth_hint(self):
+        self.flag_fails(401)
+        self.assertIn("valves", self.tool.mark_read(1))
+
+    def test_server_error_hint(self):
+        self.flag_fails(502)
+        self.assertIn("retry", self.tool.mark_read(1))
+
+    def test_non_numeric_id_hint(self):
+        self.run_with(FakeNC())
+        out = self.tool.read_email("abc")
+        self.assertIn("plain number", out)
+
+    def test_network_hint(self):
+        def boom(*a, **k):
+            raise mod.requests.ConnectionError("down")
+
+        self.run_with(boom)
+        self.assertIn("What to do", self.tool.list_mailboxes())
+
+    def test_send_unknown_account(self):
+        self.run_with(FakeNC())
+        self.tool.valves.ALLOW_SEND = True
+        self.tool.valves.ACCOUNT_ID = 99
+        self.assertIn("ACCOUNT_ID", self.tool.send_email("a@b.c", "s", "b"))
+
     def test_missing_credentials(self):
         self.tool.valves.NEXTCLOUD_USER = ""
         self.assertIn("credentials", self.tool.mark_read(1))
