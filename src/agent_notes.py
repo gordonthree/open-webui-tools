@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.10.0
+version: 1.11.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -41,6 +41,7 @@ import json
 import logging
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1159,8 +1160,8 @@ def help_topics(read_cap: int, tagged_chars: int, search_cap: int, continuation:
             f"If text is longer than {NOTE_TEXT_MAX} characters and must be kept exactly as written, pass continues=true to agent_notes_create or agent_notes_append. "
             f"The tool saves it unchanged as several consecutive entries (cut at a paragraph, line or word boundary) and the reply lists their numbers (entry_numbers).\n"
             f"At most {continuation} entries (about {continuation * NOTE_TEXT_MAX} characters) per call; more than that is refused and nothing is saved, so save the first part, then append the rest with continues=true again.\n"
-            "Readers see the pieces linked by continues_at and continues_from. Without continues=true, a text over the limit is refused. "
-            "To shorten or summarize instead, just write the shorter text.",
+            "Readers see the pieces linked by continues_at and continues_from. Without continues=true, a text over the limit is refused, saying how to retry; "
+            "if you keep sending it too long, the tool eventually saves it this way for you. To shorten or summarize instead, just write the shorter text.",
         ),
         "organize": (
             "tags, renaming and deleting",
@@ -1188,6 +1189,54 @@ def help_topics(read_cap: int, tagged_chars: int, search_cap: int, continuation:
 
 
 # --------------------------------------------------------------------------- #
+# Too-long retries: a model that keeps sending an over-limit entry without continues=true gets it saved anyway
+# --------------------------------------------------------------------------- #
+
+OVERLONG_WINDOW_S = 900.0  # refusals older than this no longer count as "in a row"
+_overlong: Dict[tuple, "tuple[int, float]"] = {}  # (author, lowercase note name) -> (too-long refusals so far, when the last one was)
+# Kept in memory on purpose: Open WebUI keeps the loaded tool cached until its source changes, so this lasts across calls;
+# a restart or a new push merely resets the counts, which only means one more refusal before the automatic save.
+
+
+def _clock() -> float:
+    return time.monotonic()
+
+
+def _overlong_forget(key: tuple) -> None:
+    _overlong.pop(key, None)
+
+
+_AUTO_NOTE = "Your text was too long for one entry several times in a row, so it was saved as {n} linked entries, word for word (as continues=true does). Pass continues=true yourself next time."
+
+
+def plan_entries(key: tuple, text: Any, continues: Any, max_parts: int, auto_after: int) -> "tuple[List[str], bool]":
+    """The entries to save for create/append, and whether continues was switched on for the caller (second value).
+
+    continues=true, or a text that fits one entry: as entry_parts. A text over the limit sent without continues=true is refused
+    - with the way to retry - until it has been sent that way auto_after times in a row (the same author and note, each within
+    OVERLONG_WINDOW_S of the last); that call is saved as if continues=true had been passed. auto_after 0 never does."""
+    if _to_bool(continues):
+        return entry_parts(text, True, max_parts), False
+    cleaned = str(text or "").strip()
+    if len(cleaned) <= NOTE_TEXT_MAX:
+        return [validate_text(text)], False
+    parts = split_text(cleaned, max_parts)  # too long even split up: this raises, saying so, and isn't counted as a retry
+    now = _clock()
+    for k, (_, last) in list(_overlong.items()):
+        if now - last > OVERLONG_WINDOW_S:
+            del _overlong[k]
+    attempt = _overlong.get(key, (0, now))[0] + 1
+    if auto_after > 0 and attempt >= auto_after:
+        return parts, True
+    _overlong[key] = (attempt, now)
+    more = f" If you send it too long {auto_after - attempt} more time{'s' if auto_after - attempt != 1 else ''}, it will be saved this way automatically." if auto_after > 0 else ""
+    raise NoteError(
+        f"Entry text is {len(cleaned)} characters; one entry holds at most {NOTE_TEXT_MAX}. To keep it word for word, "
+        f"call again with continues=true and the same text: it will be saved as {len(parts)} linked entries.{more}"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Open WebUI tool
 # --------------------------------------------------------------------------- #
 
@@ -1206,6 +1255,7 @@ class Tools:
         MIN_SUMMARY_CHARS: int = Field(default=1000, description="A note whose entries total fewer characters than this isn't offered for summarizing (agent_notes_list needs_summary=true skips it, and shows 'short'): a summary of a note that small would just copy it. 0 summarizes everything.")
         MAX_TAGGED_CHARS: int = Field(default=6000, description="Character budget for agent_notes_read_tagged's reply (about a quarter as many tokens). Whole notes/entries only; anything that doesn't fit is left out and reported.")
         MAX_CONTINUATION_ENTRIES: int = Field(default=6, description="With continues=true, agent_notes_create/agent_notes_append split a long text into at most this many entries of up to 500 characters each (so 6 = about 3000 characters per call). A longer text is refused whole.")
+        AUTO_CONTINUE_AFTER: int = Field(default=3, description="If a model sends a text over 500 characters to agent_notes_create/agent_notes_append without continues=true this many times in a row (same author and note, within 15 minutes), the tool stops refusing and saves it as linked entries, as if continues=true had been passed. 0 turns this off: such a text is always refused.")
         MAX_SEARCH_RESULTS: int = Field(default=30, description="Caps each of agent_notes_search' two result lists (matching notes, matching entries).")
 
     def __init__(self):
@@ -1350,19 +1400,24 @@ class Tools:
         :param weight: Optional rating of the entry, 0 to 100, where 50 (the default) is neutral: lower for something negative or unreliable, higher for something positive or reliable. Pass "" (or omit) for 50. agent_notes_set_weight changes it later.
         """
         try:
+            title, author = validate_name(name), resolve_author(author_name, __model__)
+            key = (author, title.lower())
+            parts, auto = plan_entries(key, text, continues, self.valves.MAX_CONTINUATION_ENTRIES, self.valves.AUTO_CONTINUE_AFTER)
             result = await asyncio.to_thread(
                 create_note_db,
                 self.valves.NOTES_DB_PATH,
-                validate_name(name),
-                entry_parts(text, continues, self.valves.MAX_CONTINUATION_ENTRIES),
+                title,
+                parts,
                 validate_comment(comment),
-                resolve_author(author_name, __model__),
+                author,
                 validate_timestamp(created_at),
                 validate_weight(weight),
             )
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
-        return {"success": True, **result, "note": "Created. Use agent_notes_append to add more entries."}
+        _overlong_forget(key)
+        remark = "Created. Use agent_notes_append to add more entries."
+        return {"success": True, **result, "note": (_AUTO_NOTE.format(n=len(parts)) + " " if auto else "") + remark}
 
     async def agent_notes_append(
         self, name: str, text: str, author_name: Optional[str] = None, created_at: Optional[str] = None, continues: bool = False, weight: Optional[str] = None, __model__: Optional[dict] = None
@@ -1384,18 +1439,22 @@ class Tools:
         :param weight: Optional rating of the entry, 0 to 100, where 50 (the default) is neutral: lower for something negative or unreliable, higher for something positive or reliable. Pass "" (or omit) for 50. With continues=true every piece gets it. agent_notes_set_weight changes it later.
         """
         try:
+            title, author = validate_name(name), resolve_author(author_name, __model__)
+            key = (author, title.lower())
+            parts, auto = plan_entries(key, text, continues, self.valves.MAX_CONTINUATION_ENTRIES, self.valves.AUTO_CONTINUE_AFTER)
             result = await asyncio.to_thread(
                 append_entry_db,
                 self.valves.NOTES_DB_PATH,
-                validate_name(name),
-                entry_parts(text, continues, self.valves.MAX_CONTINUATION_ENTRIES),
-                resolve_author(author_name, __model__),
+                title,
+                parts,
+                author,
                 validate_timestamp(created_at),
                 validate_weight(weight),
             )
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
-        return {"success": True, **result}
+        _overlong_forget(key)
+        return {"success": True, **result, **({"note": _AUTO_NOTE.format(n=len(parts))} if auto else {})}
 
     async def agent_notes_edit_entry(self, name: str, entry_no: str, text: str, weight: Optional[str] = None) -> Dict[str, Any]:
         """

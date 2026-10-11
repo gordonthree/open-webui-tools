@@ -21,6 +21,7 @@ class NotesTestCase(unittest.TestCase):
         self.tool = mod.Tools()
         self.tool.valves.NOTES_DB_PATH = self.db
         self.tool.valves.MIN_SUMMARY_CHARS = 0  # tests use tiny notes; the short-note rule has its own tests
+        mod._overlong.clear()  # too-long retry counts are kept module-wide
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -566,6 +567,96 @@ class ListAndSearchTests(NotesTestCase):
     def test_help_does_not_touch_the_database(self):
         self.run_async(self.tool.agent_notes_help("write"))
         self.assertFalse(Path(self.db).exists())
+
+    # ---- too-long retries become continues=true ----
+
+    LONG = "word " * 150  # 750 characters: two entries
+
+    def append(self, text=None, name="n", **kw):
+        return self.run_async(self.tool.agent_notes_append(name, text or self.LONG, **kw))
+
+    def test_third_too_long_call_in_a_row_is_saved_as_linked_entries(self):
+        self.create("n", "start")
+        first, second = self.append(), self.append()
+        self.assertFalse(first["success"] or second["success"])
+        self.assertIn("continues=true", first["error"])
+        self.assertIn("2 linked entries", first["error"])
+        self.assertIn("2 more times", first["error"])
+        self.assertIn("1 more time,", second["error"])
+        third = self.append()
+        self.assertTrue(third["success"], third)
+        self.assertEqual(third["entry_numbers"], "2-3")
+        self.assertIn("linked entries", third["note"])
+        entries = self.run_async(self.tool.agent_notes_read("n"))["entries"]
+        self.assertEqual(" ".join(e["text"] for e in entries[1:]), self.LONG.strip())
+        self.assertEqual(entries[1]["continues_at"], 3)
+        self.assertFalse(self.append()["success"])  # the count starts again after an automatic save
+
+    def test_valve_zero_never_switches_continues_on(self):
+        self.tool.valves.AUTO_CONTINUE_AFTER = 0
+        self.create("n", "start")
+        for _ in range(6):
+            out = self.append()
+            self.assertFalse(out["success"])
+            self.assertNotIn("automatically", out["error"])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM note_data")[0][0], 1)
+
+    def test_valve_sets_how_many_it_takes(self):
+        self.tool.valves.AUTO_CONTINUE_AFTER = 1
+        self.create("n", "start")
+        self.assertTrue(self.append()["success"])  # the very first too-long call is saved
+        self.tool.valves.AUTO_CONTINUE_AFTER = 2
+        self.assertFalse(self.append()["success"])
+        self.assertTrue(self.append()["success"])
+
+    def test_anything_else_in_between_breaks_the_run(self):
+        self.create("n", "start")
+        self.append()
+        self.append()
+        self.assertTrue(self.append("short and fine")["success"])  # a good write ends the run
+        self.append()
+        self.append()
+        self.assertTrue(self.append()["success"])  # third since the reset: saved
+        self.append()
+        self.append()
+        self.assertTrue(self.append(continues=True)["success"])  # asking properly also ends it
+        self.assertFalse(self.append()["success"])
+
+    def test_counts_are_per_author_and_per_note(self):
+        self.create("n", "start")
+        self.create("m", "start")
+        self.append(), self.append()
+        self.assertFalse(self.append(name="m")["success"])  # another note: its own count
+        self.assertFalse(self.append(author_name="Someone else")["success"])  # another author too
+        self.assertTrue(self.append()["success"])  # the original pair's third
+
+    def test_refusals_stop_counting_after_the_window(self):
+        self.create("n", "start")
+        clock = [1000.0]
+        original, mod._clock = mod._clock, lambda: clock[0]
+        try:
+            self.append(), self.append()
+            clock[0] += mod.OVERLONG_WINDOW_S + 1
+            self.assertFalse(self.append()["success"])  # the old two no longer count
+            clock[0] += 10
+            self.assertFalse(self.append()["success"])
+            self.assertTrue(self.append()["success"])
+        finally:
+            mod._clock = original
+
+    def test_create_works_the_same_way_and_too_long_even_for_the_cap_is_never_counted(self):
+        for _ in range(2):
+            self.assertFalse(self.run_async(self.tool.agent_notes_create("big", self.LONG))["success"])
+        out = self.run_async(self.tool.agent_notes_create("big", self.LONG))
+        self.assertTrue(out["success"], out)
+        self.assertEqual(out["entry_numbers"], "1-2")
+        self.assertIn("Created", out["note"])
+        self.tool.valves.MAX_CONTINUATION_ENTRIES = 2
+        for _ in range(5):
+            refused = self.append("word " * 400)
+            self.assertFalse(refused["success"])
+            self.assertIn("Nothing was saved", refused["error"])
+        self.assertEqual(mod._overlong, {})
 
     def test_deleting_or_editing_a_piece_keeps_the_chain_consistent(self):
         self.run_async(self.tool.agent_notes_create("n", "word " * 400, continues=True))  # entries 1-4
