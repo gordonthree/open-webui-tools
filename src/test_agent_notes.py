@@ -575,22 +575,31 @@ class ListAndSearchTests(NotesTestCase):
     def append(self, text=None, name="n", **kw):
         return self.run_async(self.tool.agent_notes_append(name, text or self.LONG, **kw))
 
-    def test_third_too_long_call_in_a_row_is_saved_as_linked_entries(self):
+    def test_third_too_long_call_in_a_row_is_quietly_saved_as_linked_entries(self):
         self.create("n", "start")
         first, second = self.append(), self.append()
         self.assertFalse(first["success"] or second["success"])
-        self.assertIn("continues=true", first["error"])
-        self.assertIn("2 linked entries", first["error"])
-        self.assertIn("2 more times", first["error"])
-        self.assertIn("1 more time,", second["error"])
+        self.assertIn("over by 249", first["error"])
+        self.assertTrue(first["error"].startswith("Entry text is 749 characters; the limit is 500"))
+        for refusal in (first, second):  # the refusal is the usual one: it doesn't mention any fallback or say how many retries are left
+            self.assertNotIn("automatic", refusal["error"])
+            self.assertNotIn("more time", refusal["error"])
+            self.assertNotIn("linked", refusal["error"])
         third = self.append()
         self.assertTrue(third["success"], third)
         self.assertEqual(third["entry_numbers"], "2-3")
-        self.assertIn("linked entries", third["note"])
+        self.assertNotIn("note", third)  # no scolding or advertising in the reply
         entries = self.run_async(self.tool.agent_notes_read("n"))["entries"]
         self.assertEqual(" ".join(e["text"] for e in entries[1:]), self.LONG.strip())
         self.assertEqual(entries[1]["continues_at"], 3)
         self.assertFalse(self.append()["success"])  # the count starts again after an automatic save
+
+    def test_each_automatic_save_is_logged_for_the_owner(self):
+        self.create("n", "start")
+        self.append(), self.append()
+        with self.assertLogs("agent_notes", level="INFO") as logged:
+            self.append()
+        self.assertIn("3 times in a row", logged.output[0])
 
     def test_valve_zero_never_switches_continues_on(self):
         self.tool.valves.AUTO_CONTINUE_AFTER = 0
@@ -650,12 +659,12 @@ class ListAndSearchTests(NotesTestCase):
         out = self.run_async(self.tool.agent_notes_create("big", self.LONG))
         self.assertTrue(out["success"], out)
         self.assertEqual(out["entry_numbers"], "1-2")
-        self.assertIn("Created", out["note"])
+        self.assertEqual(out["note"], "Created. Use agent_notes_append to add more entries.")
         self.tool.valves.MAX_CONTINUATION_ENTRIES = 2
         for _ in range(5):
             refused = self.append("word " * 400)
             self.assertFalse(refused["success"])
-            self.assertIn("Nothing was saved", refused["error"])
+            self.assertIn("the limit is 500", refused["error"])
         self.assertEqual(mod._overlong, {})
 
     def test_deleting_or_editing_a_piece_keeps_the_chain_consistent(self):

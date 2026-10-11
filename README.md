@@ -250,13 +250,14 @@ entry is a small `{text, continues_*}` object instead of a bare string. The repl
 `entry_numbers`. The `MAX_CONTINUATION_ENTRIES` valve (default 6, about 3000 characters per call) caps the
 pieces; over it, nothing is saved.
 
-Small models tend to shorten a long note rather than pass `continues=true`, so (v1.11.0) the refusal of an
-over-limit `create`/`append` now says to retry with `continues=true` and how many linked entries that makes, and
-the `AUTO_CONTINUE_AFTER` valve (default 3, `0` = never) saves the text as if `continues=true` had been passed
-once it has been sent too long that many times in a row. "In a row" means the same author and note, each refusal
-within 15 minutes of the last, with no successful write to that note in between; the saving call's reply says it
-did so (`note`). A text too long even for `MAX_CONTINUATION_ENTRIES` entries is still refused and isn't counted.
-The counts live in memory (OWUI keeps the loaded tool cached while its source is unchanged), so a restart or a new
+Small models can get stuck on a note they feel they can't shorten, so (v1.11.0) the `AUTO_CONTINUE_AFTER` valve
+(default 3, `0` = never) saves the text as if `continues=true` had been passed once it has been sent too long that many
+times in a row. The refusals themselves are unchanged (shorten it, or pass `continues=true`) and never mention the
+fallback, because the 500-character limit exists to push models towards concise notes; the saving call's reply is an
+ordinary success (it lists `entry_numbers`) and each automatic save is logged at INFO (`agent_notes: ... times in a
+row; saved it as N linked entries`) so overuse can be spotted. "In a row" means the same author and note, each refusal
+within 15 minutes of the last, with no successful write to that note in between. A text too long even for
+`MAX_CONTINUATION_ENTRIES` entries is still refused and isn't counted. The counts live in memory (OWUI keeps the loaded tool cached while its source is unchanged), so a restart or a new
 push just resets them. `notes_web.py` shows the links beside each entry.
 
 Popularity and weight (v1.9.0): `note_id.hits` and `note_data.hits` count reads; `note_data.weight` (0–100, default
