@@ -124,6 +124,16 @@ class MarkTests(Base):
         self.assertIn("not found", self.tool.mark_all_read("Nope"))
 
 
+class GuideTests(Base):
+    def test_guide_names_every_tool_and_send_state(self):
+        g = self.tool.mail_guide()
+        for name in ("list_emails", "read_email", "mark_read", "mark_all_read", "send_email"):
+            self.assertIn(name, g)
+        self.assertIn("DISABLED", g)
+        self.tool.valves.ALLOW_SEND = True
+        self.assertIn("ENABLED", self.tool.mail_guide())
+
+
 class ErrorTests(Base):
     def test_missing_credentials(self):
         self.tool.valves.NEXTCLOUD_USER = ""

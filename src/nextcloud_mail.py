@@ -1,7 +1,7 @@
 """
 title: Nextcloud Mail
 description: Read (and optionally send) email through the Nextcloud Mail app's OCS API, using a Nextcloud app password.
-version: 0.2.0
+version: 0.3.0
 requirements: requests
 """
 
@@ -141,6 +141,31 @@ class Tools:
         return text if len(text) <= limit else text[:limit] + "\n...[truncated]"
 
     # ---------- tools exposed to the model ----------
+
+    def mail_guide(self) -> str:
+        """
+        Explain what the Nextcloud Mail tools can and cannot do. Call this first if unsure how to use them.
+        """
+        send = "ENABLED" if self.valves.ALLOW_SEND else "DISABLED (the user must turn on ALLOW_SEND)"
+        return (
+            "Nextcloud Mail tools\n"
+            "\n"
+            "Workflow: list_mailboxes -> list_emails (note each email's id) -> read_email(id).\n"
+            "- list_mailboxes: folders and unread counts.\n"
+            "- list_emails(mailbox, count, search): newest first, max 50. Shows id, date, read/UNREAD, sender,\n"
+            "  subject, preview. 'search' filters by text. Ids are numbers; use them exactly as shown.\n"
+            "- read_email(message_id, mark_read=True): full text, headers and attachment NAMES. It marks the email\n"
+            "  as read; pass mark_read=false to peek without changing it.\n"
+            "- mark_read(message_id, read=True): mark one email read, or unread with read=false.\n"
+            "- mark_all_read(mailbox): marks EVERY unread email in the folder as read. Only when the user asks.\n"
+            f"- send_email(to, subject, body, cc, in_reply_to_message_id): sending is {send}. Plain text only.\n"
+            "  Only send after the user has approved the recipient and content. To reply, pass the Message-ID\n"
+            "  line from read_email as in_reply_to_message_id.\n"
+            "\n"
+            "Limits: no attachments (reading or sending), no HTML or inline images, no deleting, moving or\n"
+            "drafting. To share an image, put its URL in the body text. Long bodies are truncated, and HTML\n"
+            "emails are converted to plain text, so links and formatting may be lost.\n"
+        )
 
     def list_mailboxes(self) -> str:
         """
@@ -287,7 +312,7 @@ class Tools:
         in_reply_to_message_id: str = "",
     ) -> str:
         """
-        Send a plain-text email. Only use when the user has explicitly asked to send it and approved the content.
+        Send a plain-text email (no attachments or HTML; put image links in the body as URLs). Only use when the user has explicitly asked to send it and approved the content.
         :param to: Comma-separated recipient email addresses.
         :param subject: Subject line.
         :param body: Plain-text message body.
