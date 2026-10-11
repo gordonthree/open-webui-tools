@@ -248,7 +248,7 @@ add `continues_at` (the next surviving piece) and `continues_from` (the previous
 out at read time so editing or deleting a piece never leaves a dangling pointer. In plain `_read_tagged` such an
 entry is a small `{text, continues_*}` object instead of a bare string. The reply to the write gives
 `entry_numbers`. The `MAX_CONTINUATION_ENTRIES` valve (default 6, about 3000 characters per call) caps the
-pieces; over it, nothing is saved.
+pieces; over it, nothing is saved. `notes_web.py` shows the links beside each entry.
 
 Small models can get stuck on a note they feel they can't shorten, so (v1.11.0) the `AUTO_CONTINUE_AFTER` valve
 (default 3, `0` = never) saves the text as if `continues=true` had been passed once it has been sent too long that many
@@ -258,7 +258,7 @@ ordinary success (it lists `entry_numbers`) and each automatic save is logged at
 row; saved it as N linked entries`) so overuse can be spotted. "In a row" means the same author and note, each refusal
 within 15 minutes of the last, with no successful write to that note in between. A text too long even for
 `MAX_CONTINUATION_ENTRIES` entries is still refused and isn't counted. The counts live in memory (OWUI keeps the loaded tool cached while its source is unchanged), so a restart or a new
-push just resets them. `notes_web.py` shows the links beside each entry.
+push just resets them.
 
 Popularity and weight (v1.9.0): `note_id.hits` and `note_data.hits` count reads; `note_data.weight` (0–100, default
 50, enforced by a `CHECK`) is a rating a model sets with `agent_notes_set_weight` — lower for entries it judges
