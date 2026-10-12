@@ -68,6 +68,19 @@ class RecordTests(Base):
         self.assertEqual(meta["text"], "Remember the milk.")
         self.assertEqual(meta["url"], "/api/v1/files/abc123/content")
 
+    def test_invented_voice_name_falls_back_to_default(self):
+        fake = FakeNet()
+        out = self.run_tool(fake, self.tool.record_voice_memo, "Hi", "", "hannah-lee-calm")
+        self.assertEqual(fake.calls[0][1]["json"]["voice"], self.tool.valves.DEFAULT_VOICE)
+        self.assertIn("not a valid voice id", out)
+        self.assertIn("hannah-lee-calm", out)
+
+    def test_valid_voice_id_is_lowercased_and_no_note(self):
+        fake = FakeNet()
+        out = self.run_tool(fake, self.tool.record_voice_memo, "Hi", "", "DEADBEEFDEADBEEFDEADBEEFDEADBEEF")
+        self.assertEqual(fake.calls[0][1]["json"]["voice"], "deadbeef" * 4)
+        self.assertNotIn("not a valid voice id", out)
+
     def test_full_link_for_email(self):
         out = self.run_tool(FakeNet(), self.tool.record_voice_memo, "Hi", "T")
         self.assertIn("https://open-webui.dimension-x.net/api/v1/files/abc123/content", out)
@@ -90,8 +103,8 @@ class RecordTests(Base):
 
     def test_explicit_voice_is_passed(self):
         fake = FakeNet()
-        self.run_tool(fake, self.tool.record_voice_memo, "Hi", "", "deadbeef")
-        self.assertEqual(fake.calls[0][1]["json"]["voice"], "deadbeef")
+        self.run_tool(fake, self.tool.record_voice_memo, "Hi", "", "deadbeef" * 4)
+        self.assertEqual(fake.calls[0][1]["json"]["voice"], "deadbeef" * 4)
 
     def test_empty_and_too_long_text(self):
         self.assertIn("text is empty", self.run_tool(FakeNet(), self.tool.record_voice_memo, "  "))

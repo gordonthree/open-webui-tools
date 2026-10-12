@@ -34,6 +34,9 @@ class MemoError(RuntimeError):
         self.status = status
 
 
+_VOICE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
 def slugify(text: str, max_len: int = 40) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
     return slug[:max_len].strip("-") or "memo"
@@ -175,7 +178,7 @@ class Tools:
             "Voice memo tools\n"
             f"- record_voice_memo(text, title, voice): speaks `text` aloud and saves it as an MP3. `text` is the exact words, "
             f"plain sentences with no Markdown, at most {v.MAX_CHARS} characters (split longer memos into several calls). "
-            "`title` is optional; pass \"\" for an automatic one. `voice` is optional; pass \"\" for the default voice.\n"
+            "`title` is optional; pass \"\" for an automatic one. `voice` is optional; pass \"\" (the normal choice). Never invent a voice name; only a 32-character hex id from the user is valid.\n"
             "- The result contains a Markdown link: copy it into your reply, exactly as given, so the user can play the memo.\n"
             "- If the user wants it by email, use the 'Full link' line from the result in the email body. It opens only "
             "while the user is logged in to Open WebUI.\n"
@@ -195,7 +198,7 @@ class Tools:
 
         :param text: The exact words to speak, written the way they should be said aloud (plain sentences, no Markdown).
         :param title: Optional short title, used in the file name and the link. Omit for an automatic one.
-        :param voice: Optional Fish Audio voice id. Omit to use the default voice.
+        :param voice: Almost always omit this (pass ""). Only a 32-character hex Fish Audio voice id the user gave you is valid; never invent a voice name, it is ignored.
         :return: A message containing a Markdown link; put that link in your reply so the user can play the memo.
         """
         v = self.valves
@@ -208,7 +211,12 @@ class Tools:
                 "What to do: shorten the text, or split it into several memos with separate calls."
             )
         title = "" if is_unset(title) else title.strip()
-        voice = v.DEFAULT_VOICE if is_unset(voice) else voice.strip()
+        voice_note = ""
+        voice = "" if is_unset(voice) else voice.strip()
+        if voice and not _VOICE_ID_RE.match(voice.lower()):
+            voice_note = f"\nNote: voice {voice!r} is not a valid voice id (32 hex characters), so the default voice was used."
+            voice = ""
+        voice = (voice.lower() or v.DEFAULT_VOICE)
 
         await _emit(__event_emitter__, {"type": "status", "data": {"description": "Recording voice memo...", "done": False}})
         try:
@@ -259,11 +267,11 @@ class Tools:
             )
             return (
                 f"Recorded {name} ({len(audio)} bytes). Put this link in your reply so the user can play it:\n"
-                f"[Play {label}]({url}){email}\nSaved on the server as: {saved}"
+                f"[Play {label}]({url}){email}\nSaved on the server as: {saved}{voice_note}"
             )
         why = upload_err or "uploading to Open WebUI is turned off"
         return (
-            f"Recorded {name} ({len(audio)} bytes) and saved on the server as: {saved}\n"
+            f"Recorded {name} ({len(audio)} bytes) and saved on the server as: {saved}{voice_note}\n"
             f"No playable link could be made ({why}). Tell the user the memo exists at that path and that the tool's "
             "OPEN_WEBUI_API_KEY valve needs checking."
         )
