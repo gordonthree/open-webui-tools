@@ -164,6 +164,25 @@ class Tools:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    async def voice_memo_help(self) -> str:
+        """
+        Explain how to use the voice memo tools. Call it when you are unsure how to record a memo or what to do with the result.
+
+        :return: A short guide.
+        """
+        v = self.valves
+        return (
+            "Voice memo tools\n"
+            f"- record_voice_memo(text, title, voice): speaks `text` aloud and saves it as an MP3. `text` is the exact words, "
+            f"plain sentences with no Markdown, at most {v.MAX_CHARS} characters (split longer memos into several calls). "
+            "`title` is optional; pass \"\" for an automatic one. `voice` is optional; pass \"\" for the default voice.\n"
+            "- The result contains a Markdown link: copy it into your reply, exactly as given, so the user can play the memo.\n"
+            "- If the user wants it by email, use the 'Full link' line from the result in the email body. It opens only "
+            "while the user is logged in to Open WebUI.\n"
+            "- list_voice_memos(limit): shows recent memos with their links, newest first.\n"
+            "- If recording fails, the error says what to do. Do not retry more than once; tell the user instead."
+        )
+
     async def record_voice_memo(
         self,
         text: str,

@@ -47,7 +47,7 @@ Current tools:
   same folder). Notes are addressed by name (unique, case-insensitive) and entries by number; there
   are no UUIDs, since a model reproduces a plain-language name more reliably than an opaque id.
 
-- `voice_memo.py` → `record_voice_memo`, `list_voice_memos` — lets a model record a spoken memo: the text goes to
+- `voice_memo.py` → `record_voice_memo`, `list_voice_memos`, `voice_memo_help` — lets a model record a spoken memo: the text goes to
   a TTS model on OpenRouter (valve `TTS_MODEL`, default `fish-audio/s2.1-pro-free:free`, OpenRouter's own id
   with no OWUI connection prefix like `or.`), the MP3 is kept in `MEMO_DIR` (default
   `/app/backend/data/voice_memos`, with a `.json` sidecar holding the text) and uploaded to OWUI's file storage,

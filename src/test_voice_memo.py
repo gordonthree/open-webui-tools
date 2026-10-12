@@ -140,6 +140,14 @@ class ListTests(Base):
         self.assertIn("T", asyncio.run(self.tool.list_voice_memos("lots")))
 
 
+class HelpTests(Base):
+    def test_help_mentions_methods_and_limit(self):
+        out = asyncio.run(self.tool.voice_memo_help())
+        self.assertIn("record_voice_memo", out)
+        self.assertIn("list_voice_memos", out)
+        self.assertIn(str(self.tool.valves.MAX_CHARS), out)
+
+
 class SlugTests(unittest.TestCase):
     def test_slugify(self):
         self.assertEqual(mod.slugify("Hello, World!"), "hello-world")
