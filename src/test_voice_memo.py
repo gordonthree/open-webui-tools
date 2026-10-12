@@ -68,6 +68,16 @@ class RecordTests(Base):
         self.assertEqual(meta["text"], "Remember the milk.")
         self.assertEqual(meta["url"], "/api/v1/files/abc123/content")
 
+    def test_full_link_for_email(self):
+        out = self.run_tool(FakeNet(), self.tool.record_voice_memo, "Hi", "T")
+        self.assertIn("https://open-webui.dimension-x.net/api/v1/files/abc123/content", out)
+        self.assertIn("logged in", out)
+
+    def test_full_link_omitted_when_base_empty(self):
+        self.tool.valves.PUBLIC_BASE_URL = ""
+        out = self.run_tool(FakeNet(), self.tool.record_voice_memo, "Hi", "T")
+        self.assertNotIn("Full link", out)
+
     def test_request_uses_bare_model_default_voice_and_mp3(self):
         fake = FakeNet()
         self.run_tool(fake, self.tool.record_voice_memo, "Hi", "", "none")
@@ -123,6 +133,7 @@ class ListTests(Base):
         out = asyncio.run(self.tool.list_voice_memos("5"))
         self.assertIn("First", out)
         self.assertIn("[play](/api/v1/files/abc123/content)", out)
+        self.assertIn("full link: https://open-webui.dimension-x.net/api/v1/files/abc123/content", out)
 
     def test_bad_limit_falls_back(self):
         self.run_tool(FakeNet(), self.tool.record_voice_memo, "x", "T")

@@ -130,6 +130,10 @@ class Tools:
             default="",
             description="Personal API key from Open WebUI (Settings -> Account -> API Keys). Set it here in the valve, not in the code.",
         )
+        PUBLIC_BASE_URL: str = Field(
+            default="https://open-webui.dimension-x.net",
+            description="Address the user's browser uses for Open WebUI. Used to build a full link that also works in an email (the user must be logged in to Open WebUI to open it). Empty = only the in-chat relative link.",
+        )
         REQUEST_TIMEOUT_SECONDS: int = Field(default=90, description="Per-HTTP-request timeout.")
 
     def __init__(self):
@@ -230,9 +234,13 @@ class Tools:
         await _emit(__event_emitter__, {"type": "status", "data": {"description": "Voice memo recorded", "done": True}})
         label = title or "voice memo"
         if url:
+            full = f"{v.PUBLIC_BASE_URL.rstrip('/')}{url}" if v.PUBLIC_BASE_URL.strip() else ""
+            email = (
+                f"\nFull link for an email (opens only when the user is logged in to Open WebUI): {full}" if full else ""
+            )
             return (
                 f"Recorded {name} ({len(audio)} bytes). Put this link in your reply so the user can play it:\n"
-                f"[Play {label}]({url})\nSaved on the server as: {saved}"
+                f"[Play {label}]({url}){email}\nSaved on the server as: {saved}"
             )
         why = upload_err or "uploading to Open WebUI is turned off"
         return (
@@ -262,6 +270,7 @@ class Tools:
                 m = json.loads(p.read_text())
             except (OSError, ValueError):
                 continue
-            link = f"[play]({m['url']})" if m.get("url") else "(no link)"
+            base = self.valves.PUBLIC_BASE_URL.strip().rstrip("/")
+            link = f"[play]({m['url']}) full link: {base}{m['url']}" if m.get("url") and base else f"[play]({m['url']})" if m.get("url") else "(no link)"
             lines.append(f"- {m.get('created', '?')} - {m.get('title', p.stem)} ({m.get('chars', '?')} chars) {link}")
         return "\n".join(lines) or "No voice memos recorded yet."
