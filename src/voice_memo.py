@@ -160,6 +160,11 @@ class Tools:
                 "OpenRouter did not accept the request. If you passed a voice, retry once without it "
                 "(pass an empty string for voice). If it fails again, tell the user the model or voice setting needs checking."
             )
+        elif status == 429 and re.search(r"per-day|daily|free-models", str(e), re.I):
+            hint = (
+                "OpenRouter's daily limit for free models has been reached. It resets by itself in a few hours. "
+                "Do not retry; tell the user the memo could not be recorded until the limit resets."
+            )
         elif status == 429 or status >= 500 or status == -1:
             hint = "A temporary problem on the OpenRouter side. Retry once; if it fails again, tell the user."
         else:

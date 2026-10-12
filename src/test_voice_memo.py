@@ -144,6 +144,17 @@ class RecordTests(Base):
         self.assertIn("without it", out)
         self.assertFalse(Path(self.tool.valves.MEMO_DIR).exists())
 
+    def test_daily_free_limit_says_do_not_retry(self):
+        msg = "Rate limit exceeded: free-models-per-day-high-balance"
+        fake = FakeNet(tts=Resp(429, payload={"error": {"message": msg, "code": 429}}))
+        out = self.run_tool(fake, self.tool.record_voice_memo, "Hi")
+        self.assertIn(msg, out)
+        self.assertIn("Do not retry", out)
+
+    def test_plain_429_still_retries_once(self):
+        fake = FakeNet(tts=Resp(429, payload={"error": {"message": "Too many requests", "code": 429}}))
+        self.assertIn("Retry once", self.run_tool(fake, self.tool.record_voice_memo, "Hi"))
+
     def test_missing_openrouter_key(self):
         self.tool.valves.OPENROUTER_API_KEY = ""
         out = self.run_tool(FakeNet(), self.tool.record_voice_memo, "Hi")
