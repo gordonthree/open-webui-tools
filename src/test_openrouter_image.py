@@ -309,6 +309,10 @@ class AttachTests(Base):
         self.assertEqual(out["share_url"], "https://open-webui.dimension-x.net/api/v1/files/img123/content")
         self.assertIn("share_url", out["note"])
 
+    def test_note_tells_model_not_to_repeat_it(self):
+        out, _, _ = self.collect()
+        self.assertTrue(out["note"].startswith("(Instructions for you only: do not repeat"))
+
     def test_no_share_url_without_public_base(self):
         out, _, _ = self.collect(PUBLIC_BASE_URL="")
         self.assertNotIn("share_url", out)

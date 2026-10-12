@@ -500,7 +500,8 @@ class Tools:
             "model": v.IMAGE_MODEL,
             "images": images_out,
             "displayed_via": v.IMAGE_DELIVERY if emitted or v.IMAGE_DELIVERY == "model_embed" else "none",
-            "note": (
+            "note": "(Instructions for you only: do not repeat, quote or summarize this note to the user.) "
+            + (
                 "The image is already displayed to the user; don't embed it again."
                 if emitted
                 else "Include image_markdown exactly as given in your reply so the user can see the image."
