@@ -133,6 +133,10 @@ class Tools:
             default="",
             description="Personal API key from Open WebUI (Settings -> Account -> API Keys). Set it here in the valve, not in the code.",
         )
+        ATTACH_TO_CHAT: bool = Field(
+            default=True,
+            description="Also attach each uploaded memo to the assistant's message, so it is listed in the chat's Files tab. Needs the upload to have worked.",
+        )
         PUBLIC_BASE_URL: str = Field(
             default="https://open-webui.dimension-x.net",
             description="Address the user's browser uses for Open WebUI. Used to build a full link that also works in an email (the user must be logged in to Open WebUI to open it). Empty = only the in-chat relative link.",
@@ -258,6 +262,19 @@ class Tools:
             except OSError:
                 pass
 
+        if url and v.ATTACH_TO_CHAT:
+            file_id = url.split("/api/v1/files/")[1].split("/")[0]
+            await _emit(
+                __event_emitter__,
+                {
+                    "type": "files",
+                    "data": {
+                        "files": [
+                            {"type": "file", "id": file_id, "url": url, "name": name, "size": len(audio), "status": "uploaded"}
+                        ]
+                    },
+                },
+            )
         await _emit(__event_emitter__, {"type": "status", "data": {"description": "Voice memo recorded", "done": True}})
         label = title or "voice memo"
         if url:

@@ -81,6 +81,31 @@ class RecordTests(Base):
         self.assertEqual(fake.calls[0][1]["json"]["voice"], "deadbeef" * 4)
         self.assertNotIn("not a valid voice id", out)
 
+    def test_memo_is_attached_to_chat_files(self):
+        events = []
+
+        async def emit(e):
+            events.append(e)
+
+        self.run_tool(FakeNet(), self.tool.record_voice_memo, "Hi", "T", "", emit)
+        files = [e for e in events if e["type"] == "files"]
+        self.assertEqual(len(files), 1)
+        f = files[0]["data"]["files"][0]
+        self.assertEqual((f["id"], f["url"]), ("abc123", "/api/v1/files/abc123/content"))
+        self.assertTrue(f["name"].endswith("-t.mp3"))
+
+    def test_no_attach_when_valve_off_or_upload_failed(self):
+        events = []
+
+        async def emit(e):
+            events.append(e)
+
+        self.tool.valves.ATTACH_TO_CHAT = False
+        self.run_tool(FakeNet(), self.tool.record_voice_memo, "Hi", "T", "", emit)
+        self.tool.valves.ATTACH_TO_CHAT = True
+        self.run_tool(FakeNet(upload=Resp(401, payload={})), self.tool.record_voice_memo, "Hi", "T", "", emit)
+        self.assertFalse([e for e in events if e["type"] == "files"])
+
     def test_full_link_for_email(self):
         out = self.run_tool(FakeNet(), self.tool.record_voice_memo, "Hi", "T")
         self.assertIn("https://open-webui.dimension-x.net/api/v1/files/abc123/content", out)

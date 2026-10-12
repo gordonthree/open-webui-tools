@@ -54,7 +54,8 @@ Current tools:
   and the model gets back a Markdown link the user clicks to play it. `DEFAULT_VOICE` is a Fish Audio
   `reference_id` from fish.audio's voice library. Needs `OPENROUTER_API_KEY` and `OPEN_WEBUI_API_KEY` valves.
   `PUBLIC_BASE_URL` (default the OWUI address) makes it also return a full link the model can paste into an email;
-  it opens only for a browser logged in to OWUI. No delete method on purpose. Unrelated to ComfyUI.
+  it opens only for a browser logged in to OWUI. `ATTACH_TO_CHAT` (on) also attaches the memo to the assistant message via a `files` event so it
+  shows in the chat's Files tab. No delete method on purpose. Unrelated to ComfyUI.
 
 - `agent_duo.py` — an Open WebUI **Pipe** (a Function, not a Tool) that shows up as one model, "Mara + Hannah",
   and puts two agents living on **two different OWUI servers** into one chat with the human. See "Two-agent
