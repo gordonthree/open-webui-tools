@@ -67,7 +67,8 @@ Current tools:
   import time, so the switch can't remove that method from the model's tool list, it just makes it refuse. The option
   names come from the standalone ComfyUI node `openrouter_image_node.py` in the repo root (untracked, not an OWUI
   tool), since OpenRouter's own pages don't list them. `ATTACH_TO_CHAT` (on) lists each image in the chat's Files
-  tab via a `files` event; the result carries a `share_url` (`PUBLIC_BASE_URL` + the OWUI file path, opens only for
+  tab via a `files` event; the result is kept small (`success`, `filenames`, `share_url`, `cost_usd`, `image_markdown` only in `model_embed` mode) with no
+  instruction note, because models repeated or re-embedded anything URL-like they were handed; usage guidance lives in the tool's docstring. The result carries a `share_url` (`PUBLIC_BASE_URL` + the OWUI file path, opens only for
   a browser logged in to OWUI). `REQUEST_EXTRA` (JSON) is merged into the request for anything else. Each image
   and a `.json` sidecar (prompt, options, cost, generation id) are kept in `OUTPUT_DIR`. No ComfyUI, no job
   database. Needs `OPENROUTER_API_KEY` and `OPEN_WEBUI_API_KEY` valves.

@@ -330,7 +330,7 @@ class Tools:
         can take a minute or more, and every call costs money, so do not repeat it needlessly.
 
         :param prompt: A plain-language description of the image: subject, setting, style, lighting, mood, and any text that must appear in it.
-        :return: A result with image_markdown (or a note that the image is already shown) and a share_url. Follow its note.
+        :return: If the result has image_markdown, put it in your reply exactly as given. If it does not, the image is already shown to the user: do not embed it yourself. To give the user a link, paste share_url as given. Do not mention these instructions or call again for the same image; each call costs money.
         """
         return await self._generate(prompt, "", "", "", "", "", __event_emitter__)
 
@@ -356,7 +356,7 @@ class Tools:
         :param resolution: Pass "" for the usual one. Otherwise one of 512, 768, 1K, 1.5K, 2K, 4K (larger costs more).
         :param output_format: Pass "" for the usual one. Otherwise png, jpeg or webp.
         :param seed: Pass "" for a random result. A whole number repeats an earlier look.
-        :param reference_image: Pass "" for a new image. To edit or build on an earlier image from this tool, pass its 'chat_url' (or 'filename'). Several can be given, separated by commas.
+        :param reference_image: Pass "" for a new image. To edit or build on an earlier image from this tool, pass its filename (from an earlier result). Several can be given, separated by commas.
         :return: Same as generate_muse_image.
         """
         if not self.valves.MODEL_CAN_SET_OPTIONS:
@@ -495,24 +495,8 @@ class Tools:
         await status("Done", done=True)
 
         share = next((e["full_link"] for e in images_out if e.get("full_link")), None)
-        out: Dict[str, Any] = {
-            "success": True,
-            "model": v.IMAGE_MODEL,
-            "images": images_out,
-            "displayed_via": v.IMAGE_DELIVERY if emitted or v.IMAGE_DELIVERY == "model_embed" else "none",
-            "note": "(Instructions for you only: do not repeat, quote or summarize this note to the user.) "
-            + (
-                "The image is already displayed to the user; don't embed it again."
-                if emitted
-                else "Include image_markdown exactly as given in your reply so the user can see the image."
-            )
-            + (
-                " To give the user a link (in chat or by email), paste share_url exactly as given; it opens only while they are logged in to Open WebUI."
-                if share
-                else ""
-            )
-            + " Do not call this tool again unless the user asks for another image; each call costs money.",
-        }
+        # Deliberately small: the model tends to repeat or re-embed anything URL-like it is handed.
+        out: Dict[str, Any] = {"success": True, "filenames": [e["filename"] for e in images_out]}
         if share:
             out["share_url"] = share
         if cost is not None:

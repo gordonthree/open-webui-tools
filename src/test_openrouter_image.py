@@ -74,7 +74,8 @@ class GenerateTests(Base):
         self.assertTrue(out["success"])
         self.assertIn("![generated image](/api/v1/files/img123/content)", out["image_markdown"])
         self.assertEqual(out["cost_usd"], 0.0042)
-        self.assertEqual(out["images"][0]["full_link"], "https://open-webui.dimension-x.net/api/v1/files/img123/content")
+        self.assertEqual(out["share_url"], "https://open-webui.dimension-x.net/api/v1/files/img123/content")
+        self.assertEqual(len(out["filenames"]), 1)
         files = sorted(p.suffix for p in Path(self.tool.valves.OUTPUT_DIR).iterdir())
         self.assertEqual(files, [".json", ".png"])
         meta = json.loads(next(Path(self.tool.valves.OUTPUT_DIR).glob("*.json")).read_text())
@@ -155,7 +156,7 @@ class GenerateTests(Base):
         f = files[0]["data"]["files"][0]
         self.assertEqual((f["type"], f["id"], f["url"]), ("image", "img123", "/api/v1/files/img123/content"))
         self.assertEqual(len(files), 1)
-        self.assertIn("already displayed", out["note"])
+        self.assertNotIn("note", out)
 
     def test_no_local_copy(self):
         self.tool.valves.SAVE_LOCAL_COPY = False
@@ -307,11 +308,12 @@ class AttachTests(Base):
     def test_share_url_is_returned(self):
         out, _, _ = self.collect()
         self.assertEqual(out["share_url"], "https://open-webui.dimension-x.net/api/v1/files/img123/content")
-        self.assertIn("share_url", out["note"])
 
-    def test_note_tells_model_not_to_repeat_it(self):
-        out, _, _ = self.collect()
-        self.assertTrue(out["note"].startswith("(Instructions for you only: do not repeat"))
+    def test_result_is_small_and_has_no_note_or_embeddable_urls(self):
+        out, _, _ = self.collect(IMAGE_DELIVERY="files_event")
+        self.assertEqual(set(out), {"success", "filenames", "share_url", "cost_usd"})
+        out, _, _ = self.collect(IMAGE_DELIVERY="model_embed")
+        self.assertEqual(set(out), {"success", "filenames", "share_url", "cost_usd", "image_markdown"})
 
     def test_no_share_url_without_public_base(self):
         out, _, _ = self.collect(PUBLIC_BASE_URL="")
