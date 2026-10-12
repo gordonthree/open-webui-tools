@@ -182,6 +182,31 @@ async def _emit(emitter: Optional[Callable], payload: Dict[str, Any]) -> None:
         await emitter(payload)
 
 
+# Images attached so far to each assistant message (message id -> files), newest messages last.
+_CHAT_FILES: Dict[str, List[Dict[str, Any]]] = {}
+_CHAT_FILES_KEEP = 50
+
+
+async def _publish_files(emitter: Optional[Callable], message_id: Optional[str], new_files: List[Dict[str, Any]]) -> None:
+    """
+    Attach files to the assistant message. Open WebUI's backend saves a `files` event by merging it into the
+    message, but its browser code REPLACES the message's file list with each event's, so a second call in the
+    same message would push the first image out of view until a reload. So after the saving event, a
+    `chat:message:files` event (shown by the browser, not saved by the backend) carries the full list so far.
+    """
+    if not emitter or not new_files:
+        return
+    await emitter({"type": "files", "data": {"files": new_files}})
+    if not message_id:
+        return
+    so_far = _CHAT_FILES.setdefault(message_id, [])
+    so_far.extend(new_files)
+    while len(_CHAT_FILES) > _CHAT_FILES_KEEP:
+        _CHAT_FILES.pop(next(iter(_CHAT_FILES)))
+    if len(so_far) > len(new_files):
+        await emitter({"type": "chat:message:files", "data": {"files": list(so_far)}})
+
+
 class Tools:
     class Valves(BaseModel):
         OPENROUTER_API_KEY: str = Field(default="", description="OpenRouter API key (https://openrouter.ai/settings/keys). This model is paid.")
@@ -322,6 +347,7 @@ class Tools:
         self,
         prompt: str,
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
+        __message_id__: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate one image with Meta's Muse Image model on OpenRouter (a paid, hosted model that reasons
@@ -335,7 +361,7 @@ the one prompt, in plain sentences; size, format and the other settings are chos
 
         :param prompt: A plain-language description of the image: subject, setting, style, lighting, mood, and any text that must appear in it.
         """
-        return await self._generate(prompt, "", "", "", "", "", __event_emitter__)
+        return await self._generate(prompt, "", "", "", "", "", __event_emitter__, __message_id__)
 
     async def generate_muse_image_advanced(
         self,
@@ -346,6 +372,7 @@ the one prompt, in plain sentences; size, format and the other settings are chos
         seed: str = "",
         reference_image: str = "",
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
+        __message_id__: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Like generate_muse_image, with per-call settings. Only use this when the user explicitly asks for a
@@ -367,9 +394,9 @@ the one prompt, in plain sentences; size, format and the other settings are chos
                 "success": False,
                 "error": "Per-call image settings are turned off. Call generate_muse_image with just the prompt instead; the size and other settings are already chosen.",
             }
-        return await self._generate(prompt, aspect_ratio, resolution, output_format, seed, reference_image, __event_emitter__)
+        return await self._generate(prompt, aspect_ratio, resolution, output_format, seed, reference_image, __event_emitter__, __message_id__)
 
-    async def _generate(self, prompt, aspect_ratio, resolution, output_format, seed, reference_image, __event_emitter__) -> Dict[str, Any]:
+    async def _generate(self, prompt, aspect_ratio, resolution, output_format, seed, reference_image, __event_emitter__, __message_id__=None) -> Dict[str, Any]:
         v = self.valves
         prompt = (prompt or "").strip()
         if not prompt:
@@ -480,20 +507,14 @@ the one prompt, in plain sentences; size, format and the other settings are chos
 
         chat_sources = [f["url"] for f in chat_files]
         shows_inline = v.IMAGE_DELIVERY == "files_event" and bool(__event_emitter__)
-        if shows_inline:
-            # One event both displays the image and lists it in the Files tab.
-            payload = {"type": "files", "data": {"files": [{"type": "image", "status": "uploaded", **f} for f in chat_files]}}
-            await _emit(__event_emitter__, payload)
-        else:
-            if v.IMAGE_DELIVERY == "message_event" and __event_emitter__:
-                md = "\n\n".join(f"![generated image]({u})" for u in chat_sources)
-                await _emit(__event_emitter__, {"type": "message", "data": {"content": md + "\n\n"}})
-            if v.ATTACH_TO_CHAT and __event_emitter__:
-                # type "file" (not "image") so it is listed without being drawn a second time.
-                await _emit(
-                    __event_emitter__,
-                    {"type": "files", "data": {"files": [{"type": "file", "status": "uploaded", **f} for f in chat_files]}},
-                )
+        if v.IMAGE_DELIVERY == "message_event" and __event_emitter__:
+            md = "\n\n".join(f"![generated image]({u})" for u in chat_sources)
+            await _emit(__event_emitter__, {"type": "message", "data": {"content": md + "\n\n"}})
+        if shows_inline or (v.ATTACH_TO_CHAT and __event_emitter__):
+            # "image" displays the picture in the message (and lists it in the Files tab); "file" only lists it,
+            # so it is not drawn a second time next to the model's own embed.
+            kind = "image" if shows_inline else "file"
+            await _publish_files(__event_emitter__, __message_id__, [{"type": kind, "status": "uploaded", **f} for f in chat_files])
         emitted = v.IMAGE_DELIVERY != "model_embed" and bool(__event_emitter__)
         await status("Done", done=True)
 

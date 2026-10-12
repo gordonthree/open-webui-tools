@@ -53,6 +53,7 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.tool = mod.Tools()
+        mod._CHAT_FILES.clear()
         self.tool.valves.OUTPUT_DIR = str(Path(self.tmp.name) / "imgs")
         self.tool.valves.OPENROUTER_API_KEY = "or-key"
         self.tool.valves.OPEN_WEBUI_API_KEY = "owui-key"
@@ -326,6 +327,50 @@ class AttachTests(Base):
     def test_no_share_url_without_public_base(self):
         out, _, _ = self.collect(PUBLIC_BASE_URL="")
         self.assertNotIn("share_url", out)
+
+
+class MultiImageTests(Base):
+    def calls(self, ids):
+        events = []
+
+        async def emit(e):
+            events.append(e)
+
+        for mid in ids:
+            self.run_tool(FakeNet(upload=Resp(200, {"id": f"img-{len(events)}"})), "A fox", __event_emitter__=emit, __message_id__=mid)
+        return events
+
+    def test_second_image_in_same_message_sends_the_full_list_live(self):
+        events = self.calls(["m1", "m1"])
+        saved = [e for e in events if e["type"] == "files"]
+        live = [e for e in events if e["type"] == "chat:message:files"]
+        self.assertEqual([len(e["data"]["files"]) for e in saved], [1, 1])  # backend merges these itself
+        self.assertEqual(len(live), 1)
+        self.assertEqual(len(live[0]["data"]["files"]), 2)
+        self.assertEqual(events.index(live[0]) > events.index(saved[1]), True)  # full list comes after the saving event
+
+    def test_third_image_sends_all_three(self):
+        live = [e for e in self.calls(["m1"] * 3) if e["type"] == "chat:message:files"]
+        self.assertEqual([len(e["data"]["files"]) for e in live], [2, 3])
+
+    def test_different_messages_do_not_mix(self):
+        events = self.calls(["m1", "m2"])
+        self.assertFalse([e for e in events if e["type"] == "chat:message:files"])
+
+    def test_no_message_id_still_attaches_without_live_list(self):
+        events = self.calls([None, None])
+        self.assertEqual(len([e for e in events if e["type"] == "files"]), 2)
+        self.assertFalse([e for e in events if e["type"] == "chat:message:files"])
+
+    def test_message_id_is_hidden_from_the_model(self):
+        import inspect
+
+        for fn in (mod.Tools.generate_muse_image, mod.Tools.generate_muse_image_advanced):
+            self.assertIn("__message_id__", inspect.signature(fn).parameters)
+
+    def test_memory_is_bounded(self):
+        self.calls([f"m{i}" for i in range(mod._CHAT_FILES_KEEP + 10)])
+        self.assertLessEqual(len(mod._CHAT_FILES), mod._CHAT_FILES_KEEP)
 
 
 class HelperTests(unittest.TestCase):
