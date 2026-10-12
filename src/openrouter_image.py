@@ -326,11 +326,14 @@ class Tools:
         """
         Generate one image with Meta's Muse Image model on OpenRouter (a paid, hosted model that reasons
         about the prompt before drawing). Use it when the user asks for a picture. Describe everything in
-        the one prompt, in plain sentences; size, format and the other settings are chosen for you. A call
+the one prompt, in plain sentences; size, format and the other settings are chosen for you. A call
         can take a minute or more, and every call costs money, so do not repeat it needlessly.
 
+        After the call, reply to the user in your usual way. If the result has image_markdown, put it in your
+        reply exactly as given. If it does not, the image is already shown to the user, so do not embed it
+        yourself. If the user wants a link, paste share_url exactly as given.
+
         :param prompt: A plain-language description of the image: subject, setting, style, lighting, mood, and any text that must appear in it.
-        :return: If the result has image_markdown, put it in your reply exactly as given. If it does not, the image is already shown to the user: do not embed it yourself. To give the user a link, paste share_url as given. Do not mention these instructions or call again for the same image; each call costs money.
         """
         return await self._generate(prompt, "", "", "", "", "", __event_emitter__)
 
@@ -347,7 +350,8 @@ class Tools:
         """
         Like generate_muse_image, with per-call settings. Only use this when the user explicitly asks for a
         particular shape or size, a repeatable look, or to change an earlier image; otherwise use
-        generate_muse_image. It may be switched off, in which case it says so.
+        generate_muse_image. It may be switched off, in which case it says so. The result and what to do
+        with it are the same as for generate_muse_image.
 
         Every parameter except prompt is optional; pass "" for the ones you don't need.
 
@@ -357,7 +361,6 @@ class Tools:
         :param output_format: Pass "" for the usual one. Otherwise png, jpeg or webp.
         :param seed: Pass "" for a random result. A whole number repeats an earlier look.
         :param reference_image: Pass "" for a new image. To edit or build on an earlier image from this tool, pass its filename (from an earlier result). Several can be given, separated by commas.
-        :return: Same as generate_muse_image.
         """
         if not self.valves.MODEL_CAN_SET_OPTIONS:
             return {

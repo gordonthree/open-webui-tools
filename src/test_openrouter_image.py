@@ -232,6 +232,14 @@ class ValveTests(Base):
         params = [p for p in inspect.signature(mod.Tools.generate_muse_image).parameters if not p.startswith("__") and p != "self"]
         self.assertEqual(params, ["prompt"])
 
+    def test_usage_guidance_is_in_the_description_open_webui_keeps(self):
+        import re
+
+        # Open WebUI keeps only the docstring text before the first :param / :return: line.
+        desc = re.split(":(param|return)", mod.Tools.generate_muse_image.__doc__, 1)[0]
+        self.assertIn("image_markdown", desc)
+        self.assertIn("share_url", desc)
+
     def test_default_valves_are_applied(self):
         v = self.tool.valves
         v.DEFAULT_ASPECT_RATIO, v.DEFAULT_RESOLUTION, v.DEFAULT_OUTPUT_FORMAT, v.DEFAULT_SEED = "3:2", "2K", "webp", "7"
