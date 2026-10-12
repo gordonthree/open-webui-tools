@@ -144,7 +144,7 @@ class GenerateTests(Base):
         async def emit(e):
             events.append(e)
 
-        out = self.run_tool(FakeNet(), "A fox", emit)
+        out = self.run_tool(FakeNet(), "A fox", __event_emitter__=emit)
         self.assertNotIn("image_markdown", out)
         files = [e for e in events if e["type"] == "files"]
         self.assertEqual(files[0]["data"]["files"], [{"type": "image", "url": "/api/v1/files/img123/content"}])
@@ -154,6 +154,67 @@ class GenerateTests(Base):
         self.tool.valves.SAVE_LOCAL_COPY = False
         self.run_tool(FakeNet(), "A fox")
         self.assertFalse(Path(self.tool.valves.OUTPUT_DIR).exists())
+
+
+class OptionTests(Base):
+    def test_options_are_sent(self):
+        fake = FakeNet()
+        out = self.run_tool(fake, "A fox", "16:9", "2k", "JPG", "42")
+        self.assertTrue(out["success"])
+        self.assertEqual(
+            fake.calls[0][1]["json"],
+            {"aspect_ratio": "16:9", "resolution": "2K", "output_format": "jpeg", "seed": 42, "model": "meta/muse-image", "prompt": "A fox"},
+        )
+
+    def test_unset_options_are_not_sent(self):
+        fake = FakeNet()
+        self.run_tool(fake, "A fox", "none", "", "default", "null", "")
+        self.assertEqual(fake.calls[0][1]["json"], {"model": "meta/muse-image", "prompt": "A fox"})
+
+    def test_bad_option_lists_choices_and_makes_no_call(self):
+        fake = FakeNet()
+        out = self.run_tool(fake, "A fox", "wide")
+        self.assertFalse(out["success"])
+        self.assertIn("16:9", out["error"])
+        self.assertEqual(fake.calls, [])
+        self.assertIn("whole number", self.run_tool(fake, "A fox", "", "", "", "abc")["error"])
+
+    def test_reference_from_owui_link_becomes_data_url(self):
+        fake = FakeNet()
+        with mock.patch.object(mod.requests, "get", return_value=Resp(200, content=PNG)) as g:
+            self.run_tool(fake, "Make it night", "", "", "", "", "/api/v1/files/abc/content")
+        self.assertTrue(g.call_args[0][0].endswith("/api/v1/files/abc/content"))
+        ref = fake.calls[0][1]["json"]["input_references"][0]
+        self.assertEqual(ref["type"], "image_url")
+        self.assertTrue(ref["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    def test_reference_from_local_filename_and_no_path_tricks(self):
+        d = Path(self.tool.valves.OUTPUT_DIR)
+        d.mkdir(parents=True)
+        (d / "old.png").write_bytes(PNG)
+        fake = FakeNet()
+        self.run_tool(fake, "Edit", "", "", "", "", "../../etc/old.png")
+        self.assertEqual(len(fake.calls[0][1]["json"]["input_references"]), 1)
+
+    def test_missing_reference_is_a_clear_error(self):
+        out = self.run_tool(FakeNet(), "Edit", "", "", "", "", "nope.png")
+        self.assertFalse(out["success"])
+        self.assertIn("not found", out["error"])
+
+    def test_too_many_references(self):
+        self.tool.valves.MAX_REFERENCES = 1
+        out = self.run_tool(FakeNet(), "Edit", "", "", "", "", "a.png,b.png")
+        self.assertIn("At most 1", out["error"])
+
+    def test_sidecar_omits_reference_bytes(self):
+        d = Path(self.tool.valves.OUTPUT_DIR)
+        d.mkdir(parents=True)
+        (d / "old.png").write_bytes(PNG)
+        self.run_tool(FakeNet(), "Edit", "1:1", "", "", "", "old.png")
+        meta = json.loads(next(p for p in d.glob("*.json")).read_text())
+        self.assertEqual(meta["references"], 1)
+        self.assertNotIn("input_references", meta["extra"])
+        self.assertEqual(meta["extra"]["aspect_ratio"], "1:1")
 
 
 class HelperTests(unittest.TestCase):

@@ -59,10 +59,13 @@ Current tools:
 
 - `openrouter_image.py` → `generate_muse_image` — a paid, hosted alternative to `generate_image`: sends one plain-language
   prompt to Meta's `meta/muse-image` through OpenRouter's `/api/v1/images` and shows the result in the chat (same
-  `IMAGE_DELIVERY` modes and OWUI file upload as `generate_image`). The model's declared image parameters are empty, so
-  the tool sends only `model` and `prompt`; the `REQUEST_EXTRA` valve (a JSON object) is merged into the request for
-  anything else OpenRouter turns out to accept. Each image and a `.json` sidecar (prompt, cost, generation id) are
-  kept in `OUTPUT_DIR`. No ComfyUI, no job database. Needs `OPENROUTER_API_KEY` and `OPEN_WEBUI_API_KEY` valves.
+  `IMAGE_DELIVERY` modes and OWUI file upload as `generate_image`). Optional `aspect_ratio`, `resolution`
+  (512-4K), `output_format`, `seed`, and `reference_image` (an earlier result's `chat_url`/`filename`, or several
+  comma-separated, to edit or build on it; sent as `input_references` data URLs). The option names and values come
+  from the standalone ComfyUI node `openrouter_image_node.py` in the repo root (untracked, not an OWUI tool), since
+  OpenRouter's own pages don't list them. The `REQUEST_EXTRA` valve (a JSON object) is merged into the request for
+  anything else. Each image and a `.json` sidecar (prompt, options, cost, generation id) are kept in `OUTPUT_DIR`.
+  No ComfyUI, no job database. Needs `OPENROUTER_API_KEY` and `OPEN_WEBUI_API_KEY` valves.
 
 - `agent_duo.py` — an Open WebUI **Pipe** (a Function, not a Tool) that shows up as one model, "Mara + Hannah",
   and puts two agents living on **two different OWUI servers** into one chat with the human. See "Two-agent

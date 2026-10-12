@@ -27,6 +27,25 @@ def is_unset(value: Any) -> bool:
     return value is None or (isinstance(value, str) and value.strip().lower() in _UNSET_STRINGS)
 
 
+ASPECT_RATIOS = ["1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "4:5", "5:4", "21:9", "9:21", "2:1", "1:2"]
+RESOLUTIONS = ["512", "768", "1K", "1.5K", "2K", "4K"]
+OUTPUT_FORMATS = ["png", "jpeg", "webp"]
+_FILE_URL_RE = re.compile(r"/api/v1/files/([A-Za-z0-9_-]+)/content")
+
+
+def pick_option(value: Any, allowed: List[str], what: str) -> Optional[str]:
+    """None when unset; the canonical spelling of a valid choice; otherwise a ValueError listing the choices."""
+    if is_unset(value):
+        return None
+    wanted = str(value).strip().lower().replace(" ", "")
+    for a in allowed:
+        if a.lower() == wanted:
+            return a
+    if what == "output_format" and wanted == "jpg":
+        return "jpeg"
+    raise ValueError(f"{what} {str(value).strip()!r} is not supported. Choose one of: {', '.join(allowed)}, or pass \"\" for the default.")
+
+
 class ImageError(RuntimeError):
     """A failed OpenRouter call, keeping the HTTP status so errors can be explained."""
 
@@ -98,6 +117,32 @@ def extract_images(data: Dict[str, Any], timeout: int) -> List[bytes]:
     return [b for b in out if b]
 
 
+def load_reference(valves: "Tools.Valves", ref: str) -> bytes:
+    """Bytes of an earlier image: an Open WebUI file link/path, or a file name in OUTPUT_DIR."""
+    ref = ref.strip()
+    m = _FILE_URL_RE.search(ref)
+    if m:
+        if not valves.OPEN_WEBUI_API_KEY:
+            raise ImageError("OPEN_WEBUI_API_KEY is empty in the tool's valves, so the reference image cannot be read.", 0)
+        try:
+            r = requests.get(
+                f"{valves.OPEN_WEBUI_BASE_URL.rstrip('/')}/api/v1/files/{m.group(1)}/content",
+                headers={"Authorization": f"Bearer {valves.OPEN_WEBUI_API_KEY}"},
+                timeout=valves.REQUEST_TIMEOUT_SECONDS,
+            )
+            r.raise_for_status()
+        except requests.RequestException as e:
+            raise ImageError(f"Could not read the reference image {ref!r} from Open WebUI: {e}", 0)
+        return r.content
+    path = Path(valves.OUTPUT_DIR) / Path(ref).name  # file name only: no folder tricks
+    try:
+        return path.read_bytes()
+    except OSError:
+        raise ImageError(
+            f"Reference image {ref!r} was not found. Pass the 'chat_url' or 'filename' of an image this tool made earlier.", 0
+        )
+
+
 def image_ext(blob: bytes) -> Tuple[str, str]:
     """(extension, mime type) from the image's first bytes; PNG when unsure."""
     if blob[:3] == b"\xff\xd8\xff":
@@ -154,6 +199,7 @@ class Tools:
             description="Folder (inside the Open WebUI container) where each image and a small .json sidecar (prompt, model, cost) are kept.",
         )
         SAVE_LOCAL_COPY: bool = Field(default=True, description="Keep each image and its sidecar in OUTPUT_DIR.")
+        MAX_REFERENCES: int = Field(default=4, description="Most reference images accepted in one call (OpenRouter allows up to 16).")
         MAX_PROMPT_CHARS: int = Field(default=4000, description="Longest prompt accepted, in characters.")
         UPLOAD_TO_OPEN_WEBUI: bool = Field(
             default=True,
@@ -229,16 +275,30 @@ class Tools:
     async def generate_muse_image(
         self,
         prompt: str,
+        aspect_ratio: str = "",
+        resolution: str = "",
+        output_format: str = "",
+        seed: str = "",
+        reference_image: str = "",
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
     ) -> Dict[str, Any]:
         """
         Generate one image with Meta's Muse Image model on OpenRouter (a paid, hosted model that reasons
         about the prompt before drawing). Use it when the user asks for a picture and wants this model; use
         generate_image instead for ComfyUI/SDXL renders with seeds, LoRAs and negative prompts. This tool
-        has no size, seed or negative-prompt options: describe everything in the one prompt, in plain sentences.
+        has no negative prompt: describe everything in the one prompt, in plain sentences. To change an
+        image made earlier, pass it as reference_image and describe the change in the prompt.
         A call can take a minute or more, and every call costs money, so do not repeat it needlessly.
 
-        :param prompt: A plain-language description of the image: subject, setting, style, lighting, mood, and any text that must appear in it.
+        Every parameter except prompt is optional. If your calling format makes you pass a value, pass ""
+        for the ones you don't need.
+
+        :param prompt: A plain-language description of the image: subject, setting, style, lighting, mood, and any text that must appear in it. When editing, describe what to change.
+        :param aspect_ratio: Pass "" for the default. Otherwise one of 1:1, 4:3, 3:4, 3:2, 2:3, 16:9, 9:16, 4:5, 5:4, 21:9, 9:21, 2:1, 1:2.
+        :param resolution: Pass "" for the default. Otherwise one of 512, 768, 1K, 1.5K, 2K, 4K (larger costs more).
+        :param output_format: Pass "" for the default. Otherwise png, jpeg or webp.
+        :param seed: Pass "" for a random result. A whole number repeats an earlier look.
+        :param reference_image: Pass "" to make a new image. To edit or build on an earlier image from this tool, pass its 'chat_url' (or 'filename'). Several can be given, separated by commas.
         :return: A result with image_markdown (or a note that the image is already shown). Follow its note.
         """
         v = self.valves
@@ -254,9 +314,37 @@ class Tools:
         async def status(text: str, done: bool = False):
             await _emit(__event_emitter__, {"type": "status", "data": {"description": text, "done": done}})
 
+        try:
+            options: Dict[str, Any] = {}
+            for key, val, allowed in (
+                ("aspect_ratio", aspect_ratio, ASPECT_RATIOS),
+                ("resolution", resolution, RESOLUTIONS),
+                ("output_format", output_format, OUTPUT_FORMATS),
+            ):
+                choice = pick_option(val, allowed, key)
+                if choice:
+                    options[key] = choice
+            if not is_unset(seed):
+                try:
+                    options["seed"] = int(str(seed).strip())
+                except ValueError:
+                    raise ValueError(f"seed {str(seed).strip()!r} is not a whole number. Pass a number, or \"\" for a random one.")
+            refs = [] if is_unset(reference_image) else [r.strip() for r in str(reference_image).split(",") if r.strip()]
+            if len(refs) > v.MAX_REFERENCES:
+                raise ValueError(f"At most {v.MAX_REFERENCES} reference images are allowed; {len(refs)} were given.")
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
         await status("Generating image...")
         try:
             extra = self._extra()
+            if refs:
+                blobs_in = await asyncio.to_thread(lambda: [load_reference(v, r) for r in refs])
+                options["input_references"] = [
+                    {"type": "image_url", "image_url": {"url": f"data:{image_ext(b)[1]};base64,{base64.b64encode(b).decode('ascii')}"}}
+                    for b in blobs_in
+                ]
+            extra = {**extra, **options}
             data = await asyncio.to_thread(request_images, v, prompt, extra)
             blobs = await asyncio.to_thread(extract_images, data, v.REQUEST_TIMEOUT_SECONDS)
             if not blobs:
@@ -312,7 +400,8 @@ class Tools:
                                 "created": stamp.isoformat(timespec="seconds"),
                                 "model": v.IMAGE_MODEL,
                                 "prompt": prompt,
-                                "extra": extra,
+                                "extra": {k: val for k, val in extra.items() if k != "input_references"},
+                                "references": len(refs),
                                 "cost": cost,
                                 "generation_id": data.get("id"),
                                 "url": url,
