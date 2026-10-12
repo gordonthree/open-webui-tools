@@ -1,0 +1,171 @@
+"""
+Tests for openrouter_image.py. Run with: python -m unittest test_openrouter_image -v
+(no OpenRouter or Open WebUI needed - requests.post/get are replaced with fakes).
+"""
+
+import asyncio
+import base64
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import openrouter_image as mod
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 20
+
+
+class Resp:
+    def __init__(self, status=200, payload=None, content=b""):
+        self.status_code = status
+        self._payload = payload
+        self.content = content
+        self.text = json.dumps(payload) if payload is not None else ""
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise mod.requests.HTTPError(f"HTTP {self.status_code}", response=self)
+
+
+def ok_body(n=1, cost=0.0042):
+    return {"id": "gen-1", "data": [{"b64_json": base64.b64encode(PNG).decode()} for _ in range(n)], "usage": {"cost": cost}}
+
+
+class FakeNet:
+    def __init__(self, images=None, upload=None):
+        self.images = images or Resp(200, ok_body())
+        self.upload = upload or Resp(200, {"id": "img123"})
+        self.calls = []
+
+    def __call__(self, url, **kw):
+        self.calls.append((url, kw))
+        return self.images if url.endswith("/images") else self.upload
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tool = mod.Tools()
+        self.tool.valves.OUTPUT_DIR = str(Path(self.tmp.name) / "imgs")
+        self.tool.valves.OPENROUTER_API_KEY = "or-key"
+        self.tool.valves.OPEN_WEBUI_API_KEY = "owui-key"
+
+    def run_tool(self, fake, *a, **kw):
+        with mock.patch.object(mod.requests, "post", fake):
+            return asyncio.run(self.tool.generate_muse_image(*a, **kw))
+
+
+class GenerateTests(Base):
+    def test_success(self):
+        fake = FakeNet()
+        out = self.run_tool(fake, "A red fox in snow")
+        self.assertTrue(out["success"])
+        self.assertIn("![generated image](/api/v1/files/img123/content)", out["image_markdown"])
+        self.assertEqual(out["cost_usd"], 0.0042)
+        self.assertEqual(out["images"][0]["full_link"], "https://open-webui.dimension-x.net/api/v1/files/img123/content")
+        files = sorted(p.suffix for p in Path(self.tool.valves.OUTPUT_DIR).iterdir())
+        self.assertEqual(files, [".json", ".png"])
+        meta = json.loads(next(Path(self.tool.valves.OUTPUT_DIR).glob("*.json")).read_text())
+        self.assertEqual((meta["prompt"], meta["generation_id"]), ("A red fox in snow", "gen-1"))
+
+    def test_request_body_and_headers(self):
+        fake = FakeNet()
+        self.run_tool(fake, "A fox")
+        url, kw = fake.calls[0]
+        self.assertEqual(url, "https://openrouter.ai/api/v1/images")
+        self.assertEqual(kw["json"], {"model": "meta/muse-image", "prompt": "A fox"})
+        self.assertEqual(kw["headers"]["Authorization"], "Bearer or-key")
+
+    def test_request_extra_merged_but_cannot_override_model_or_prompt(self):
+        self.tool.valves.REQUEST_EXTRA = '{"aspect_ratio": "16:9", "model": "evil", "prompt": "evil"}'
+        fake = FakeNet()
+        self.run_tool(fake, "A fox")
+        self.assertEqual(fake.calls[0][1]["json"], {"aspect_ratio": "16:9", "model": "meta/muse-image", "prompt": "A fox"})
+
+    def test_bad_request_extra(self):
+        self.tool.valves.REQUEST_EXTRA = "{nope"
+        fake = FakeNet()
+        out = self.run_tool(fake, "A fox")
+        self.assertFalse(out["success"])
+        self.assertIn("REQUEST_EXTRA", out["error"])
+        self.assertEqual(fake.calls, [])
+
+    def test_url_style_response_is_downloaded(self):
+        fake = FakeNet(images=Resp(200, {"data": [{"url": "https://cdn.example/x.png"}]}))
+        with mock.patch.object(mod.requests, "get", return_value=Resp(200, content=PNG)):
+            out = self.run_tool(fake, "A fox")
+        self.assertTrue(out["success"])
+
+    def test_empty_and_too_long_prompt(self):
+        self.assertIn("prompt is empty", self.run_tool(FakeNet(), "  ")["error"])
+        self.tool.valves.MAX_PROMPT_CHARS = 5
+        self.assertIn("limit is 5", self.run_tool(FakeNet(), "far too long")["error"])
+
+    def test_402_says_no_retry(self):
+        fake = FakeNet(images=Resp(402, {"error": {"message": "Insufficient credits", "code": 402}}))
+        out = self.run_tool(fake, "A fox")
+        self.assertFalse(out["success"])
+        self.assertIn("Insufficient credits", out["error"])
+        self.assertIn("retrying will not help", out["error"])
+
+    def test_400_content_block_allows_one_rewrite(self):
+        fake = FakeNet(images=Resp(400, {"error": {"message": "blocked", "code": 400}}))
+        self.assertIn("rewritten", self.run_tool(fake, "A fox")["error"])
+
+    def test_missing_key(self):
+        self.tool.valves.OPENROUTER_API_KEY = ""
+        out = self.run_tool(FakeNet(), "A fox")
+        self.assertIn("OPENROUTER_API_KEY", out["error"])
+
+    def test_empty_data_is_an_error(self):
+        out = self.run_tool(FakeNet(images=Resp(200, {"data": []})), "A fox")
+        self.assertFalse(out["success"])
+        self.assertIn("no image", out["error"])
+
+    def test_upload_failure_warns_and_says_do_not_retry(self):
+        fake = FakeNet(upload=Resp(401, {"detail": "bad key"}))
+        out = self.run_tool(fake, "A fox")
+        self.assertFalse(out["success"])
+        self.assertIn("generated (and billed)", out["error"])
+        self.assertIn("do not call this tool again", out["error"])
+        self.assertEqual(len(list(Path(self.tool.valves.OUTPUT_DIR).glob("*.png"))), 1)
+
+    def test_files_event_delivery(self):
+        self.tool.valves.IMAGE_DELIVERY = "files_event"
+        events = []
+
+        async def emit(e):
+            events.append(e)
+
+        out = self.run_tool(FakeNet(), "A fox", emit)
+        self.assertNotIn("image_markdown", out)
+        files = [e for e in events if e["type"] == "files"]
+        self.assertEqual(files[0]["data"]["files"], [{"type": "image", "url": "/api/v1/files/img123/content"}])
+        self.assertIn("already displayed", out["note"])
+
+    def test_no_local_copy(self):
+        self.tool.valves.SAVE_LOCAL_COPY = False
+        self.run_tool(FakeNet(), "A fox")
+        self.assertFalse(Path(self.tool.valves.OUTPUT_DIR).exists())
+
+
+class HelperTests(unittest.TestCase):
+    def test_image_ext(self):
+        self.assertEqual(mod.image_ext(PNG)[0], "png")
+        self.assertEqual(mod.image_ext(b"\xff\xd8\xff\xe0")[0], "jpg")
+        self.assertEqual(mod.image_ext(b"RIFF\x00\x00\x00\x00WEBPxx")[0], "webp")
+
+    def test_slugify(self):
+        self.assertEqual(mod.slugify("A Red Fox, in snow!"), "a-red-fox-in-snow")
+        self.assertEqual(mod.slugify("!!!"), "image")
+
+
+if __name__ == "__main__":
+    unittest.main()

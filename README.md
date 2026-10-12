@@ -57,6 +57,13 @@ Current tools:
   it opens only for a browser logged in to OWUI. `ATTACH_TO_CHAT` (on) also attaches the memo to the assistant message via a `files` event so it
   shows in the chat's Files tab. No delete method on purpose. Unrelated to ComfyUI.
 
+- `openrouter_image.py` → `generate_muse_image` — a paid, hosted alternative to `generate_image`: sends one plain-language
+  prompt to Meta's `meta/muse-image` through OpenRouter's `/api/v1/images` and shows the result in the chat (same
+  `IMAGE_DELIVERY` modes and OWUI file upload as `generate_image`). The model's declared image parameters are empty, so
+  the tool sends only `model` and `prompt`; the `REQUEST_EXTRA` valve (a JSON object) is merged into the request for
+  anything else OpenRouter turns out to accept. Each image and a `.json` sidecar (prompt, cost, generation id) are
+  kept in `OUTPUT_DIR`. No ComfyUI, no job database. Needs `OPENROUTER_API_KEY` and `OPEN_WEBUI_API_KEY` valves.
+
 - `agent_duo.py` — an Open WebUI **Pipe** (a Function, not a Tool) that shows up as one model, "Mara + Hannah",
   and puts two agents living on **two different OWUI servers** into one chat with the human. See "Two-agent
   chat (agent_duo)" below. Unrelated to ComfyUI.
@@ -479,7 +486,7 @@ Each tool has a matching `test_*.py` file that simulates ComfyUI's HTTP API with
 module — no live ComfyUI or Open WebUI server needed. Run all of them from `src/`:
 
 ```
-python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes test_agent_duo test_voice_memo -v
+python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes test_agent_duo test_voice_memo test_openrouter_image -v
 ```
 
 `scripts/import_server_history.py` has its own test file the same way — run from `scripts/`:

@@ -34,6 +34,7 @@ comfy_sdxl_retrieve: <tool-id>
 comfy_sdxl_poses: <tool-id>
 agent_notes: <tool-id>
 voice_memo: <tool-id>
+openrouter_image: <tool-id>
 agent_duo: <function-id>
 
 `agent_duo` is an Open WebUI *Function* (a Pipe), not a Tool: find its id under Admin -> Functions
