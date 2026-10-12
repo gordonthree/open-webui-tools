@@ -61,6 +61,11 @@ class Base(unittest.TestCase):
         with mock.patch.object(mod.requests, "post", fake):
             return asyncio.run(self.tool.generate_muse_image(*a, **kw))
 
+    def run_adv(self, fake, *a, **kw):
+        self.tool.valves.MODEL_CAN_SET_OPTIONS = True
+        with mock.patch.object(mod.requests, "post", fake):
+            return asyncio.run(self.tool.generate_muse_image_advanced(*a, **kw))
+
 
 class GenerateTests(Base):
     def test_success(self):
@@ -147,7 +152,9 @@ class GenerateTests(Base):
         out = self.run_tool(FakeNet(), "A fox", __event_emitter__=emit)
         self.assertNotIn("image_markdown", out)
         files = [e for e in events if e["type"] == "files"]
-        self.assertEqual(files[0]["data"]["files"], [{"type": "image", "url": "/api/v1/files/img123/content"}])
+        f = files[0]["data"]["files"][0]
+        self.assertEqual((f["type"], f["id"], f["url"]), ("image", "img123", "/api/v1/files/img123/content"))
+        self.assertEqual(len(files), 1)
         self.assertIn("already displayed", out["note"])
 
     def test_no_local_copy(self):
@@ -159,7 +166,7 @@ class GenerateTests(Base):
 class OptionTests(Base):
     def test_options_are_sent(self):
         fake = FakeNet()
-        out = self.run_tool(fake, "A fox", "16:9", "2k", "JPG", "42")
+        out = self.run_adv(fake, "A fox", "16:9", "2k", "JPG", "42")
         self.assertTrue(out["success"])
         self.assertEqual(
             fake.calls[0][1]["json"],
@@ -168,21 +175,21 @@ class OptionTests(Base):
 
     def test_unset_options_are_not_sent(self):
         fake = FakeNet()
-        self.run_tool(fake, "A fox", "none", "", "default", "null", "")
+        self.run_adv(fake, "A fox", "none", "", "default", "null", "")
         self.assertEqual(fake.calls[0][1]["json"], {"model": "meta/muse-image", "prompt": "A fox"})
 
     def test_bad_option_lists_choices_and_makes_no_call(self):
         fake = FakeNet()
-        out = self.run_tool(fake, "A fox", "wide")
+        out = self.run_adv(fake, "A fox", "wide")
         self.assertFalse(out["success"])
         self.assertIn("16:9", out["error"])
         self.assertEqual(fake.calls, [])
-        self.assertIn("whole number", self.run_tool(fake, "A fox", "", "", "", "abc")["error"])
+        self.assertIn("whole number", self.run_adv(fake, "A fox", "", "", "", "abc")["error"])
 
     def test_reference_from_owui_link_becomes_data_url(self):
         fake = FakeNet()
         with mock.patch.object(mod.requests, "get", return_value=Resp(200, content=PNG)) as g:
-            self.run_tool(fake, "Make it night", "", "", "", "", "/api/v1/files/abc/content")
+            self.run_adv(fake, "Make it night", "", "", "", "", "/api/v1/files/abc/content")
         self.assertTrue(g.call_args[0][0].endswith("/api/v1/files/abc/content"))
         ref = fake.calls[0][1]["json"]["input_references"][0]
         self.assertEqual(ref["type"], "image_url")
@@ -193,28 +200,118 @@ class OptionTests(Base):
         d.mkdir(parents=True)
         (d / "old.png").write_bytes(PNG)
         fake = FakeNet()
-        self.run_tool(fake, "Edit", "", "", "", "", "../../etc/old.png")
+        self.run_adv(fake, "Edit", "", "", "", "", "../../etc/old.png")
         self.assertEqual(len(fake.calls[0][1]["json"]["input_references"]), 1)
 
     def test_missing_reference_is_a_clear_error(self):
-        out = self.run_tool(FakeNet(), "Edit", "", "", "", "", "nope.png")
+        out = self.run_adv(FakeNet(), "Edit", "", "", "", "", "nope.png")
         self.assertFalse(out["success"])
         self.assertIn("not found", out["error"])
 
     def test_too_many_references(self):
         self.tool.valves.MAX_REFERENCES = 1
-        out = self.run_tool(FakeNet(), "Edit", "", "", "", "", "a.png,b.png")
+        out = self.run_adv(FakeNet(), "Edit", "", "", "", "", "a.png,b.png")
         self.assertIn("At most 1", out["error"])
 
     def test_sidecar_omits_reference_bytes(self):
         d = Path(self.tool.valves.OUTPUT_DIR)
         d.mkdir(parents=True)
         (d / "old.png").write_bytes(PNG)
-        self.run_tool(FakeNet(), "Edit", "1:1", "", "", "", "old.png")
+        self.run_adv(FakeNet(), "Edit", "1:1", "", "", "", "old.png")
         meta = json.loads(next(p for p in d.glob("*.json")).read_text())
         self.assertEqual(meta["references"], 1)
         self.assertNotIn("input_references", meta["extra"])
         self.assertEqual(meta["extra"]["aspect_ratio"], "1:1")
+
+
+class ValveTests(Base):
+    def test_simple_method_takes_only_a_prompt(self):
+        import inspect
+
+        params = [p for p in inspect.signature(mod.Tools.generate_muse_image).parameters if not p.startswith("__") and p != "self"]
+        self.assertEqual(params, ["prompt"])
+
+    def test_default_valves_are_applied(self):
+        v = self.tool.valves
+        v.DEFAULT_ASPECT_RATIO, v.DEFAULT_RESOLUTION, v.DEFAULT_OUTPUT_FORMAT, v.DEFAULT_SEED = "3:2", "2K", "webp", "7"
+        fake = FakeNet()
+        self.run_tool(fake, "A fox")
+        self.assertEqual(
+            fake.calls[0][1]["json"],
+            {"aspect_ratio": "3:2", "resolution": "2K", "output_format": "webp", "seed": 7, "model": "meta/muse-image", "prompt": "A fox"},
+        )
+
+    def test_default_reference_images_are_sent(self):
+        d = Path(self.tool.valves.OUTPUT_DIR)
+        d.mkdir(parents=True)
+        (d / "style.png").write_bytes(PNG)
+        self.tool.valves.DEFAULT_REFERENCE_IMAGES = "style.png"
+        fake = FakeNet()
+        self.run_tool(fake, "A fox")
+        self.assertEqual(len(fake.calls[0][1]["json"]["input_references"]), 1)
+
+    def test_call_values_override_valve_defaults(self):
+        self.tool.valves.DEFAULT_ASPECT_RATIO = "3:2"
+        self.tool.valves.DEFAULT_SEED = "7"
+        fake = FakeNet()
+        self.run_adv(fake, "A fox", "1:1", "", "", "9")
+        body = fake.calls[0][1]["json"]
+        self.assertEqual((body["aspect_ratio"], body["seed"]), ("1:1", 9))
+
+    def test_advanced_refuses_when_valve_off(self):
+        fake = FakeNet()
+        with mock.patch.object(mod.requests, "post", fake):
+            out = asyncio.run(self.tool.generate_muse_image_advanced("A fox", "1:1"))
+        self.assertFalse(out["success"])
+        self.assertIn("generate_muse_image", out["error"])
+        self.assertEqual(fake.calls, [])
+
+    def test_simple_method_works_while_advanced_is_off(self):
+        self.assertFalse(self.tool.valves.MODEL_CAN_SET_OPTIONS)
+        self.assertTrue(self.run_tool(FakeNet(), "A fox")["success"])
+
+    def test_bad_valve_value_is_reported(self):
+        self.tool.valves.DEFAULT_SEED = "abc"
+        self.assertIn("whole number", self.run_tool(FakeNet(), "A fox")["error"])
+
+
+class AttachTests(Base):
+    def collect(self, **valves):
+        for k, val in valves.items():
+            setattr(self.tool.valves, k, val)
+        events = []
+
+        async def emit(e):
+            events.append(e)
+
+        out = self.run_tool(FakeNet(), "A fox", __event_emitter__=emit)
+        return out, [e for e in events if e["type"] == "files"], events
+
+    def test_image_is_attached_to_files_tab_by_default(self):
+        out, files, _ = self.collect()
+        self.assertEqual(len(files), 1)
+        f = files[0]["data"]["files"][0]
+        self.assertEqual((f["type"], f["id"], f["url"]), ("file", "img123", "/api/v1/files/img123/content"))
+        self.assertTrue(f["name"].endswith(".png"))
+        self.assertIn("image_markdown", out)  # model_embed still shows it in the reply
+
+    def test_attach_off(self):
+        _, files, _ = self.collect(ATTACH_TO_CHAT=False)
+        self.assertEqual(files, [])
+
+    def test_message_event_mode_attaches_and_appends_markdown(self):
+        _, files, events = self.collect(IMAGE_DELIVERY="message_event")
+        self.assertEqual(len(files), 1)
+        self.assertEqual(len([e for e in events if e["type"] == "message"]), 1)
+
+    def test_share_url_is_returned(self):
+        out, _, _ = self.collect()
+        self.assertEqual(out["share_url"], "https://open-webui.dimension-x.net/api/v1/files/img123/content")
+        self.assertIn("share_url", out["note"])
+
+    def test_no_share_url_without_public_base(self):
+        out, _, _ = self.collect(PUBLIC_BASE_URL="")
+        self.assertNotIn("share_url", out)
 
 
 class HelperTests(unittest.TestCase):

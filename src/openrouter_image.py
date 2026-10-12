@@ -190,13 +190,31 @@ class Tools:
             default="meta/muse-image",
             description="OpenRouter's own model id, with no Open WebUI connection prefix such as 'or.'.",
         )
+        DEFAULT_ASPECT_RATIO: Literal["default", "1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "4:5", "5:4", "21:9", "9:21", "2:1", "1:2"] = Field(
+            default="default", description="Aspect ratio used for every image. 'default' leaves it to the model."
+        )
+        DEFAULT_RESOLUTION: Literal["default", "512", "768", "1K", "1.5K", "2K", "4K"] = Field(
+            default="default", description="Resolution used for every image (larger costs more). 'default' leaves it to the model."
+        )
+        DEFAULT_OUTPUT_FORMAT: Literal["default", "png", "jpeg", "webp"] = Field(
+            default="default", description="Image file format. 'default' leaves it to the model."
+        )
+        DEFAULT_SEED: str = Field(default="", description="A whole number to get the same look every time. Empty = random.")
+        DEFAULT_REFERENCE_IMAGES: str = Field(
+            default="",
+            description="Reference image(s) sent with every call, e.g. a style or character sheet: an Open WebUI file link ('/api/v1/files/<id>/content') or a file name in OUTPUT_DIR; separate several with commas. Empty = none.",
+        )
+        MODEL_CAN_SET_OPTIONS: bool = Field(
+            default=False,
+            description="Off: the model only supplies a prompt and the DEFAULT_* settings above are always used; generate_muse_image_advanced refuses to run. On: the model may choose aspect ratio, resolution, format, seed and reference images per call through generate_muse_image_advanced. (Open WebUI saves a tool's parameter list when the tool is imported, so this switch cannot remove generate_muse_image_advanced from the model's tool list; it only decides whether that method works.)",
+        )
         REQUEST_EXTRA: str = Field(
             default="",
-            description='Optional JSON object merged into every request body, for options OpenRouter accepts but this tool does not know about, e.g. {"aspect_ratio": "16:9"}. "model" and "prompt" cannot be overridden. Empty = nothing extra.',
+            description='Optional JSON object merged into every request body, for options OpenRouter accepts but this tool does not know about. "model" and "prompt" cannot be overridden. Empty = nothing extra.',
         )
         OUTPUT_DIR: str = Field(
             default="/app/backend/data/openrouter_images",
-            description="Folder (inside the Open WebUI container) where each image and a small .json sidecar (prompt, model, cost) are kept.",
+            description="Folder (inside the Open WebUI container) where each image and a small .json sidecar (prompt, options, cost) are kept.",
         )
         SAVE_LOCAL_COPY: bool = Field(default=True, description="Keep each image and its sidecar in OUTPUT_DIR.")
         MAX_REFERENCES: int = Field(default=4, description="Most reference images accepted in one call (OpenRouter allows up to 16).")
@@ -215,14 +233,18 @@ class Tools:
         )
         PUBLIC_BASE_URL: str = Field(
             default="https://open-webui.dimension-x.net",
-            description="Address the user's browser uses for Open WebUI. Used to build a full link that also works in an email (the user must be logged in to Open WebUI to open it). Empty = no full link.",
+            description="Address the user's browser uses for Open WebUI. Used to build a full link (share_url) that also works in an email (the user must be logged in to Open WebUI to open it). Empty = no full link.",
+        )
+        ATTACH_TO_CHAT: bool = Field(
+            default=True,
+            description="Attach each image to the assistant's message so it is listed in the chat's Files tab. (With IMAGE_DELIVERY 'files_event' the attachment is also what displays the image.)",
         )
         IMAGE_DELIVERY: Literal["model_embed", "files_event", "message_event"] = Field(
             default="model_embed",
             description=(
-                "How the finished image reaches the chat. "
+                "How the finished image is shown in the chat. "
                 "'model_embed': the result includes image_markdown and the model is told to put it in its reply. "
-                "'files_event': the tool attaches the image to the message via an event; the model is told not to embed it. "
+                "'files_event': the tool attaches the image to the message via an event, which displays it; the model is told not to embed it. "
                 "'message_event': the tool appends markdown to the message text via an event; this text can be overwritten when the model streams its reply."
             ),
         )
@@ -245,8 +267,8 @@ class Tools:
             hint = "The OpenRouter account is out of credits. Tell the user; retrying will not help."
         elif status == 400:
             hint = (
-                "OpenRouter did not accept the prompt. It may have been blocked by the model's content rules, or the "
-                "request is malformed. Retry once with a rewritten, plainer prompt; if it fails again, tell the user."
+                "OpenRouter did not accept the request. The prompt may have been blocked by the model's content rules. "
+                "Retry once with a rewritten, plainer prompt; if it fails again, tell the user."
             )
         elif status == 404:
             hint = "OpenRouter does not know this image model. This is a configuration problem. Tell the user; retrying will not help."
@@ -272,7 +294,47 @@ class Tools:
         extra.pop("prompt", None)
         return extra
 
+    def _settings(self, aspect_ratio: Any, resolution: Any, output_format: Any, seed: Any, reference_image: Any) -> Tuple[Dict[str, Any], List[str]]:
+        """Valve defaults, overridden by whatever per-call values are set. Raises ValueError on a bad value."""
+        v = self.valves
+        options: Dict[str, Any] = {}
+        for key, call_val, default_val, allowed in (
+            ("aspect_ratio", aspect_ratio, v.DEFAULT_ASPECT_RATIO, ASPECT_RATIOS),
+            ("resolution", resolution, v.DEFAULT_RESOLUTION, RESOLUTIONS),
+            ("output_format", output_format, v.DEFAULT_OUTPUT_FORMAT, OUTPUT_FORMATS),
+        ):
+            choice = pick_option(call_val, allowed, key) or pick_option(default_val, allowed, key)
+            if choice:
+                options[key] = choice
+        seed_val = seed if not is_unset(seed) else v.DEFAULT_SEED
+        if not is_unset(seed_val):
+            try:
+                options["seed"] = int(str(seed_val).strip())
+            except ValueError:
+                raise ValueError(f"seed {str(seed_val).strip()!r} is not a whole number. Pass a number, or \"\" for a random one.")
+        raw_refs = reference_image if not is_unset(reference_image) else v.DEFAULT_REFERENCE_IMAGES
+        refs = [] if is_unset(raw_refs) else [r.strip() for r in str(raw_refs).split(",") if r.strip()]
+        if len(refs) > v.MAX_REFERENCES:
+            raise ValueError(f"At most {v.MAX_REFERENCES} reference images are allowed; {len(refs)} were given.")
+        return options, refs
+
     async def generate_muse_image(
+        self,
+        prompt: str,
+        __event_emitter__: Optional[Callable[[dict], Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Generate one image with Meta's Muse Image model on OpenRouter (a paid, hosted model that reasons
+        about the prompt before drawing). Use it when the user asks for a picture. Describe everything in
+        the one prompt, in plain sentences; size, format and the other settings are chosen for you. A call
+        can take a minute or more, and every call costs money, so do not repeat it needlessly.
+
+        :param prompt: A plain-language description of the image: subject, setting, style, lighting, mood, and any text that must appear in it.
+        :return: A result with image_markdown (or a note that the image is already shown) and a share_url. Follow its note.
+        """
+        return await self._generate(prompt, "", "", "", "", "", __event_emitter__)
+
+    async def generate_muse_image_advanced(
         self,
         prompt: str,
         aspect_ratio: str = "",
@@ -283,24 +345,28 @@ class Tools:
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Generate one image with Meta's Muse Image model on OpenRouter (a paid, hosted model that reasons
-        about the prompt before drawing). Use it when the user asks for a picture and wants this model; use
-        generate_image instead for ComfyUI/SDXL renders with seeds, LoRAs and negative prompts. This tool
-        has no negative prompt: describe everything in the one prompt, in plain sentences. To change an
-        image made earlier, pass it as reference_image and describe the change in the prompt.
-        A call can take a minute or more, and every call costs money, so do not repeat it needlessly.
+        Like generate_muse_image, with per-call settings. Only use this when the user explicitly asks for a
+        particular shape or size, a repeatable look, or to change an earlier image; otherwise use
+        generate_muse_image. It may be switched off, in which case it says so.
 
-        Every parameter except prompt is optional. If your calling format makes you pass a value, pass ""
-        for the ones you don't need.
+        Every parameter except prompt is optional; pass "" for the ones you don't need.
 
-        :param prompt: A plain-language description of the image: subject, setting, style, lighting, mood, and any text that must appear in it. When editing, describe what to change.
-        :param aspect_ratio: Pass "" for the default. Otherwise one of 1:1, 4:3, 3:4, 3:2, 2:3, 16:9, 9:16, 4:5, 5:4, 21:9, 9:21, 2:1, 1:2.
-        :param resolution: Pass "" for the default. Otherwise one of 512, 768, 1K, 1.5K, 2K, 4K (larger costs more).
-        :param output_format: Pass "" for the default. Otherwise png, jpeg or webp.
+        :param prompt: A plain-language description of the image. When editing, describe what to change.
+        :param aspect_ratio: Pass "" for the usual one. Otherwise one of 1:1, 4:3, 3:4, 3:2, 2:3, 16:9, 9:16, 4:5, 5:4, 21:9, 9:21, 2:1, 1:2.
+        :param resolution: Pass "" for the usual one. Otherwise one of 512, 768, 1K, 1.5K, 2K, 4K (larger costs more).
+        :param output_format: Pass "" for the usual one. Otherwise png, jpeg or webp.
         :param seed: Pass "" for a random result. A whole number repeats an earlier look.
-        :param reference_image: Pass "" to make a new image. To edit or build on an earlier image from this tool, pass its 'chat_url' (or 'filename'). Several can be given, separated by commas.
-        :return: A result with image_markdown (or a note that the image is already shown). Follow its note.
+        :param reference_image: Pass "" for a new image. To edit or build on an earlier image from this tool, pass its 'chat_url' (or 'filename'). Several can be given, separated by commas.
+        :return: Same as generate_muse_image.
         """
+        if not self.valves.MODEL_CAN_SET_OPTIONS:
+            return {
+                "success": False,
+                "error": "Per-call image settings are turned off. Call generate_muse_image with just the prompt instead; the size and other settings are already chosen.",
+            }
+        return await self._generate(prompt, aspect_ratio, resolution, output_format, seed, reference_image, __event_emitter__)
+
+    async def _generate(self, prompt, aspect_ratio, resolution, output_format, seed, reference_image, __event_emitter__) -> Dict[str, Any]:
         v = self.valves
         prompt = (prompt or "").strip()
         if not prompt:
@@ -310,30 +376,13 @@ class Tools:
                 "success": False,
                 "error": f"The prompt is {len(prompt)} characters; the limit is {v.MAX_PROMPT_CHARS}. Shorten it and call again.",
             }
+        try:
+            options, refs = self._settings(aspect_ratio, resolution, output_format, seed, reference_image)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
 
         async def status(text: str, done: bool = False):
             await _emit(__event_emitter__, {"type": "status", "data": {"description": text, "done": done}})
-
-        try:
-            options: Dict[str, Any] = {}
-            for key, val, allowed in (
-                ("aspect_ratio", aspect_ratio, ASPECT_RATIOS),
-                ("resolution", resolution, RESOLUTIONS),
-                ("output_format", output_format, OUTPUT_FORMATS),
-            ):
-                choice = pick_option(val, allowed, key)
-                if choice:
-                    options[key] = choice
-            if not is_unset(seed):
-                try:
-                    options["seed"] = int(str(seed).strip())
-                except ValueError:
-                    raise ValueError(f"seed {str(seed).strip()!r} is not a whole number. Pass a number, or \"\" for a random one.")
-            refs = [] if is_unset(reference_image) else [r.strip() for r in str(reference_image).split(",") if r.strip()]
-            if len(refs) > v.MAX_REFERENCES:
-                raise ValueError(f"At most {v.MAX_REFERENCES} reference images are allowed; {len(refs)} were given.")
-        except ValueError as e:
-            return {"success": False, "error": str(e)}
 
         await status("Generating image...")
         try:
@@ -360,7 +409,7 @@ class Tools:
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
         cost = usage.get("cost")
         images_out: List[Dict[str, Any]] = []
-        chat_sources: List[str] = []
+        chat_files: List[Dict[str, Any]] = []
         warnings: List[str] = []
         for i, blob in enumerate(blobs, start=1):
             ext, mime = image_ext(blob)
@@ -386,11 +435,12 @@ class Tools:
                 if err:
                     warnings.append(f"Could not upload the image to Open WebUI ({err}).")
             if url:
-                chat_sources.append(url)
                 entry["chat_url"] = url
                 base = v.PUBLIC_BASE_URL.strip().rstrip("/")
                 if base:
                     entry["full_link"] = f"{base}{url}"
+                m = _FILE_URL_RE.search(url)
+                chat_files.append({"id": m.group(1) if m else None, "url": url, "name": name, "size": len(blob)})
 
             if saved:
                 try:
@@ -413,7 +463,7 @@ class Tools:
                     pass
             images_out.append(entry)
 
-        if not chat_sources:
+        if not chat_files:
             await status("Image generated, but could not be shown", done=True)
             return {
                 "success": False,
@@ -425,16 +475,26 @@ class Tools:
                 "images": images_out,
             }
 
-        emitted = v.IMAGE_DELIVERY != "model_embed" and bool(__event_emitter__)
-        if emitted:
-            if v.IMAGE_DELIVERY == "files_event":
-                payload = {"type": "files", "data": {"files": [{"type": "image", "url": u} for u in chat_sources]}}
-            else:
-                md = "\n\n".join(f"![generated image]({u})" for u in chat_sources)
-                payload = {"type": "message", "data": {"content": md + "\n\n"}}
+        chat_sources = [f["url"] for f in chat_files]
+        shows_inline = v.IMAGE_DELIVERY == "files_event" and bool(__event_emitter__)
+        if shows_inline:
+            # One event both displays the image and lists it in the Files tab.
+            payload = {"type": "files", "data": {"files": [{"type": "image", "status": "uploaded", **f} for f in chat_files]}}
             await _emit(__event_emitter__, payload)
+        else:
+            if v.IMAGE_DELIVERY == "message_event" and __event_emitter__:
+                md = "\n\n".join(f"![generated image]({u})" for u in chat_sources)
+                await _emit(__event_emitter__, {"type": "message", "data": {"content": md + "\n\n"}})
+            if v.ATTACH_TO_CHAT and __event_emitter__:
+                # type "file" (not "image") so it is listed without being drawn a second time.
+                await _emit(
+                    __event_emitter__,
+                    {"type": "files", "data": {"files": [{"type": "file", "status": "uploaded", **f} for f in chat_files]}},
+                )
+        emitted = v.IMAGE_DELIVERY != "model_embed" and bool(__event_emitter__)
         await status("Done", done=True)
 
+        share = next((e["full_link"] for e in images_out if e.get("full_link")), None)
         out: Dict[str, Any] = {
             "success": True,
             "model": v.IMAGE_MODEL,
@@ -445,9 +505,15 @@ class Tools:
                 if emitted
                 else "Include image_markdown exactly as given in your reply so the user can see the image."
             )
-            + " To send the user a link (e.g. by email), use an image's full_link; it opens only while they are logged in to Open WebUI."
+            + (
+                " To give the user a link (in chat or by email), paste share_url exactly as given; it opens only while they are logged in to Open WebUI."
+                if share
+                else ""
+            )
             + " Do not call this tool again unless the user asks for another image; each call costs money.",
         }
+        if share:
+            out["share_url"] = share
         if cost is not None:
             out["cost_usd"] = cost
         if warnings:

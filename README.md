@@ -57,15 +57,20 @@ Current tools:
   it opens only for a browser logged in to OWUI. `ATTACH_TO_CHAT` (on) also attaches the memo to the assistant message via a `files` event so it
   shows in the chat's Files tab. No delete method on purpose. Unrelated to ComfyUI.
 
-- `openrouter_image.py` → `generate_muse_image` — a paid, hosted alternative to `generate_image`: sends one plain-language
-  prompt to Meta's `meta/muse-image` through OpenRouter's `/api/v1/images` and shows the result in the chat (same
-  `IMAGE_DELIVERY` modes and OWUI file upload as `generate_image`). Optional `aspect_ratio`, `resolution`
-  (512-4K), `output_format`, `seed`, and `reference_image` (an earlier result's `chat_url`/`filename`, or several
-  comma-separated, to edit or build on it; sent as `input_references` data URLs). The option names and values come
-  from the standalone ComfyUI node `openrouter_image_node.py` in the repo root (untracked, not an OWUI tool), since
-  OpenRouter's own pages don't list them. The `REQUEST_EXTRA` valve (a JSON object) is merged into the request for
-  anything else. Each image and a `.json` sidecar (prompt, options, cost, generation id) are kept in `OUTPUT_DIR`.
-  No ComfyUI, no job database. Needs `OPENROUTER_API_KEY` and `OPEN_WEBUI_API_KEY` valves.
+- `openrouter_image.py` → `generate_muse_image`, `generate_muse_image_advanced` — a paid, hosted alternative to
+  `generate_image`: sends a plain-language prompt to Meta's `meta/muse-image` through OpenRouter's `/api/v1/images`
+  and shows the result in the chat. The model normally supplies only a prompt (`generate_muse_image`); the image
+  options are valves (`DEFAULT_ASPECT_RATIO`, `DEFAULT_RESOLUTION` 512-4K, `DEFAULT_OUTPUT_FORMAT`, `DEFAULT_SEED`,
+  `DEFAULT_REFERENCE_IMAGES` for a style/character reference sent with every call). `MODEL_CAN_SET_OPTIONS` (off)
+  decides whether `generate_muse_image_advanced` (per-call aspect ratio/resolution/format/seed/`reference_image`,
+  where a reference is an earlier result's `chat_url` or `filename`) works; OWUI freezes a tool's parameter list at
+  import time, so the switch can't remove that method from the model's tool list, it just makes it refuse. The option
+  names come from the standalone ComfyUI node `openrouter_image_node.py` in the repo root (untracked, not an OWUI
+  tool), since OpenRouter's own pages don't list them. `ATTACH_TO_CHAT` (on) lists each image in the chat's Files
+  tab via a `files` event; the result carries a `share_url` (`PUBLIC_BASE_URL` + the OWUI file path, opens only for
+  a browser logged in to OWUI). `REQUEST_EXTRA` (JSON) is merged into the request for anything else. Each image
+  and a `.json` sidecar (prompt, options, cost, generation id) are kept in `OUTPUT_DIR`. No ComfyUI, no job
+  database. Needs `OPENROUTER_API_KEY` and `OPEN_WEBUI_API_KEY` valves.
 
 - `agent_duo.py` — an Open WebUI **Pipe** (a Function, not a Tool) that shows up as one model, "Mara + Hannah",
   and puts two agents living on **two different OWUI servers** into one chat with the human. See "Two-agent
