@@ -47,6 +47,14 @@ Current tools:
   same folder). Notes are addressed by name (unique, case-insensitive) and entries by number; there
   are no UUIDs, since a model reproduces a plain-language name more reliably than an opaque id.
 
+- `voice_memo.py` → `record_voice_memo`, `list_voice_memos` — lets a model record a spoken memo: the text goes to
+  a TTS model on OpenRouter (valve `TTS_MODEL`, default `fish-audio/s2.1-pro-free:free`, OpenRouter's own id
+  with no OWUI connection prefix like `or.`), the MP3 is kept in `MEMO_DIR` (default
+  `/app/backend/data/voice_memos`, with a `.json` sidecar holding the text) and uploaded to OWUI's file storage,
+  and the model gets back a Markdown link the user clicks to play it. `DEFAULT_VOICE` is a Fish Audio
+  `reference_id` from fish.audio's voice library. Needs `OPENROUTER_API_KEY` and `OPEN_WEBUI_API_KEY` valves.
+  No delete method on purpose. Unrelated to ComfyUI.
+
 - `agent_duo.py` — an Open WebUI **Pipe** (a Function, not a Tool) that shows up as one model, "Mara + Hannah",
   and puts two agents living on **two different OWUI servers** into one chat with the human. See "Two-agent
   chat (agent_duo)" below. Unrelated to ComfyUI.
@@ -469,7 +477,7 @@ Each tool has a matching `test_*.py` file that simulates ComfyUI's HTTP API with
 module — no live ComfyUI or Open WebUI server needed. Run all of them from `src/`:
 
 ```
-python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes test_agent_duo -v
+python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes test_agent_duo test_voice_memo -v
 ```
 
 `scripts/import_server_history.py` has its own test file the same way — run from `scripts/`:
