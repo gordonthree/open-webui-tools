@@ -70,7 +70,10 @@ Current tools:
   tab via a `files` event (OWUI's browser code replaces a message's file list with each event's, so for a second image in
   the same message the tool also sends the full list so far as a `chat:message:files` event, which the backend doesn't save); the result is kept small (`success`, `filenames`, `share_url`, `cost_usd`, `image_markdown` only in `model_embed` mode) with no
   instruction note, because models repeated or re-embedded anything URL-like they were handed; usage guidance lives in the tool's docstring. The result carries a `share_url` (`PUBLIC_BASE_URL` + the OWUI file path, opens only for
-  a browser logged in to OWUI). `REQUEST_EXTRA` (JSON) is merged into the request for anything else. Each image
+  a browser logged in to OWUI). Spending limits: `DAILY_BUDGET_USD` (rolling 24 h, default $2) and `MAX_IMAGES_PER_HOUR` (default 20), 0 = off, counted from
+  the cost OpenRouter reports and kept in `spend_ledger.jsonl` in `OUTPUT_DIR` (seeded from the existing `.json` sidecars;
+  calls still running count at `ESTIMATED_IMAGE_COST_USD`). A blocked call makes no request and tells the model to stop;
+  this is a second layer behind the spending limit on the OpenRouter key itself. `REQUEST_EXTRA` (JSON) is merged into the request for anything else. Each image
   and a `.json` sidecar (prompt, options, cost, generation id) are kept in `OUTPUT_DIR`. No ComfyUI, no job
   database. Needs `OPENROUTER_API_KEY` and `OPEN_WEBUI_API_KEY` valves.
 

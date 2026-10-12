@@ -54,6 +54,8 @@ class Base(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.tool = mod.Tools()
         mod._CHAT_FILES.clear()
+        mod._MEM_LEDGER.clear()
+        mod._IN_FLIGHT = 0
         self.tool.valves.OUTPUT_DIR = str(Path(self.tmp.name) / "imgs")
         self.tool.valves.OPENROUTER_API_KEY = "or-key"
         self.tool.valves.OPEN_WEBUI_API_KEY = "owui-key"
@@ -77,7 +79,7 @@ class GenerateTests(Base):
         self.assertEqual(out["cost_usd"], 0.0042)
         self.assertEqual(out["share_url"], "https://open-webui.dimension-x.net/api/v1/files/img123/content")
         self.assertEqual(len(out["filenames"]), 1)
-        files = sorted(p.suffix for p in Path(self.tool.valves.OUTPUT_DIR).iterdir())
+        files = sorted(p.suffix for p in Path(self.tool.valves.OUTPUT_DIR).iterdir() if p.name != "spend_ledger.jsonl")
         self.assertEqual(files, [".json", ".png"])
         meta = json.loads(next(Path(self.tool.valves.OUTPUT_DIR).glob("*.json")).read_text())
         self.assertEqual((meta["prompt"], meta["generation_id"]), ("A red fox in snow", "gen-1"))
@@ -162,7 +164,8 @@ class GenerateTests(Base):
     def test_no_local_copy(self):
         self.tool.valves.SAVE_LOCAL_COPY = False
         self.run_tool(FakeNet(), "A fox")
-        self.assertFalse(Path(self.tool.valves.OUTPUT_DIR).exists())
+        # only the spending ledger lives there; no image or sidecar is kept
+        self.assertEqual([p.name for p in Path(self.tool.valves.OUTPUT_DIR).iterdir()], ["spend_ledger.jsonl"])
 
 
 class OptionTests(Base):
@@ -371,6 +374,99 @@ class MultiImageTests(Base):
     def test_memory_is_bounded(self):
         self.calls([f"m{i}" for i in range(mod._CHAT_FILES_KEEP + 10)])
         self.assertLessEqual(len(mod._CHAT_FILES), mod._CHAT_FILES_KEEP)
+
+
+class LimitTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.tool.valves.DAILY_BUDGET_USD = 0.05
+        self.tool.valves.MAX_IMAGES_PER_HOUR = 0
+
+    def ledger(self):
+        return Path(self.tool.valves.OUTPUT_DIR) / "spend_ledger.jsonl"
+
+    def test_budget_blocks_after_spending_and_makes_no_request(self):
+        for _ in range(5):  # 5 x $0.01
+            self.assertTrue(self.run_tool(FakeNet(images=Resp(200, ok_body(cost=0.01))), "A fox")["success"])
+        fake = FakeNet()
+        out = self.run_tool(fake, "A fox")
+        self.assertFalse(out["success"])
+        self.assertIn("budget reached", out["error"])
+        self.assertIn("Do not retry", out["error"])
+        self.assertEqual(fake.calls, [])
+
+    def test_hourly_limit(self):
+        self.tool.valves.DAILY_BUDGET_USD = 0
+        self.tool.valves.MAX_IMAGES_PER_HOUR = 2
+        self.run_tool(FakeNet(), "A fox")
+        self.run_tool(FakeNet(), "A fox")
+        fake = FakeNet()
+        out = self.run_tool(fake, "A fox")
+        self.assertIn("2 images in the last hour (limit 2)", out["error"])
+        self.assertEqual(fake.calls, [])
+
+    def test_limits_off_when_zero(self):
+        self.tool.valves.DAILY_BUDGET_USD = 0
+        for _ in range(4):
+            self.assertTrue(self.run_tool(FakeNet(), "A fox")["success"])
+
+    def test_old_spending_ages_out(self):
+        now = 1_000_000.0
+        self.ledger().parent.mkdir(parents=True)
+        self.ledger().write_text(
+            json.dumps({"t": now - 2 * 86400, "cost": 9.0}) + "\n" + json.dumps({"t": now - 7200, "cost": 0.04}) + "\n"
+        )
+        v = self.tool.valves
+        v.DAILY_BUDGET_USD, v.MAX_IMAGES_PER_HOUR = 0.05, 0
+        self.assertIsNone(mod.check_limits(v, now, 0))  # the 2-day-old $9 is ignored; $0.04 < $0.05
+        self.assertIn("budget", mod.check_limits(v, now, 1))  # a running call is assumed to cost $0.02 more
+        v.DAILY_BUDGET_USD, v.MAX_IMAGES_PER_HOUR = 0, 1
+        self.assertIsNone(mod.check_limits(v, now, 0))  # nothing in the last hour (the $0.04 is 2h old)
+        self.ledger().write_text(json.dumps({"t": now - 60, "cost": 0.0}) + "\n")
+        self.assertIn("last hour", mod.check_limits(v, now, 0))
+
+    def test_ledger_survives_a_new_tool_instance(self):
+        self.run_tool(FakeNet(), "A fox")
+        other = mod.Tools()
+        other.valves.OUTPUT_DIR = self.tool.valves.OUTPUT_DIR
+        self.assertAlmostEqual(sum(c for _, c in mod._read_ledger(other.valves, __import__("time").time())), 0.0042)
+
+    def test_ledger_is_seeded_from_existing_sidecars(self):
+        d = Path(self.tool.valves.OUTPUT_DIR)
+        d.mkdir(parents=True)
+        created = __import__("datetime").datetime.now().astimezone().isoformat(timespec="seconds")
+        (d / "old.json").write_text(json.dumps({"created": created, "cost": 0.04}))
+        self.assertAlmostEqual(sum(c for _, c in mod._read_ledger(self.tool.valves, __import__("time").time())), 0.04)
+
+    def test_parallel_calls_cannot_all_slip_past_the_limit(self):
+        self.tool.valves.DAILY_BUDGET_USD = 0
+        self.tool.valves.MAX_IMAGES_PER_HOUR = 2
+        fake = FakeNet()
+
+        async def go():
+            return await asyncio.gather(*[self.tool.generate_muse_image("A fox") for _ in range(4)])
+
+        with mock.patch.object(mod.requests, "post", fake):
+            results = asyncio.run(go())
+        self.assertEqual(sum(1 for r in results if r["success"]), 2)
+        self.assertEqual(sum(1 for r in results if not r["success"]), 2)
+        self.assertEqual(len([c for c in fake.calls if c[0].endswith("/images")]), 2)
+        self.assertEqual(mod._IN_FLIGHT, 0)
+
+    def test_failed_call_does_not_count_as_spend(self):
+        fake = FakeNet(images=Resp(502, {"error": {"message": "upstream", "code": 502}}))
+        self.run_tool(fake, "A fox")
+        self.assertEqual(mod._read_ledger(self.tool.valves, __import__("time").time()), [])
+        self.assertEqual(mod._IN_FLIGHT, 0)
+
+    def test_unreadable_ledger_falls_back_to_memory(self):
+        self.tool.valves.OUTPUT_DIR = "/proc/definitely/not/writable"
+        self.tool.valves.SAVE_LOCAL_COPY = False
+        self.tool.valves.UPLOAD_TO_OPEN_WEBUI = True
+        self.tool.valves.DAILY_BUDGET_USD = 0
+        self.tool.valves.MAX_IMAGES_PER_HOUR = 1
+        self.assertTrue(self.run_tool(FakeNet(), "A fox")["success"])
+        self.assertFalse(self.run_tool(FakeNet(), "A fox")["success"])
 
 
 class HelperTests(unittest.TestCase):

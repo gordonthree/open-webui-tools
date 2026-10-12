@@ -12,6 +12,7 @@ import asyncio
 import base64
 import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
@@ -182,6 +183,83 @@ async def _emit(emitter: Optional[Callable], payload: Dict[str, Any]) -> None:
         await emitter(payload)
 
 
+# --------------------------------------------------------------------------- #
+# Spending limits: a rolling ledger of what this tool has spent, in OUTPUT_DIR.
+# --------------------------------------------------------------------------- #
+
+_LEDGER_NAME = "spend_ledger.jsonl"
+_DAY = 24 * 3600
+_MEM_LEDGER: List[Tuple[float, float]] = []  # fallback when the ledger file cannot be used
+_IN_FLIGHT = 0  # calls that passed the limit check and have not finished yet
+
+
+def _read_ledger(valves: "Tools.Valves", now: float) -> List[Tuple[float, float]]:
+    """(time, cost) of every image made in the last 24 hours. Seeded from the .json sidecars the first time."""
+    d = Path(valves.OUTPUT_DIR)
+    path = d / _LEDGER_NAME
+    try:
+        if not path.exists():
+            seed = []
+            for side in d.glob("*.json"):
+                try:
+                    m = json.loads(side.read_text())
+                    t = datetime.fromisoformat(m["created"]).timestamp()
+                    seed.append((t, float(m.get("cost") or 0.0)))
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+            if d.is_dir():
+                path.write_text("".join(json.dumps({"t": t, "cost": c}) + "\n" for t, c in sorted(seed)))
+        out = []
+        for line in path.read_text().splitlines():
+            try:
+                e = json.loads(line)
+                out.append((float(e["t"]), float(e["cost"])))
+            except (ValueError, KeyError, TypeError):
+                continue
+        return [e for e in out if now - e[0] < _DAY]
+    except OSError:
+        return [e for e in _MEM_LEDGER if now - e[0] < _DAY]
+
+
+def _record_spend(valves: "Tools.Valves", now: float, cost: float) -> None:
+    _MEM_LEDGER.append((now, cost))
+    del _MEM_LEDGER[:-1000]
+    try:
+        d = Path(valves.OUTPUT_DIR)
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / _LEDGER_NAME
+        with path.open("a") as f:
+            f.write(json.dumps({"t": now, "cost": cost}) + "\n")
+        if path.stat().st_size > 200_000:  # keep it small: rewrite with just the last 24 hours
+            keep = _read_ledger(valves, now)
+            path.write_text("".join(json.dumps({"t": t, "cost": c}) + "\n" for t, c in keep))
+    except OSError:
+        pass
+
+
+def check_limits(valves: "Tools.Valves", now: float, in_flight: int) -> Optional[str]:
+    """An error message when a limit is reached, else None. Calls still running count as spent."""
+    hourly, budget = valves.MAX_IMAGES_PER_HOUR, valves.DAILY_BUDGET_USD
+    if hourly <= 0 and budget <= 0:
+        return None
+    entries = _read_ledger(valves, now)
+    last_hour = sum(1 for t, _ in entries if now - t < 3600)
+    spent = sum(c for _, c in entries) + in_flight * valves.ESTIMATED_IMAGE_COST_USD
+    if hourly > 0 and last_hour + in_flight >= hourly:
+        return (
+            f"Image limit reached: {last_hour + in_flight} images in the last hour (limit {hourly}). "
+            "Do not retry and do not call this tool again. Tell the user the hourly limit was reached; "
+            "it frees up by itself as the hour passes, and they can change it in the tool's settings."
+        )
+    if budget > 0 and spent >= budget:
+        return (
+            f"Image budget reached: about ${spent:.2f} spent in the last 24 hours (limit ${budget:.2f}). "
+            "Do not retry and do not call this tool again. Tell the user the daily budget was reached; "
+            "it frees up by itself as older images age out, and they can change it in the tool's settings."
+        )
+    return None
+
+
 # Images attached so far to each assistant message (message id -> files), newest messages last.
 _CHAT_FILES: Dict[str, List[Dict[str, Any]]] = {}
 _CHAT_FILES_KEEP = 50
@@ -243,6 +321,16 @@ class Tools:
         )
         SAVE_LOCAL_COPY: bool = Field(default=True, description="Keep each image and its sidecar in OUTPUT_DIR.")
         MAX_REFERENCES: int = Field(default=4, description="Most reference images accepted in one call (OpenRouter allows up to 16).")
+        DAILY_BUDGET_USD: float = Field(
+            default=2.0,
+            description="Refuse new images once about this much has been spent in the last 24 hours (rolling), counted from the cost OpenRouter reports. 0 = no limit. A second safety net behind the spending limit set on the OpenRouter key itself.",
+        )
+        MAX_IMAGES_PER_HOUR: int = Field(
+            default=20, description="Refuse new images once this many were made in the last hour (rolling). Catches a model retrying in a loop. 0 = no limit."
+        )
+        ESTIMATED_IMAGE_COST_USD: float = Field(
+            default=0.02, description="Assumed cost of an image that is still being made (or whose cost OpenRouter did not report), for the limits above."
+        )
         MAX_PROMPT_CHARS: int = Field(default=4000, description="Longest prompt accepted, in characters.")
         UPLOAD_TO_OPEN_WEBUI: bool = Field(
             default=True,
@@ -414,6 +502,19 @@ the one prompt, in plain sentences; size, format and the other settings are chos
         async def status(text: str, done: bool = False):
             await _emit(__event_emitter__, {"type": "status", "data": {"description": text, "done": done}})
 
+        global _IN_FLIGHT
+        blocked = check_limits(v, time.time(), _IN_FLIGHT)
+        if blocked:
+            await status("Image limit reached", done=True)
+            return {"success": False, "error": blocked}
+        _IN_FLIGHT += 1  # no await between the check above and this, so parallel calls cannot all slip through
+        try:
+            return await self._generate_checked(prompt, options, refs, status, __event_emitter__, __message_id__)
+        finally:
+            _IN_FLIGHT -= 1
+
+    async def _generate_checked(self, prompt, options, refs, status, __event_emitter__, __message_id__) -> Dict[str, Any]:
+        v = self.valves
         await status("Generating image...")
         try:
             extra = self._extra()
@@ -438,6 +539,12 @@ the one prompt, in plain sentences; size, format and the other settings are chos
         stamp = datetime.now().astimezone()
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
         cost = usage.get("cost")
+        try:
+            per_image = float(cost) / len(blobs) if cost is not None else v.ESTIMATED_IMAGE_COST_USD
+        except (TypeError, ValueError):
+            per_image = v.ESTIMATED_IMAGE_COST_USD
+        for _ in blobs:
+            _record_spend(v, time.time(), per_image)
         images_out: List[Dict[str, Any]] = []
         chat_files: List[Dict[str, Any]] = []
         warnings: List[str] = []
