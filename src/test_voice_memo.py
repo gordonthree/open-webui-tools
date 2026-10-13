@@ -306,6 +306,128 @@ class FormatterTests(Base):
         self.assertFalse(any(seen))
 
 
+class MultiTTS(FakeNet):
+    """Fake network that returns different audio per voice so joined order can be checked."""
+
+    def __call__(self, url, **kw):
+        if url.endswith("/audio/speech"):
+            self.calls.append((url, kw))
+            return Resp(200, b"\xff\xfb" + kw["json"]["voice"][:4].encode() + b"|", headers={"Content-Type": "audio/mpeg"})
+        return super().__call__(url, **kw)
+
+
+MARA, HANNAH = "67f1f9b08fef4fbc957cd2a93c45918c", "cffb6be7e50f40e2999b224b16bd4cc0"
+
+
+class ConversationTests(Base):
+    def convo(self, script, fake=None, title=""):
+        fake = fake or MultiTTS()
+        out = self.run_tool(fake, self.tool.record_conversation, script, title)
+        return fake, out
+
+    def speech_calls(self, fake):
+        return [kw["json"] for url, kw in fake.calls if url.endswith("/audio/speech")]
+
+    def test_each_speaker_gets_own_voice_and_clips_are_joined_in_order(self):
+        fake, out = self.convo("Mara: Hi there.\nHannah: Hello!\nMara: Bye now.")
+        calls = self.speech_calls(fake)
+        self.assertEqual([c["voice"] for c in calls], [MARA, HANNAH, MARA])
+        self.assertEqual([c["input"] for c in calls], ["Hi there.", "Hello!", "Bye now."])
+        mp3 = next(Path(self.tool.valves.MEMO_DIR).glob("*.mp3")).read_bytes()
+        self.assertEqual(mp3, b"\xff\xfb67f1|\xff\xfbcffb|\xff\xfb67f1|")
+        self.assertIn("[Play conversation](/api/v1/files/abc123/content)", out)
+
+    def test_same_speaker_neighbours_merge_and_continuation_lines_join(self):
+        fake, _ = self.convo("Mara: One.\nTwo.\nMara: Three.\nHannah: Four.")
+        calls = self.speech_calls(fake)
+        self.assertEqual([c["input"] for c in calls], ["One. Two. Three.", "Four."])
+
+    def test_markdown_labels_and_case_are_tolerated(self):
+        fake, _ = self.convo("**Mara:** Hi.\n- HANNAH: Yo.")
+        self.assertEqual([c["voice"] for c in self.speech_calls(fake)], [MARA, HANNAH])
+
+    def test_unknown_speaker_uses_default_voice_with_note(self):
+        fake, out = self.convo("Bob: Hi.\nMara: Hey.")
+        self.assertEqual(self.speech_calls(fake)[0]["voice"], self.tool.valves.DEFAULT_VOICE)
+        self.assertIn("no voice is set for Bob", out)
+
+    def test_script_without_names_is_rejected_with_format_hint(self):
+        fake, out = self.convo("Just some words with no speaker.")
+        self.assertIn("first line has no speaker name", out)
+        self.assertIn("Mara: Hello there.", out)
+        self.assertEqual(self.speech_calls(fake), [])
+
+    def test_too_many_turns_or_characters(self):
+        self.tool.valves.MAX_CONVERSATION_LINES = 2
+        _, out = self.convo("Mara: a.\nHannah: b.\nMara: c.")
+        self.assertIn("3 turns; the limit is 2", out)
+        self.tool.valves.MAX_CHARS = 5
+        _, out = self.convo("Mara: far too long")
+        self.assertIn("limit is 5", out)
+
+    def test_failure_names_the_line_and_saves_nothing(self):
+        class Fail(MultiTTS):
+            def __call__(self, url, **kw):
+                if url.endswith("/audio/speech") and len([c for c in self.calls if c[0].endswith("/audio/speech")]) == 1:
+                    self.calls.append((url, kw))
+                    return Resp(429, payload={"error": {"message": "Too many requests", "code": 429}})
+                return super().__call__(url, **kw)
+
+        _, out = self.convo("Mara: a.\nHannah: b.", Fail())
+        self.assertIn("line 2 of 2 (Hannah)", out)
+        self.assertIn("Retry once", out)
+        self.assertFalse(Path(self.tool.valves.MEMO_DIR).exists())
+
+    def test_bad_speaker_voices_valve_is_a_config_error(self):
+        self.tool.valves.SPEAKER_VOICES = "not json"
+        _, out = self.convo("Mara: hi")
+        self.assertIn("SPEAKER_VOICES", out)
+        self.assertIn("configuration problem", out)
+
+    def test_formatter_runs_per_line_and_sidecar_keeps_both_texts(self):
+        self.tool.valves.FORMATTER_MODEL = "m"
+        fake = MultiTTS(chat=chat_reply("[happy] Hi there."))
+        self.convo("Mara: Hi there.", fake)
+        self.assertEqual(self.speech_calls(fake)[0]["input"], "[happy] Hi there.")
+        meta = json.loads(next(Path(self.tool.valves.MEMO_DIR).glob("*.json")).read_text())
+        self.assertEqual(meta["text"], "Mara: Hi there.")
+        self.assertEqual(meta["spoken_text"], "Mara: [happy] Hi there.")
+        self.assertEqual(meta["speakers"], {"Mara": MARA})
+
+    def test_help_lists_conversation_and_speakers(self):
+        out = asyncio.run(self.tool.voice_memo_help())
+        self.assertIn("record_conversation", out)
+        self.assertIn("mara, hannah", out)
+
+
+class Mp3JoinTests(unittest.TestCase):
+    def test_id3_tags_are_stripped_before_joining(self):
+        id3v2 = b"ID3\x04\x00\x00\x00\x00\x00\x04" + b"JUNK"
+        id3v1 = b"TAG" + b"\x00" * 125
+        joined = mod.join_mp3([b"\xff\xfbA" + id3v1, id3v2 + b"\xff\xfbB"])
+        self.assertEqual(joined, b"\xff\xfbA\xff\xfbB")
+
+    def test_runs_off_event_loop(self):
+        import threading
+
+        seen = []
+
+        def fake(url, **kw):
+            seen.append(threading.current_thread() is threading.main_thread())
+            return MultiTTS()(url, **kw)
+
+        tool = mod.Tools()
+        with tempfile.TemporaryDirectory() as d:
+            tool.valves.MEMO_DIR = d
+            tool.valves.OPENROUTER_API_KEY = "k"
+            tool.valves.OPEN_WEBUI_API_KEY = "k"
+            tool.valves.FORMATTER_MODEL = ""
+            with mock.patch.object(mod.requests, "post", fake):
+                asyncio.run(tool.record_conversation("Mara: a.\nHannah: b."))
+        self.assertEqual(len(seen), 3)
+        self.assertFalse(any(seen))
+
+
 class ListTests(Base):
     def test_empty_then_listing(self):
         self.assertIn("No voice memos", asyncio.run(self.tool.list_voice_memos()))

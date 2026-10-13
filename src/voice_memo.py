@@ -198,6 +198,58 @@ def add_expression_tags(valves: "Tools.Valves", text: str) -> Tuple[str, str]:
     return out, ""
 
 
+_SPEAKER_LINE_RE = re.compile(r"^([A-Za-z][A-Za-z0-9 .'\-]{0,29}?)\s*[:\uff1a]\s*\**\s*(.*)$")
+
+
+def parse_script(script: str) -> List[Tuple[str, str]]:
+    """Split "Name: words" lines into (name, words) turns. Unlabelled lines continue the previous turn.
+
+    Neighbouring turns by the same speaker are merged, so each speaker change costs one speech call.
+    Raises ValueError if the script has no labelled lines.
+    """
+    turns: List[Tuple[str, str]] = []
+    for raw in (script or "").splitlines():
+        line = re.sub(r"^[\s*_#>\-]+", "", raw).strip()
+        if not line:
+            continue
+        m = _SPEAKER_LINE_RE.match(line)
+        if m and m.group(2).strip():
+            turns.append((m.group(1).strip(), m.group(2).strip()))
+        elif m:  # a bare "Name:" heading; the words follow on the next line
+            turns.append((m.group(1).strip(), ""))
+        elif turns:
+            name, words = turns[-1]
+            turns[-1] = (name, f"{words} {line}".strip())
+        else:
+            raise ValueError("the first line has no speaker name")
+    merged: List[Tuple[str, str]] = []
+    for name, words in turns:
+        if not words:
+            continue
+        if merged and merged[-1][0].lower() == name.lower():
+            merged[-1] = (merged[-1][0], f"{merged[-1][1]} {words}")
+        else:
+            merged.append((name, words))
+    if not merged:
+        raise ValueError("no lines in the form 'Name: words' were found")
+    return merged
+
+
+def strip_id3(mp3: bytes) -> bytes:
+    """Drop a leading ID3v2 tag and a trailing ID3v1 tag so clips can be joined end to end."""
+    if mp3[:3] == b"ID3" and len(mp3) >= 10:
+        size = (mp3[6] << 21) | (mp3[7] << 14) | (mp3[8] << 7) | mp3[9]
+        mp3 = mp3[10 + size :]
+    if len(mp3) >= 128 and mp3[-128:-125] == b"TAG":
+        mp3 = mp3[:-128]
+    return mp3
+
+
+def join_mp3(parts: List[bytes]) -> bytes:
+    """Join MP3 clips by appending their frames. Fish returns the same format every time, so this plays cleanly."""
+    return b"".join(strip_id3(p) for p in parts)
+
+
 class Tools:
     class Valves(BaseModel):
         OPENROUTER_API_KEY: str = Field(default="", description="OpenRouter API key (https://openrouter.ai/settings/keys).")
@@ -227,6 +279,14 @@ class Tools:
             description="0 to 1. How closely the formatted text's words must match the original (tags ignored). If the formatter rewrites more than this allows, the original text is spoken instead. 1 = no word changes at all.",
         )
         FORMATTER_TIMEOUT_SECONDS: int = Field(default=30, description="Timeout for the formatter call. On timeout the original text is spoken.")
+        SPEAKER_VOICES: str = Field(
+            default='{"mara": "67f1f9b08fef4fbc957cd2a93c45918c", "hannah": "cffb6be7e50f40e2999b224b16bd4cc0"}',
+            description='JSON object mapping a speaker name (any case) to a 32-character Fish Audio voice id, used by record_conversation. A name that is not listed is spoken in DEFAULT_VOICE.',
+        )
+        MAX_CONVERSATION_LINES: int = Field(
+            default=12,
+            description="Most speaker turns record_conversation accepts in one call (neighbouring lines by the same speaker count as one). Each turn is one paid speech request.",
+        )
         MAX_CHARS: int = Field(default=3000, description="Longest memo text accepted, in characters.")
         UPLOAD_TO_OPEN_WEBUI: bool = Field(
             default=True,
@@ -278,6 +338,12 @@ class Tools:
             return text
         return f"{text}\nWhat to do: {hint}"
 
+    def _speaker_names(self) -> List[str]:
+        try:
+            return [str(k) for k in json.loads(self.valves.SPEAKER_VOICES or "{}")]
+        except (ValueError, AttributeError):
+            return []
+
     def _memo_dir(self) -> Path:
         d = Path(self.valves.MEMO_DIR)
         d.mkdir(parents=True, exist_ok=True)
@@ -299,6 +365,8 @@ class Tools:
             "- The result contains a Markdown link: copy it into your reply, exactly as given, so the user can play the memo.\n"
             "- If the user wants it by email, use the 'Full link' line from the result in the email body. It opens only "
             "while the user is logged in to Open WebUI.\n"
+            "- record_conversation(script, title): records several people talking as ONE clip, each in their own voice. `script` has one line per turn, written \"Name: words\" (for example \"Mara: Hi!\" then \"Hannah: Hello!\"). "
+            "Voices are set by the SPEAKER_VOICES valve: " + (", ".join(self._speaker_names()) or "none set") + ". Any other name gets the default voice. Use it instead of several record_voice_memo calls when a conversation should be one recording.\n"
             "- list_voice_memos(limit): shows recent memos with their links, newest first.\n"
             "- show_last_memo(): shows the newest memo's text, the text actually spoken (with the tags that were added), and its link. Use it when the user asks what was said or which tags were used.\n"
             "- If recording fails, the error says what to do. Do not retry more than once; tell the user instead."
@@ -344,6 +412,20 @@ class Tools:
             await _emit(__event_emitter__, {"type": "status", "data": {"description": "Voice memo failed", "done": True}})
             return self._fail(e)
 
+        return await self._finish(audio, title, text, spoken, {"voice": voice}, voice_note, __event_emitter__)
+
+    async def _finish(
+        self,
+        audio: bytes,
+        title: str,
+        text: str,
+        spoken: str,
+        extra_meta: Dict[str, Any],
+        voice_note: str,
+        emitter: Optional[Callable[[dict], Any]],
+    ) -> str:
+        """Save the audio, upload it, write the sidecar, attach it to the chat and build the reply the model sees."""
+        v = self.valves
         stamp = datetime.now().astimezone()
         name = f"{stamp:%Y%m%d-%H%M%S}-{slugify(title or text)}.mp3"
         saved = ""
@@ -368,7 +450,7 @@ class Tools:
                         {
                             "title": title or text[:60],
                             "created": stamp.isoformat(timespec="seconds"),
-                            "voice": voice,
+                            **extra_meta,
                             "model": v.TTS_MODEL,
                             "chars": len(text),
                             "text": text,
@@ -384,7 +466,7 @@ class Tools:
         if url and v.ATTACH_TO_CHAT:
             file_id = url.split("/api/v1/files/")[1].split("/")[0]
             await _emit(
-                __event_emitter__,
+                emitter,
                 {
                     "type": "files",
                     "data": {
@@ -394,7 +476,7 @@ class Tools:
                     },
                 },
             )
-        await _emit(__event_emitter__, {"type": "status", "data": {"description": "Voice memo recorded", "done": True}})
+        await _emit(emitter, {"type": "status", "data": {"description": "Voice memo recorded", "done": True}})
         label = title or "voice memo"
         if url:
             full = f"{v.PUBLIC_BASE_URL.rstrip('/')}{url}" if v.PUBLIC_BASE_URL.strip() else ""
@@ -410,6 +492,92 @@ class Tools:
             f"Recorded {name} ({len(audio)} bytes) and saved on the server as: {saved}{voice_note}\n"
             f"No playable link could be made ({why}). Tell the user the memo exists at that path and that the tool's "
             "OPEN_WEBUI_API_KEY valve needs checking."
+        )
+
+
+    async def record_conversation(
+        self,
+        script: str,
+        title: str = "",
+        __event_emitter__: Optional[Callable[[dict], Any]] = None,
+    ) -> str:
+        """
+        Record a spoken conversation between named speakers as one audio clip, each speaker in their own voice, and give the user a link to listen to it.
+
+        :param script: One line per turn, written "Name: what they say". Known names (see voice_memo_help) get their own voice. Plain sentences, no Markdown.
+        :param title: Optional short title, used in the file name and the link. Omit for an automatic one.
+        :return: A message containing a Markdown link; put that link in your reply so the user can play the recording.
+        """
+        v = self.valves
+        try:
+            voices = {str(k).strip().lower(): str(x).strip().lower() for k, x in json.loads(v.SPEAKER_VOICES or "{}").items()}
+        except (ValueError, AttributeError):
+            return (
+                "Error: the SPEAKER_VOICES valve is not a valid JSON object.\n"
+                "What to do: this is a configuration problem. Tell the user; retrying will not help."
+            )
+        try:
+            turns = parse_script(script)
+        except ValueError as e:
+            return (
+                f"Error: {e}.\n"
+                'What to do: call again with one line per turn, each written like "Mara: Hello there." '
+                "(the speaker's name, a colon, then the words)."
+            )
+        if len(turns) > v.MAX_CONVERSATION_LINES:
+            return (
+                f"Error: the script has {len(turns)} turns; the limit is {v.MAX_CONVERSATION_LINES}.\n"
+                "What to do: shorten it, or record it in several calls."
+            )
+        total = sum(len(w) for _n, w in turns)
+        if total > v.MAX_CHARS:
+            return (
+                f"Error: the script is {total} characters; the limit is {v.MAX_CHARS}.\n"
+                "What to do: shorten it, or record it in several calls."
+            )
+        title = "" if is_unset(title) else title.strip()
+
+        unknown: List[str] = []
+        used: Dict[str, str] = {}
+        resolved: List[Tuple[str, str, str]] = []
+        for name, words in turns:
+            voice = voices.get(name.lower(), "")
+            if not _VOICE_ID_RE.match(voice):
+                voice = v.DEFAULT_VOICE
+                if name not in unknown:
+                    unknown.append(name)
+            used.setdefault(name, voice)
+            resolved.append((name, words, voice))
+
+        parts: List[bytes] = []
+        spoken_turns: List[Tuple[str, str]] = []
+        for i, (name, words, voice) in enumerate(resolved, 1):
+            await _emit(
+                __event_emitter__,
+                {"type": "status", "data": {"description": f"Recording {name} ({i} of {len(resolved)})...", "done": False}},
+            )
+            spoken, _why = await asyncio.to_thread(add_expression_tags, v, words)
+            try:
+                audio, _ctype = await asyncio.to_thread(synthesize, v, spoken, voice)
+            except MemoError as e:
+                await _emit(__event_emitter__, {"type": "status", "data": {"description": "Conversation failed", "done": True}})
+                return self._fail(MemoError(f"line {i} of {len(resolved)} ({name}): {e}", e.status))
+            parts.append(audio)
+            spoken_turns.append((name, spoken))
+
+        text = "\n".join(f"{n}: {w}" for n, w, _v in resolved)
+        spoken_text = "\n".join(f"{n}: {w}" for n, w in spoken_turns)
+        note = ""
+        if unknown:
+            note = f"\nNote: no voice is set for {', '.join(unknown)}, so the default voice was used."
+        return await self._finish(
+            join_mp3(parts),
+            title or "conversation",
+            text,
+            spoken_text,
+            {"voice": "multiple", "speakers": used},
+            note,
+            __event_emitter__,
         )
 
     async def list_voice_memos(self, limit: str = "10") -> str:
