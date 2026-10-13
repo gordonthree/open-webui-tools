@@ -626,7 +626,7 @@ class HelpTests(Base):
         import re as _re
 
         for fn in (mod.Tools.record_voice_memo, mod.Tools.record_conversation):
-            self.assertIn("about 500 words", _re.sub(r"\s+", " ", fn.__doc__))
+            self.assertIn("about 500 words", _re.sub(r"\s+", " ", fn.__doc__).lower())
 
     def test_help_mentions_methods_and_limit(self):
         out = asyncio.run(self.tool.voice_memo_help())
