@@ -466,7 +466,7 @@ class Tools:
         """
         Record a spoken voice memo from text and give the user a link to listen to it.
 
-        :param text: The exact words to speak, written the way they should be said aloud (plain sentences, no Markdown). For expression use square-bracket tags: a mood at the start of a sentence ([happy], [sad], [angry], [excited], [calm], [nervous]) or a sound anywhere ([whispering], [laughing], [sighing]); never *asterisks* or (stage directions), which are read aloud.
+        :param text: The exact words to speak, written the way they should be said aloud (plain sentences, no Markdown). Keep it to about 500 words; longer text is rejected and the error gives the exact limit. For expression use square-bracket tags: a mood at the start of a sentence ([happy], [sad], [angry], [excited], [calm], [nervous]) or a sound anywhere ([whispering], [laughing], [sighing]); never *asterisks* or (stage directions), which are read aloud.
         :param title: Optional short title, used in the file name and the link. Omit for an automatic one.
         :param voice: Almost always omit this (pass ""). Only a 32-character hex Fish Audio voice id the user gave you is valid; never invent a voice name, it is ignored.
         :return: A message containing a Markdown link; put that link in your reply so the user can play the memo.
@@ -589,7 +589,7 @@ class Tools:
         """
         Record a spoken conversation between named speakers as one audio clip, each speaker in their own voice, and give the user a link to listen to it.
 
-        :param script: One line per turn, written "Name: what they say". Known names (see voice_memo_help) get their own voice. Plain sentences, no Markdown.
+        :param script: One line per turn, written "Name: what they say". About 500 words in total at most; longer text is rejected and the error gives the exact limit. Known names (see voice_memo_help) get their own voice. Plain sentences, no Markdown.
         :param title: Optional short title, used in the file name and the link. Omit for an automatic one.
         :return: A message containing a Markdown link; put that link in your reply so the user can play the recording.
         """

@@ -622,6 +622,12 @@ class ShowLastTests(Base):
 
 
 class HelpTests(Base):
+    def test_descriptions_tell_the_model_the_rough_limit(self):
+        import re as _re
+
+        for fn in (mod.Tools.record_voice_memo, mod.Tools.record_conversation):
+            self.assertIn("about 500 words", _re.sub(r"\s+", " ", fn.__doc__))
+
     def test_help_mentions_methods_and_limit(self):
         out = asyncio.run(self.tool.voice_memo_help())
         self.assertIn("record_voice_memo", out)
