@@ -44,7 +44,7 @@ class FakeNet:
             if isinstance(self.chat, Exception):
                 raise self.chat
             return self.chat
-        return self.tts if url.endswith("/audio/speech") else self.upload
+        return self.tts if url.endswith(("/audio/speech", "/v1/tts")) else self.upload
 
     def tts_input(self):
         return next(kw["json"]["input"] for url, kw in self.calls if url.endswith("/audio/speech"))
@@ -316,6 +316,10 @@ class MultiTTS(FakeNet):
         return super().__call__(url, **kw)
 
 
+def fish_calls(fake):
+    return [kw for url, kw in fake.calls if url.endswith("/v1/tts")]
+
+
 MARA, HANNAH = "67f1f9b08fef4fbc957cd2a93c45918c", "cffb6be7e50f40e2999b224b16bd4cc0"
 
 
@@ -425,6 +429,107 @@ class Mp3JoinTests(unittest.TestCase):
             with mock.patch.object(mod.requests, "post", fake):
                 asyncio.run(tool.record_conversation("Mara: a.\nHannah: b."))
         self.assertEqual(len(seen), 3)
+        self.assertFalse(any(seen))
+
+
+class FishBackendTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.tool.valves.FISH_API_KEY = "fish-key"
+
+    def test_single_memo_uses_fish_request_shape(self):
+        fake = FakeNet()
+        out = self.run_tool(fake, self.tool.record_voice_memo, "Hello there.", "T")
+        self.assertEqual([u for u, _ in fake.calls if "openrouter" in u], [])
+        kw = fish_calls(fake)[0]
+        self.assertEqual(fake.calls[0][0], "https://api.fish.audio/v1/tts")
+        self.assertEqual(kw["headers"]["Authorization"], "Bearer fish-key")
+        self.assertEqual(kw["headers"]["model"], "s2.1-pro-free")
+        self.assertEqual(kw["json"], {"text": "Hello there.", "format": "mp3", "reference_id": self.tool.valves.DEFAULT_VOICE})
+        self.assertIn("[Play T](/api/v1/files/abc123/content)", out)
+        meta = json.loads(next(Path(self.tool.valves.MEMO_DIR).glob("*.json")).read_text())
+        self.assertIn("Fish Audio API", meta["model"])
+
+    def test_no_fish_key_keeps_openrouter_path(self):
+        self.tool.valves.FISH_API_KEY = ""
+        fake = FakeNet()
+        self.run_tool(fake, self.tool.record_voice_memo, "Hello there.", "T")
+        self.assertEqual(fish_calls(fake), [])
+        self.assertTrue(fake.calls[0][0].endswith("/audio/speech"))
+
+    def test_fish_only_works_without_openrouter_key(self):
+        self.tool.valves.OPENROUTER_API_KEY = ""
+        out = self.run_tool(FakeNet(), self.tool.record_voice_memo, "Hello there.", "T")
+        self.assertIn("Recorded", out)
+
+    def test_conversation_is_one_request_with_tags_and_voice_array(self):
+        fake = FakeNet()
+        out = self.run_tool(fake, self.tool.record_conversation, "Mara: Hi.\nHannah: Hello!\nMara: Bye.")
+        calls = fish_calls(fake)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["json"]["text"], "<|speaker:0|>Hi. <|speaker:1|>Hello! <|speaker:0|>Bye.")
+        self.assertEqual(calls[0]["json"]["reference_id"], [MARA, HANNAH])
+        meta = json.loads(next(Path(self.tool.valves.MEMO_DIR).glob("*.json")).read_text())
+        self.assertEqual(meta["mode"], "one request")
+        self.assertIn("[Play conversation]", out)
+
+    def test_speaker_case_is_one_speaker(self):
+        fake = FakeNet()
+        self.run_tool(fake, self.tool.record_conversation, "Mara: Hi.\nHannah: Yo.\nMARA: Bye.")
+        self.assertEqual(fish_calls(fake)[0]["json"]["text"], "<|speaker:0|>Hi. <|speaker:1|>Yo. <|speaker:0|>Bye.")
+        self.assertEqual(len(fish_calls(fake)[0]["json"]["reference_id"]), 2)
+
+    def test_unknown_speaker_gets_default_voice_in_array(self):
+        fake = FakeNet()
+        out = self.run_tool(fake, self.tool.record_conversation, "Mara: Hi.\nBob: Hey.")
+        self.assertEqual(fish_calls(fake)[0]["json"]["reference_id"], [MARA, self.tool.valves.DEFAULT_VOICE])
+        self.assertIn("no voice is set for Bob", out)
+
+    def test_native_off_joins_clips_through_fish(self):
+        self.tool.valves.NATIVE_MULTI_SPEAKER = False
+        fake = FakeNet()
+        self.run_tool(fake, self.tool.record_conversation, "Mara: Hi.\nHannah: Yo.")
+        calls = fish_calls(fake)
+        self.assertEqual([c["json"]["text"] for c in calls], ["Hi.", "Yo."])
+        self.assertEqual([c["json"]["reference_id"] for c in calls], [MARA, HANNAH])
+
+    def test_one_speaker_and_five_speakers_do_not_use_native(self):
+        fake = FakeNet()
+        self.run_tool(fake, self.tool.record_conversation, "Mara: Hi.\nMara: Again.")
+        self.assertEqual([c["json"]["text"] for c in fish_calls(fake)], ["Hi. Again."])
+        fake = FakeNet()
+        self.run_tool(fake, self.tool.record_conversation, "A: 1.\nB: 2.\nC: 3.\nD: 4.\nE: 5.")
+        self.assertEqual(len(fish_calls(fake)), 5)
+
+    def test_formatter_tags_each_turn_inside_the_speaker_markers(self):
+        self.tool.valves.FORMATTER_MODEL = "m"
+        fake = FakeNet(chat=chat_reply("[happy] Hi."))
+        self.run_tool(fake, self.tool.record_conversation, "Mara: Hi.\nHannah: Hi.")
+        self.assertEqual(fish_calls(fake)[0]["json"]["text"], "<|speaker:0|>[happy] Hi. <|speaker:1|>[happy] Hi.")
+
+    def test_errors_name_fish_audio(self):
+        fake = FakeNet(tts=Resp(402, payload={"status": 402, "message": "Insufficient balance"}))
+        out = self.run_tool(fake, self.tool.record_voice_memo, "Hi")
+        self.assertIn("Fish Audio HTTP 402: Insufficient balance", out)
+        self.assertIn("The Fish Audio account is out of credits", out)
+        fake = FakeNet(tts=Resp(503, payload={"status": 503, "message": "High load"}))
+        out = self.run_tool(fake, self.tool.record_conversation, "Mara: a.\nHannah: b.")
+        self.assertIn("Fish Audio side", out)
+        self.assertIn("Retry once", out)
+        self.assertFalse(Path(self.tool.valves.MEMO_DIR).exists())
+
+    def test_fish_calls_stay_off_the_event_loop(self):
+        import threading
+
+        seen = []
+
+        def fake(url, **kw):
+            seen.append(threading.current_thread() is threading.main_thread())
+            return FakeNet()(url, **kw)
+
+        with mock.patch.object(mod.requests, "post", fake):
+            asyncio.run(self.tool.record_conversation("Mara: a.\nHannah: b."))
+        self.assertEqual(len(seen), 2)
         self.assertFalse(any(seen))
 
 

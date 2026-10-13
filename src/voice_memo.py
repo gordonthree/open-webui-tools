@@ -31,9 +31,10 @@ def is_unset(value: Any) -> bool:
 class MemoError(RuntimeError):
     """A failed OpenRouter call, keeping the HTTP status so the error can say what to do."""
 
-    def __init__(self, message: str, status: int = 0):
+    def __init__(self, message: str, status: int = 0, provider: str = "OpenRouter"):
         super().__init__(message)
         self.status = status
+        self.provider = provider
 
 
 _VOICE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -44,8 +45,43 @@ def slugify(text: str, max_len: int = 40) -> str:
     return slug[:max_len].strip("-") or "memo"
 
 
+def effective_model(valves: "Tools.Valves") -> str:
+    """The speech model name to record in the sidecar, for whichever backend is in use."""
+    return f"fish-audio/{valves.FISH_MODEL} (Fish Audio API)" if (valves.FISH_API_KEY or "").strip() else valves.TTS_MODEL
+
+
+def synthesize_fish(valves: "Tools.Valves", text: str, reference: Any) -> Tuple[bytes, str]:
+    """Call Fish Audio's own /v1/tts. `reference` is one voice id, or a list of ids for <|speaker:N|> tags in `text`."""
+    body: Dict[str, Any] = {"text": text, "format": "mp3"}
+    if reference:
+        body["reference_id"] = reference
+    try:
+        r = requests.post(
+            valves.FISH_API_URL,
+            headers={"Authorization": f"Bearer {valves.FISH_API_KEY.strip()}", "model": valves.FISH_MODEL, "Content-Type": "application/json"},
+            json=body,
+            timeout=valves.REQUEST_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as e:
+        raise MemoError(f"Could not reach Fish Audio: {e}", -1, "Fish Audio")
+    if r.status_code >= 400:
+        detail = ""
+        try:
+            detail = r.json().get("message", "")
+        except Exception:
+            detail = (r.text or "")[:200]
+        raise MemoError(f"Fish Audio HTTP {r.status_code}: {detail}", r.status_code, "Fish Audio")
+    if not r.content:
+        raise MemoError("Fish Audio returned an empty audio body.", 502, "Fish Audio")
+    return r.content, r.headers.get("Content-Type", "audio/mpeg")
+
+
 def synthesize(valves: "Tools.Valves", text: str, voice: str) -> Tuple[bytes, str]:
-    """Call OpenRouter's /audio/speech. Returns (mp3 bytes, content type)."""
+    """Speak `text`. Uses Fish Audio's own API when FISH_API_KEY is set, otherwise OpenRouter's /audio/speech.
+
+    Returns (mp3 bytes, content type)."""
+    if (valves.FISH_API_KEY or "").strip():
+        return synthesize_fish(valves, text, voice)
     if not valves.OPENROUTER_API_KEY:
         raise MemoError("OPENROUTER_API_KEY is not set in the tool's valves.", 401)
     body = {
@@ -287,6 +323,16 @@ class Tools:
             default=12,
             description="Most speaker turns record_conversation accepts in one call (neighbouring lines by the same speaker count as one). Each turn is one paid speech request.",
         )
+        FISH_API_KEY: str = Field(
+            default="",
+            description="Fish Audio API key (https://fish.audio). When set, speech is made directly with Fish Audio instead of through OpenRouter, which avoids OpenRouter's free-model daily cap and lets record_conversation use real per-speaker voices. Empty = use OpenRouter.",
+        )
+        FISH_API_URL: str = Field(default="https://api.fish.audio/v1/tts", description="Fish Audio text-to-speech endpoint.")
+        FISH_MODEL: str = Field(default="s2.1-pro-free", description="Fish Audio model sent in the 'model' header (s2.1-pro-free, s2.1-pro, s2-pro).")
+        NATIVE_MULTI_SPEAKER: bool = Field(
+            default=True,
+            description="With FISH_API_KEY set, record_conversation sends the whole exchange as ONE request using <|speaker:N|> tags and a list of voices. Off = one request per line, joined afterwards.",
+        )
         MAX_CHARS: int = Field(default=3000, description="Longest memo text accepted, in characters.")
         UPLOAD_TO_OPEN_WEBUI: bool = Field(
             default=True,
@@ -318,13 +364,14 @@ class Tools:
         """Turn an exception into an error message that tells the model what to do next."""
         text = f"Error: {e}"
         status = getattr(e, "status", 0)
+        who = getattr(e, "provider", "OpenRouter")
         if status in (401, 403):
-            hint = "OpenRouter rejected the API key or the spending limit is reached. This is a configuration problem. Tell the user; retrying will not help."
+            hint = f"{who} rejected the API key or the spending limit is reached. This is a configuration problem. Tell the user; retrying will not help."
         elif status == 402:
-            hint = "The OpenRouter account is out of credits. Tell the user; retrying will not help."
+            hint = f"The {who} account is out of credits. Tell the user; retrying will not help."
         elif status in (400, 404):
             hint = (
-                "OpenRouter did not accept the request. If you passed a voice, retry once without it "
+                f"{who} did not accept the request. If you passed a voice, retry once without it "
                 "(pass an empty string for voice). If it fails again, tell the user the model or voice setting needs checking."
             )
         elif status == 429 and re.search(r"per-day|daily|free-models", str(e), re.I):
@@ -333,7 +380,7 @@ class Tools:
                 "Do not retry; tell the user the memo could not be recorded until the limit resets."
             )
         elif status == 429 or status >= 500 or status == -1:
-            hint = "A temporary problem on the OpenRouter side. Retry once; if it fails again, tell the user."
+            hint = f"A temporary problem on the {who} side. Retry once; if it fails again, tell the user."
         else:
             return text
         return f"{text}\nWhat to do: {hint}"
@@ -451,7 +498,7 @@ class Tools:
                             "title": title or text[:60],
                             "created": stamp.isoformat(timespec="seconds"),
                             **extra_meta,
-                            "model": v.TTS_MODEL,
+                            "model": effective_model(v),
                             "chars": len(text),
                             "text": text,
                             **({"spoken_text": spoken} if spoken != text else {}),
@@ -549,21 +596,41 @@ class Tools:
             used.setdefault(name, voice)
             resolved.append((name, words, voice))
 
-        parts: List[bytes] = []
-        spoken_turns: List[Tuple[str, str]] = []
-        for i, (name, words, voice) in enumerate(resolved, 1):
-            await _emit(
-                __event_emitter__,
-                {"type": "status", "data": {"description": f"Recording {name} ({i} of {len(resolved)})...", "done": False}},
-            )
-            spoken, _why = await asyncio.to_thread(add_expression_tags, v, words)
-            try:
-                audio, _ctype = await asyncio.to_thread(synthesize, v, spoken, voice)
-            except MemoError as e:
-                await _emit(__event_emitter__, {"type": "status", "data": {"description": "Conversation failed", "done": True}})
-                return self._fail(MemoError(f"line {i} of {len(resolved)} ({name}): {e}", e.status))
-            parts.append(audio)
-            spoken_turns.append((name, spoken))
+        # One short formatter call per turn, all at once, before any speech is made.
+        await _emit(__event_emitter__, {"type": "status", "data": {"description": "Preparing conversation...", "done": False}})
+        tagged = await asyncio.gather(*(asyncio.to_thread(add_expression_tags, v, words) for _n, words, _vc in resolved))
+        spoken_turns: List[Tuple[str, str]] = [(n, t[0]) for (n, _w, _vc), t in zip(resolved, tagged)]
+
+        # With a Fish key, one request can carry every speaker: <|speaker:N|> tags in the text and a list of voices.
+        order: List[str] = []
+        for n, _w, vc in resolved:
+            if n.lower() not in [o.lower() for o in order]:
+                order.append(n)
+        native = bool((v.FISH_API_KEY or "").strip()) and v.NATIVE_MULTI_SPEAKER and 2 <= len(order) <= 4
+        try:
+            if native:
+                await _emit(__event_emitter__, {"type": "status", "data": {"description": "Recording conversation...", "done": False}})
+                lowered = [o.lower() for o in order]
+                script_text = " ".join(f"<|speaker:{lowered.index(n.lower())}|>{t}" for n, t in spoken_turns)
+                refs = [next(vc for n, _w, vc in resolved if n.lower() == o.lower()) for o in order]
+                audio, _ctype = await asyncio.to_thread(synthesize_fish, v, script_text, refs)
+                joined = audio
+            else:
+                parts: List[bytes] = []
+                for i, ((name, _words, voice), (_n, spoken)) in enumerate(zip(resolved, spoken_turns), 1):
+                    await _emit(
+                        __event_emitter__,
+                        {"type": "status", "data": {"description": f"Recording {name} ({i} of {len(resolved)})...", "done": False}},
+                    )
+                    try:
+                        audio, _ctype = await asyncio.to_thread(synthesize, v, spoken, voice)
+                    except MemoError as e:
+                        raise MemoError(f"line {i} of {len(resolved)} ({name}): {e}", e.status, e.provider)
+                    parts.append(audio)
+                joined = join_mp3(parts)
+        except MemoError as e:
+            await _emit(__event_emitter__, {"type": "status", "data": {"description": "Conversation failed", "done": True}})
+            return self._fail(e)
 
         text = "\n".join(f"{n}: {w}" for n, w, _v in resolved)
         spoken_text = "\n".join(f"{n}: {w}" for n, w in spoken_turns)
@@ -571,11 +638,11 @@ class Tools:
         if unknown:
             note = f"\nNote: no voice is set for {', '.join(unknown)}, so the default voice was used."
         return await self._finish(
-            join_mp3(parts),
+            joined,
             title or "conversation",
             text,
             spoken_text,
-            {"voice": "multiple", "speakers": used},
+            {"voice": "multiple", "speakers": used, "mode": "one request" if native else "joined clips"},
             note,
             __event_emitter__,
         )

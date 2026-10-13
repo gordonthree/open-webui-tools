@@ -47,7 +47,7 @@ Current tools:
   same folder). Notes are addressed by name (unique, case-insensitive) and entries by number; there
   are no UUIDs, since a model reproduces a plain-language name more reliably than an opaque id.
 
-- `voice_memo.py` → `record_voice_memo`, `list_voice_memos`, `show_last_memo` (original and spoken text of the newest memo), `record_conversation` (several named speakers as one clip: one speech call per turn, each in the voice the `SPEAKER_VOICES` valve maps to that name, clips joined; limit `MAX_CONVERSATION_LINES`), `voice_memo_help` — lets a model record a spoken memo: the text goes to
+- `voice_memo.py` → `record_voice_memo`, `list_voice_memos`, `show_last_memo` (original and spoken text of the newest memo), `record_conversation` (several named speakers as one clip, each in the voice the `SPEAKER_VOICES` valve maps to that name; limit `MAX_CONVERSATION_LINES`. With `FISH_API_KEY` set it is ONE request to Fish's own API: `<|speaker:N|>` tags in the text plus a `reference_id` list, which is Fish's documented multi-speaker form; without it, or with `NATIVE_MULTI_SPEAKER` off or more than 4 speakers, it makes one speech call per turn and joins the mp3 clips), `voice_memo_help` — lets a model record a spoken memo: the text goes to
   a TTS model on OpenRouter (valve `TTS_MODEL`, default `fish-audio/s2.1-pro-free:free`, OpenRouter's own id
   with no OWUI connection prefix like `or.`), the MP3 is kept in `MEMO_DIR` (default
   `/app/backend/data/voice_memos`, with a `.json` sidecar holding the text) and uploaded to OWUI's file storage,
@@ -56,7 +56,7 @@ Current tools:
   (read aloud). Before speaking, a small chat model (valve `FORMATTER_MODEL`, default
   `mistralai/mistral-small-24b-instruct-2501`, empty = off) adds the tags: it is skipped when the text is already tagged, falls back
   to the original text on any error or if it changes the words (`FORMATTER_MIN_WORD_MATCH`), and the `.json` sidecar keeps both `text` and
-  `spoken_text`; `FORMATTER_PROMPT` overrides the built-in prompt; the full tag reference for a knowledge file is `docs/fish_audio_tags.md`. Needs `OPENROUTER_API_KEY` and `OPEN_WEBUI_API_KEY` valves.
+  `spoken_text`; `FORMATTER_PROMPT` overrides the built-in prompt; the full tag reference for a knowledge file is `docs/fish_audio_tags.md`. Needs `OPEN_WEBUI_API_KEY` plus a speech key: `FISH_API_KEY` (Fish Audio direct, `FISH_MODEL` default `s2.1-pro-free`, avoids OpenRouter's free-model daily cap) or `OPENROUTER_API_KEY` (also used by the tag formatter).
   `PUBLIC_BASE_URL` (default the OWUI address) makes it also return a full link the model can paste into an email;
   it opens only for a browser logged in to OWUI. `ATTACH_TO_CHAT` (on) also attaches the memo to the assistant message via a `files` event so it
   shows in the chat's Files tab. No delete method on purpose. Unrelated to ComfyUI.
