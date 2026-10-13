@@ -117,7 +117,7 @@ RULES
 - Tags go in [square brackets]. The voice performs a tag; it never says it.
 - A mood tag goes at the START of a sentence. Use at most one main mood per sentence; change it only when the feeling changes.
 - A tone or sound tag can go anywhere, next to what it affects. After a sound tag, keep any written sound already there (for example "ha ha").
-- Use few tags. At most one tag per two sentences, and none at all for plain or neutral sentences such as reminders or facts. Many tags sound unnatural.
+- Use few tags. For a short message, one or two. For a story or other narration, tag where the mood or pace changes: about one tag every two to four sentences, including a soft or calm opening, a tense or sad turn, and a warm or happy ending. Plain facts and reminders get no tags unless the words clearly show a feeling.
 - Pick a mood only when the words clearly show it. Never invent a feeling the text does not express (a reminder is not angry).
 - If the text contains *asterisk actions* or (stage directions), REPLACE them with a bracket tag in the same place. The asterisks, parentheses and the words inside them must not appear in your reply.
 - Remove emoji and Markdown marks. Do not add anything else.
