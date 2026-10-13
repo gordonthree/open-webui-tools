@@ -212,6 +212,12 @@ class HelpTests(Base):
         self.assertIn("list_voice_memos", out)
         self.assertIn(str(self.tool.valves.MAX_CHARS), out)
 
+    def test_help_teaches_bracket_tags_not_asterisks(self):
+        out = asyncio.run(self.tool.voice_memo_help())
+        self.assertIn("[happy]", out)
+        self.assertIn("[whispering]", out)
+        self.assertIn("Never use *asterisks*", out)
+
 
 class SlugTests(unittest.TestCase):
     def test_slugify(self):

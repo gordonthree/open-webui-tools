@@ -188,7 +188,7 @@ class Tools:
             "Voice memo tools\n"
             f"- record_voice_memo(text, title, voice): speaks `text` aloud and saves it as an MP3. `text` is the exact words, "
             f"plain sentences with no Markdown, at most {v.MAX_CHARS} characters (split longer memos into several calls). "
-            "For expression, put a tag in square brackets where it should happen, e.g. [whispers], [laugh], [giggle], [sigh]; the voice performs it and does not say the word. Never use *asterisks* or (stage directions): they are read aloud. `title` is optional; pass \"\" for an automatic one. `voice` is optional; pass \"\" (the normal choice). Never invent a voice name; only a 32-character hex id from the user is valid.\n"
+            "Expression goes in square brackets and is performed, not spoken. Mood tags work best at the start of a sentence: [happy] [sad] [angry] [excited] [calm] [nervous]. Tone and sound tags can go anywhere: [whispering] [shouting] [soft tone] [laughing] [sighing] [break]. Any short description also works, e.g. [slightly sad]. Never use *asterisks* or (stage directions): they are read aloud. `title` is optional; pass \"\" for an automatic one. `voice` is optional; pass \"\" (the normal choice). Never invent a voice name; only a 32-character hex id from the user is valid.\n"
             "- The result contains a Markdown link: copy it into your reply, exactly as given, so the user can play the memo.\n"
             "- If the user wants it by email, use the 'Full link' line from the result in the email body. It opens only "
             "while the user is logged in to Open WebUI.\n"
@@ -206,7 +206,7 @@ class Tools:
         """
         Record a spoken voice memo from text and give the user a link to listen to it.
 
-        :param text: The exact words to speak, written the way they should be said aloud (plain sentences, no Markdown). For expression use square-bracket tags such as [whispers] or [laugh] where they should happen; never *asterisks* or (stage directions), which are read aloud.
+        :param text: The exact words to speak, written the way they should be said aloud (plain sentences, no Markdown). For expression use square-bracket tags: a mood at the start of a sentence ([happy], [sad], [angry], [excited], [calm], [nervous]) or a sound anywhere ([whispering], [laughing], [sighing]); never *asterisks* or (stage directions), which are read aloud.
         :param title: Optional short title, used in the file name and the link. Omit for an automatic one.
         :param voice: Almost always omit this (pass ""). Only a 32-character hex Fish Audio voice id the user gave you is valid; never invent a voice name, it is ignored.
         :return: A message containing a Markdown link; put that link in your reply so the user can play the memo.
