@@ -175,6 +175,22 @@ class RecordTests(Base):
         self.assertIn("turned off", out)
 
 
+class EventLoopTests(Base):
+    def test_blocking_http_calls_do_not_run_on_the_event_loop(self):
+        import threading
+
+        seen = []
+
+        def fake(url, **kw):
+            seen.append(threading.current_thread() is threading.main_thread())
+            return FakeNet()(url, **kw)
+
+        with mock.patch.object(mod.requests, "post", fake):
+            asyncio.run(self.tool.record_voice_memo("Hi", "T"))
+        self.assertEqual(len(seen), 2)
+        self.assertFalse(any(seen), "requests.post ran on the event loop thread")
+
+
 class ListTests(Base):
     def test_empty_then_listing(self):
         self.assertIn("No voice memos", asyncio.run(self.tool.list_voice_memos()))

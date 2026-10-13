@@ -8,6 +8,7 @@ description: Lets a model record a spoken voice memo. It sends the text to a tex
 requirements: requests
 """
 
+import asyncio
 import json
 import mimetypes
 import re
@@ -229,7 +230,7 @@ class Tools:
 
         await _emit(__event_emitter__, {"type": "status", "data": {"description": "Recording voice memo...", "done": False}})
         try:
-            audio, _ctype = synthesize(v, text, voice)
+            audio, _ctype = await asyncio.to_thread(synthesize, v, text, voice)
         except MemoError as e:
             await _emit(__event_emitter__, {"type": "status", "data": {"description": "Voice memo failed", "done": True}})
             return self._fail(e)
@@ -246,7 +247,10 @@ class Tools:
 
         url, upload_err = (None, None)
         if v.UPLOAD_TO_OPEN_WEBUI:
-            url, upload_err = upload_to_open_webui(v.OPEN_WEBUI_BASE_URL, v.OPEN_WEBUI_API_KEY, audio, name, v.REQUEST_TIMEOUT_SECONDS)
+            # Must run off the event loop: this posts to Open WebUI itself, which would deadlock a blocked loop.
+            url, upload_err = await asyncio.to_thread(
+                upload_to_open_webui, v.OPEN_WEBUI_BASE_URL, v.OPEN_WEBUI_API_KEY, audio, name, v.REQUEST_TIMEOUT_SECONDS
+            )
 
         if saved and not saved.startswith("("):
             try:
