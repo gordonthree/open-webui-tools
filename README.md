@@ -52,7 +52,8 @@ Current tools:
   with no OWUI connection prefix like `or.`), the MP3 is kept in `MEMO_DIR` (default
   `/app/backend/data/voice_memos`, with a `.json` sidecar holding the text) and uploaded to OWUI's file storage,
   and the model gets back a Markdown link the user clicks to play it. `DEFAULT_VOICE` is a Fish Audio
-  `reference_id` from fish.audio's voice library. Needs `OPENROUTER_API_KEY` and `OPEN_WEBUI_API_KEY` valves.
+  `reference_id` from fish.audio's voice library. Expression uses `[square bracket]` tags, never asterisks
+  (read aloud); the full tag reference for a knowledge file is `docs/fish_audio_tags.md`. Needs `OPENROUTER_API_KEY` and `OPEN_WEBUI_API_KEY` valves.
   `PUBLIC_BASE_URL` (default the OWUI address) makes it also return a full link the model can paste into an email;
   it opens only for a browser logged in to OWUI. `ATTACH_TO_CHAT` (on) also attaches the memo to the assistant message via a `files` event so it
   shows in the chat's Files tab. No delete method on purpose. Unrelated to ComfyUI.
