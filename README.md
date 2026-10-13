@@ -440,6 +440,36 @@ Deploy: create the Function once in OWUI (Admin -> Functions -> "+", paste `src/
 valves, then add its id to `secrets.md` as `agent_duo: <id>` so `python scripts/push_tool.py agent_duo` can update
 it. Tests: `cd src && python -m unittest test_agent_duo -v`.
 
+## Read-aloud with Fish Audio directly (Open WebUI Audio settings)
+
+Open WebUI's own read-aloud button can call Fish Audio without OpenRouter. Fish has an OpenAI-compatible
+endpoint, so this is a settings change only (the `voice_memo` tool has its own `FISH_API_KEY` valve and is separate).
+Set it in **Admin Settings -> Audio** on each server (this page is separate from Connections):
+
+| Setting | Value |
+| --- | --- |
+| TTS engine | OpenAI |
+| API base URL | `https://api.fish.audio/compat/v1` |
+| API key | that server's own Fish API key |
+| TTS model | `fish-audio/s2.1-pro-free` (plain `s2.1-pro-free` also works; no `:free` suffix, no `or.` prefix) |
+| Voice | a Fish voice id (`reference_id`); OpenAI preset names such as `nova` are rejected with a 400 |
+
+Verified 2026-10-13 with a real key: both free model names returned audio/mpeg. `fish-audio/s2.1-pro` (the paid
+model) returned HTTP 402 "Insufficient API credit" on a free account, so do not select it. The endpoint's default
+format is PCM, but Open WebUI sends `response_format: mp3` itself. Fish refuses an `instructions` field (400); the
+OpenAI engine does not send one.
+
+Things to know:
+- If `audio.tts.openai.params` was ever set, it overrides the model field; make sure it does not hold an old
+  `or.` model name.
+- Open WebUI looks up `/audio/voices` on the endpoint; a 404 there is logged but harmless.
+- Read-aloud splits a reply into many small requests (about 35 in 3 seconds was seen against OpenRouter's limit).
+  If Fish throttles, set response splitting to paragraphs in the same Audio settings page.
+- The speech cache keys on the request, so replies read aloud before the switch are generated again once.
+- Fish audio starts speech after only ~40 ms of silence, so earbuds that are still waking can clip the first word.
+  The `voice_memo` tool pads its clips (`LEAD_IN_MS`); read-aloud audio comes straight from Fish and is not padded.
+- Fish's free-tier limits are not stated in the API docs; watch the usage page at https://fish.audio/app/developers.
+
 ## Job database
 
 Every render attempt across `comfy_sdxl_direct.py`/`comfy_sdxl_graph.py` — including ones ComfyUI
