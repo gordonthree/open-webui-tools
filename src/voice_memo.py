@@ -300,6 +300,7 @@ class Tools:
             "- If the user wants it by email, use the 'Full link' line from the result in the email body. It opens only "
             "while the user is logged in to Open WebUI.\n"
             "- list_voice_memos(limit): shows recent memos with their links, newest first.\n"
+            "- show_last_memo(): shows the newest memo's text, the text actually spoken (with the tags that were added), and its link. Use it when the user asks what was said or which tags were used.\n"
             "- If recording fails, the error says what to do. Do not retry more than once; tell the user instead."
         )
 
@@ -436,3 +437,33 @@ class Tools:
             link = f"[play]({m['url']}) full link: {base}{m['url']}" if m.get("url") and base else f"[play]({m['url']})" if m.get("url") else "(no link)"
             lines.append(f"- {m.get('created', '?')} - {m.get('title', p.stem)} ({m.get('chars', '?')} chars) {link}")
         return "\n".join(lines) or "No voice memos recorded yet."
+
+    async def show_last_memo(self) -> str:
+        """
+        Show the details of the most recent voice memo: the text that was given, the text actually spoken (with any expression tags added), the voice, and the play link. Use it when the user asks what a memo said or which tags were used.
+
+        :return: The memo's details.
+        """
+        d = Path(self.valves.MEMO_DIR)
+        sidecars: List[Path] = sorted(d.glob("*.json"), reverse=True)[:5] if d.is_dir() else []
+        for p in sidecars:
+            try:
+                m = json.loads(p.read_text())
+            except (OSError, ValueError):
+                continue
+            spoken = m.get("spoken_text")
+            base = self.valves.PUBLIC_BASE_URL.strip().rstrip("/")
+            lines = [
+                f"Title: {m.get('title', p.stem)}",
+                f"Recorded: {m.get('created', '?')}",
+                f"Voice: {m.get('voice', '?')}  Model: {m.get('model', '?')}  Characters: {m.get('chars', '?')}",
+                f"Text given:\n{m.get('text', '')}",
+                f"Text spoken (tags added automatically):\n{spoken}" if spoken else "Text spoken: the same as the text given (no tags were added automatically).",
+            ]
+            if m.get("url"):
+                lines.append(f"[Play]({m['url']})" + (f"  Full link: {base}{m['url']}" if base else ""))
+            else:
+                lines.append("No playable link was made for this memo.")
+            lines.append(f"File: {p.with_suffix('.mp3')}")
+            return "\n".join(lines)
+        return "No voice memos recorded yet."

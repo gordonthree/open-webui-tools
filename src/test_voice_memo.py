@@ -320,6 +320,35 @@ class ListTests(Base):
         self.assertIn("T", asyncio.run(self.tool.list_voice_memos("lots")))
 
 
+class ShowLastTests(Base):
+    def test_nothing_recorded(self):
+        self.assertIn("No voice memos", asyncio.run(self.tool.show_last_memo()))
+
+    def test_shows_newest_with_both_texts_and_link(self):
+        self.run_tool(FakeNet(), self.tool.record_voice_memo, "First one.", "First")
+        self.tool.valves.FORMATTER_MODEL = "m"
+        fake = FakeNet(chat=chat_reply("[sad] Second one here."))
+        mod_time = mod.datetime
+        with mock.patch.object(mod, "datetime", wraps=mod_time) as dt:
+            dt.now.return_value = mod_time(2099, 1, 1, 0, 0, 0).astimezone()
+            self.run_tool(fake, self.tool.record_voice_memo, "Second one here.", "Second")
+        out = asyncio.run(self.tool.show_last_memo())
+        self.assertIn("Title: Second", out)
+        self.assertIn("Text given:\nSecond one here.", out)
+        self.assertIn("[sad] Second one here.", out)
+        self.assertIn("[Play](/api/v1/files/abc123/content)", out)
+        self.assertIn("https://open-webui.dimension-x.net/api/v1/files/abc123/content", out)
+        self.assertNotIn("First one", out)
+
+    def test_same_text_says_no_tags_were_added(self):
+        self.run_tool(FakeNet(), self.tool.record_voice_memo, "Plain words.", "P")
+        out = asyncio.run(self.tool.show_last_memo())
+        self.assertIn("the same as the text given", out)
+
+    def test_help_mentions_it(self):
+        self.assertIn("show_last_memo", asyncio.run(self.tool.voice_memo_help()))
+
+
 class HelpTests(Base):
     def test_help_mentions_methods_and_limit(self):
         out = asyncio.run(self.tool.voice_memo_help())
