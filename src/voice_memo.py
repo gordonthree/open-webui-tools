@@ -234,6 +234,39 @@ def add_expression_tags(valves: "Tools.Valves", text: str) -> Tuple[str, str]:
     return out, ""
 
 
+def _mp3_frame(mp3: bytes) -> Optional[Tuple[int, float]]:
+    """(byte size, seconds) of the MP3 frame at the start of `mp3`, or None if it does not start with a valid MPEG Layer III frame."""
+    if len(mp3) < 4:
+        return None
+    h = int.from_bytes(mp3[:4], "big")
+    if (h >> 21) != 0x7FF or ((h >> 17) & 3) != 1:
+        return None
+    ver, br, sr, pad = (h >> 19) & 3, (h >> 12) & 15, (h >> 10) & 3, (h >> 9) & 1
+    if ver not in (2, 3) or br in (0, 15) or sr == 3:
+        return None
+    rate = {3: (44100, 48000, 32000), 2: (22050, 24000, 16000)}[ver][sr]
+    kbps = ([0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320] if ver == 3 else [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160])[br]
+    samples = 1152 if ver == 3 else 576
+    size = (144 if ver == 3 else 72) * kbps * 1000 // rate + pad
+    return size, samples / rate
+
+
+def add_lead_in(mp3: bytes, ms: int) -> bytes:
+    """Put about `ms` of silence in front of an MP3 so a player has time to settle before the first word.
+
+    Fish starts its audio with one silent (all-zero) frame and then jumps straight into speech. Repeating that frame
+    adds clean silence without re-encoding. If the clip does not start that way it is returned unchanged.
+    """
+    info = _mp3_frame(mp3)
+    if ms <= 0 or not info:
+        return mp3
+    size, seconds = info
+    first = mp3[:size]
+    if len(first) < size or any(first[4:]):
+        return mp3
+    return first * max(0, round(ms / 1000 / seconds)) + mp3
+
+
 _SPEAKER_LINE_RE = re.compile(r"^([A-Za-z][A-Za-z0-9 .'\-]{0,29}?)\s*[:\uff1a]\s*\**\s*(.*)$")
 
 
@@ -332,6 +365,10 @@ class Tools:
         NATIVE_MULTI_SPEAKER: bool = Field(
             default=True,
             description="With FISH_API_KEY set, record_conversation sends the whole exchange as ONE request using <|speaker:N|> tags and a list of voices. Off = one request per line, joined afterwards.",
+        )
+        LEAD_IN_MS: int = Field(
+            default=250,
+            description="Milliseconds of silence put in front of each recording, so the first word is not clipped while a player or earbuds wake up. Fish's audio starts almost instantly. 0 = off.",
         )
         MAX_CHARS: int = Field(default=3000, description="Longest memo text accepted, in characters.")
         UPLOAD_TO_OPEN_WEBUI: bool = Field(
@@ -473,6 +510,7 @@ class Tools:
     ) -> str:
         """Save the audio, upload it, write the sidecar, attach it to the chat and build the reply the model sees."""
         v = self.valves
+        audio = add_lead_in(audio, v.LEAD_IN_MS)
         stamp = datetime.now().astimezone()
         name = f"{stamp:%Y%m%d-%H%M%S}-{slugify(title or text)}.mp3"
         saved = ""

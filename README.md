@@ -56,7 +56,7 @@ Current tools:
   (read aloud). Before speaking, a small chat model (valve `FORMATTER_MODEL`, default
   `mistralai/mistral-small-24b-instruct-2501`, empty = off) adds the tags: it is skipped when the text is already tagged, falls back
   to the original text on any error or if it changes the words (`FORMATTER_MIN_WORD_MATCH`), and the `.json` sidecar keeps both `text` and
-  `spoken_text`; `FORMATTER_PROMPT` overrides the built-in prompt; the full tag reference for a knowledge file is `docs/fish_audio_tags.md`. Needs `OPEN_WEBUI_API_KEY` plus a speech key: `FISH_API_KEY` (Fish Audio direct, `FISH_MODEL` default `s2.1-pro-free`, avoids OpenRouter's free-model daily cap) or `OPENROUTER_API_KEY` (also used by the tag formatter).
+  `spoken_text`; `FORMATTER_PROMPT` overrides the built-in prompt; the full tag reference for a knowledge file is `docs/fish_audio_tags.md`. Needs `OPEN_WEBUI_API_KEY` plus a speech key: `LEAD_IN_MS` (default 250: silence added in front of each recording, because Fish's audio starts after only ~40 ms and the first word can be clipped by a waking player or earbuds), `FISH_API_KEY` (Fish Audio direct, `FISH_MODEL` default `s2.1-pro-free`, avoids OpenRouter's free-model daily cap) or `OPENROUTER_API_KEY` (also used by the tag formatter).
   `PUBLIC_BASE_URL` (default the OWUI address) makes it also return a full link the model can paste into an email;
   it opens only for a browser logged in to OWUI. `ATTACH_TO_CHAT` (on) also attaches the memo to the assistant message via a `files` event so it
   shows in the chat's Files tab. No delete method on purpose. Unrelated to ComfyUI.

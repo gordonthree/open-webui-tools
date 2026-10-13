@@ -533,6 +533,51 @@ class FishBackendTests(Base):
         self.assertFalse(any(seen))
 
 
+class LeadInTests(unittest.TestCase):
+    HDR = bytes([0xFF, 0xFB, 0x90, 0xC4])  # MPEG-1 Layer III, 128 kbps, 44.1 kHz, mono: 417-byte frames
+
+    def clip(self):
+        silent = self.HDR + b"\x00" * 413
+        speech = self.HDR + b"\x8b" * 413
+        return silent + speech
+
+    def test_silence_is_added_by_repeating_the_silent_first_frame(self):
+        out = mod.add_lead_in(self.clip(), 250)
+        frames = 0.250 / (1152 / 44100)
+        added = (len(out) - len(self.clip())) // 417
+        self.assertEqual(added, round(frames))
+        self.assertTrue(out.endswith(self.clip()))
+        self.assertTrue(all(not any(out[i * 417 + 4 : (i + 1) * 417]) for i in range(added)))
+
+    def test_off_when_zero_or_not_mp3_or_first_frame_not_silent(self):
+        self.assertEqual(mod.add_lead_in(self.clip(), 0), self.clip())
+        self.assertEqual(mod.add_lead_in(b"ID3audio", 250), b"ID3audio")
+        loud = self.HDR + b"\x8b" * 413
+        self.assertEqual(mod.add_lead_in(loud, 250), loud)
+        self.assertEqual(mod.add_lead_in(self.HDR + b"\x00" * 10, 250), self.HDR + b"\x00" * 10)
+
+    def test_saved_memo_gets_the_lead_in_and_valve_turns_it_off(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tool = mod.Tools()
+        tool.valves.MEMO_DIR = tmp.name
+        tool.valves.OPENROUTER_API_KEY = "k"
+        tool.valves.OPEN_WEBUI_API_KEY = "k"
+        tool.valves.FORMATTER_MODEL = ""
+        resp = Resp(200, self.clip(), headers={"Content-Type": "audio/mpeg"})
+        with mock.patch.object(mod.requests, "post", FakeNet(tts=resp)):
+            asyncio.run(tool.record_voice_memo("Hi", "T"))
+        saved = next(Path(tmp.name).glob("*.mp3")).read_bytes()
+        self.assertGreater(len(saved), len(self.clip()))
+        self.assertTrue(saved.endswith(self.clip()))
+        for f in Path(tmp.name).iterdir():
+            f.unlink()
+        tool.valves.LEAD_IN_MS = 0
+        with mock.patch.object(mod.requests, "post", FakeNet(tts=resp)):
+            asyncio.run(tool.record_voice_memo("Hi", "T"))
+        self.assertEqual(next(Path(tmp.name).glob("*.mp3")).read_bytes(), self.clip())
+
+
 class ListTests(Base):
     def test_empty_then_listing(self):
         self.assertIn("No voice memos", asyncio.run(self.tool.list_voice_memos()))
