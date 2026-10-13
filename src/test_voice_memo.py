@@ -32,14 +32,28 @@ class Resp:
 
 
 class FakeNet:
-    def __init__(self, tts=None, upload=None):
+    def __init__(self, tts=None, upload=None, chat=None):
         self.tts = tts or Resp(200, b"ID3audio", headers={"Content-Type": "audio/mpeg"})
         self.upload = upload or Resp(200, payload={"id": "abc123"})
+        self.chat = chat
         self.calls = []
 
     def __call__(self, url, **kw):
         self.calls.append((url, kw))
+        if url.endswith("/chat/completions"):
+            if isinstance(self.chat, Exception):
+                raise self.chat
+            return self.chat
         return self.tts if url.endswith("/audio/speech") else self.upload
+
+    def tts_input(self):
+        return next(kw["json"]["input"] for url, kw in self.calls if url.endswith("/audio/speech"))
+
+
+def chat_reply(text, status=200):
+    if status != 200:
+        return Resp(status, payload={"error": {"message": "nope"}})
+    return Resp(200, payload={"choices": [{"message": {"content": text}}]})
 
 
 class Base(unittest.TestCase):
@@ -50,6 +64,7 @@ class Base(unittest.TestCase):
         self.tool.valves.MEMO_DIR = str(Path(self.tmp.name) / "memos")
         self.tool.valves.OPENROUTER_API_KEY = "or-key"
         self.tool.valves.OPEN_WEBUI_API_KEY = "owui-key"
+        self.tool.valves.FORMATTER_MODEL = ""
 
     def run_tool(self, fake, coro_fn, *a, **kw):
         with mock.patch.object(mod.requests, "post", fake):
@@ -189,6 +204,106 @@ class EventLoopTests(Base):
             asyncio.run(self.tool.record_voice_memo("Hi", "T"))
         self.assertEqual(len(seen), 2)
         self.assertFalse(any(seen), "requests.post ran on the event loop thread")
+
+
+class FormatterTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.tool.valves.FORMATTER_MODEL = "mistralai/mistral-small-24b-instruct-2501"
+
+    def record(self, fake, text="Hey there. I miss you a lot."):
+        out = self.run_tool(fake, self.tool.record_voice_memo, text, "T")
+        return out
+
+    def test_tagged_text_is_what_gets_spoken_and_original_is_kept(self):
+        fake = FakeNet(chat=chat_reply("[sad] Hey there. [sighing] I miss you a lot."))
+        out = self.record(fake)
+        self.assertEqual(fake.tts_input(), "[sad] Hey there. [sighing] I miss you a lot.")
+        meta = json.loads(next(Path(self.tool.valves.MEMO_DIR).glob("*.json")).read_text())
+        self.assertEqual(meta["text"], "Hey there. I miss you a lot.")
+        self.assertEqual(meta["spoken_text"], "[sad] Hey there. [sighing] I miss you a lot.")
+        self.assertNotIn("[sad]", out)  # the result must not hand the model tagged text to imitate
+
+    def test_formatter_request_shape(self):
+        fake = FakeNet(chat=chat_reply("[sad] Hey there. I miss you a lot."))
+        self.record(fake)
+        url, kw = fake.calls[0]
+        self.assertEqual(url, "https://openrouter.ai/api/v1/chat/completions")
+        self.assertEqual(kw["json"]["model"], "mistralai/mistral-small-24b-instruct-2501")
+        self.assertEqual(kw["headers"]["Authorization"], "Bearer or-key")
+        self.assertEqual(kw["json"]["messages"][0]["role"], "system")
+        self.assertIn("[whispering]", kw["json"]["messages"][0]["content"])
+        self.assertEqual(kw["json"]["messages"][1]["content"], "Hey there. I miss you a lot.")
+
+    def test_custom_prompt_replaces_builtin(self):
+        self.tool.valves.FORMATTER_PROMPT = "Custom rules."
+        fake = FakeNet(chat=chat_reply("[sad] Hey there. I miss you a lot."))
+        self.record(fake)
+        self.assertEqual(fake.calls[0][1]["json"]["messages"][0]["content"], "Custom rules.")
+
+    def test_off_when_model_empty_and_no_call_made(self):
+        self.tool.valves.FORMATTER_MODEL = ""
+        fake = FakeNet()
+        self.record(fake)
+        self.assertEqual([u for u, _ in fake.calls if u.endswith("/chat/completions")], [])
+
+    def test_already_tagged_text_is_not_sent_to_formatter(self):
+        fake = FakeNet(chat=chat_reply("never used"))
+        self.record(fake, "[happy] Hello there.")
+        self.assertEqual([u for u, _ in fake.calls if u.endswith("/chat/completions")], [])
+        self.assertEqual(fake.tts_input(), "[happy] Hello there.")
+
+    def test_formatter_http_error_falls_back_to_original(self):
+        fake = FakeNet(chat=chat_reply("", status=429))
+        out = self.record(fake)
+        self.assertEqual(fake.tts_input(), "Hey there. I miss you a lot.")
+        self.assertIn("Recorded", out)
+
+    def test_formatter_network_error_and_garbage_fall_back(self):
+        for chat in (mod.requests.ConnectionError("down"), Resp(200, payload={"unexpected": 1}), chat_reply("")):
+            fake = FakeNet(chat=chat)
+            self.record(fake)
+            self.assertEqual(fake.tts_input(), "Hey there. I miss you a lot.")
+
+    def test_rewritten_words_fall_back_to_original(self):
+        fake = FakeNet(chat=chat_reply("[sad] Oh hello. Truly I am missing you terribly, darling."))
+        self.record(fake)
+        self.assertEqual(fake.tts_input(), "Hey there. I miss you a lot.")
+
+    def test_runaway_output_falls_back(self):
+        fake = FakeNet(chat=chat_reply("[sad] Hey there. I miss you a lot. " + "[sighing] " * 40))
+        self.record(fake)
+        self.assertEqual(fake.tts_input(), "Hey there. I miss you a lot.")
+
+    def test_fences_quotes_are_stripped(self):
+        fake = FakeNet(chat=chat_reply('```\n"[sad] Hey there. I miss you a lot."\n```'))
+        self.record(fake)
+        self.assertEqual(fake.tts_input(), "[sad] Hey there. I miss you a lot.")
+
+    def test_asterisk_action_turned_into_tag_is_accepted(self):
+        fake = FakeNet(chat=chat_reply("[laughing] Hey there. I miss you a lot."))
+        self.record(fake, "*soft laugh* Hey there. I miss you a lot.")
+        self.assertEqual(fake.tts_input(), "[laughing] Hey there. I miss you a lot.")
+
+    def test_strict_setting_rejects_any_word_change(self):
+        self.tool.valves.FORMATTER_MIN_WORD_MATCH = 1.0
+        fake = FakeNet(chat=chat_reply("[sad] Hey there. I really miss you a lot."))
+        self.record(fake)
+        self.assertEqual(fake.tts_input(), "Hey there. I miss you a lot.")
+
+    def test_formatter_runs_off_the_event_loop(self):
+        import threading
+
+        seen = []
+
+        def fake(url, **kw):
+            seen.append(threading.current_thread() is threading.main_thread())
+            return FakeNet(chat=chat_reply("[sad] Hey there. I miss you a lot."))(url, **kw)
+
+        with mock.patch.object(mod.requests, "post", fake):
+            asyncio.run(self.tool.record_voice_memo("Hey there. I miss you a lot.", "T"))
+        self.assertEqual(len(seen), 3)
+        self.assertFalse(any(seen))
 
 
 class ListTests(Base):

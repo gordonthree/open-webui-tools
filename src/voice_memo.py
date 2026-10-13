@@ -9,6 +9,7 @@ requirements: requests
 """
 
 import asyncio
+import difflib
 import json
 import mimetypes
 import re
@@ -105,6 +106,98 @@ async def _emit(emitter: Optional[Callable], payload: Dict[str, Any]) -> None:
         await emitter(payload)
 
 
+# Matches an expression tag such as [happy] or [soft tone]. Used to spot text that is already tagged
+# and to take tags out before checking that the formatter left the words alone.
+_TAG_RE = re.compile(r"\[[^\]\n]{2,40}\]")
+
+DEFAULT_FORMATTER_PROMPT = """You prepare text to be spoken aloud by a Fish Audio S2 voice. Add expression tags and return the text.
+
+RULES
+- Keep every word, in the same order. Do not add, remove, reword or reorder words. Only add tags.
+- Tags go in [square brackets]. The voice performs a tag; it never says it.
+- A mood tag goes at the START of a sentence. Use at most one main mood per sentence; change it only when the feeling changes.
+- A tone or sound tag can go anywhere, next to what it affects. After a sound tag, keep any written sound already there (for example "ha ha").
+- Use few tags. At most one tag per two sentences, and none at all for plain or neutral sentences such as reminders or facts. Many tags sound unnatural.
+- Pick a mood only when the words clearly show it. Never invent a feeling the text does not express (a reminder is not angry).
+- If the text contains *asterisk actions* or (stage directions), REPLACE them with a bracket tag in the same place. The asterisks, parentheses and the words inside them must not appear in your reply.
+- Remove emoji and Markdown marks. Do not add anything else.
+- Reply with the tagged text only. No quotes, no explanation, no code block.
+
+TAGS
+Moods (start of a sentence): happy, sad, angry, excited, calm, nervous, confident, surprised, satisfied, delighted, scared, worried, upset, frustrated, depressed, empathetic, embarrassed, disgusted, moved, proud, relaxed, grateful, curious, sarcastic, disdainful, unhappy, anxious, hysterical, indifferent, uncertain, doubtful, confused, disappointed, regretful, guilty, ashamed, jealous, envious, hopeful, optimistic, pessimistic, nostalgic, lonely, bored, contemptuous, sympathetic, compassionate, determined, resigned
+Tone (anywhere): in a hurry tone, shouting, screaming, whispering, soft tone, emphasis (put [emphasis] just before the word to stress)
+Sounds (anywhere): laughing, chuckling, sobbing, crying loudly, sighing, groaning, panting, gasping, yawning, snoring, clear throat
+Pauses and ambience (anywhere): break, long-break, audience laughing, background laughter, crowd laughing
+Any short plain description also works, such as [slightly sad] or [very excited].
+
+EXAMPLES
+Input: Hey, it's me. The weekend plans came together after all. We got the table by the window! Ha ha, I told you it would work.
+Output: [happy] Hey, it's me. The weekend plans came together after all. [excited] We got the table by the window! [laughing] Ha ha, I told you it would work.
+
+Input: I miss the old place. I really do. I have some news though. I think it might be good.
+Output: [sad][whispering] I miss the old place. [sighing] I really do. [nervous] I have some news though. [break] [hopeful] I think it might be good.
+"""
+
+
+_STAGE_RE = re.compile(r"\*[^*\n]{1,60}\*|\([^)\n]{1,60}\)")
+
+
+def _words(text: str) -> List[str]:
+    """Spoken words only: tags, *asterisk actions* and (stage directions) are not counted, because the formatter turns them into tags."""
+    return re.findall(r"[a-z0-9']+", _STAGE_RE.sub(" ", _TAG_RE.sub(" ", text)).lower())
+
+
+def _clean_formatter_output(out: str) -> str:
+    out = (out or "").strip()
+    out = re.sub(r"^```[a-z]*\n?|\n?```$", "", out).strip()
+    # The voice would read these aloud, so drop any the formatter left behind.
+    out = re.sub(r" {2,}", " ", _STAGE_RE.sub(" ", out)).replace("*", "").strip()
+    if len(out) > 1 and out[0] == out[-1] and out[0] in "\"'":
+        out = out[1:-1].strip()
+    return out
+
+
+def add_expression_tags(valves: "Tools.Valves", text: str) -> Tuple[str, str]:
+    """Ask the formatter model to add expression tags. Returns (text to speak, reason it was left alone or "").
+
+    Never raises: any problem hands back the original text, so a memo is not lost because of the formatter.
+    """
+    model = (valves.FORMATTER_MODEL or "").strip()
+    if not model or not valves.OPENROUTER_API_KEY:
+        return text, "formatter off"
+    if _TAG_RE.search(text):
+        return text, "already tagged"
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": (valves.FORMATTER_PROMPT or "").strip() or DEFAULT_FORMATTER_PROMPT},
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0.3,
+        "max_tokens": len(text) // 2 + 300,
+    }
+    try:
+        r = requests.post(
+            f"{valves.OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {valves.OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+            json=body,
+            timeout=valves.FORMATTER_TIMEOUT_SECONDS,
+        )
+        if r.status_code >= 400:
+            return text, f"formatter HTTP {r.status_code}"
+        out = _clean_formatter_output(r.json()["choices"][0]["message"]["content"])
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as e:
+        return text, f"formatter failed: {e}"
+    if not out:
+        return text, "formatter returned nothing"
+    if len(out) > len(text) * 1.6 + 80:
+        return text, "formatter output too long"
+    before, after = _words(text), _words(out)
+    if before and difflib.SequenceMatcher(None, before, after, autojunk=False).ratio() < valves.FORMATTER_MIN_WORD_MATCH:
+        return text, "formatter changed the words"
+    return out, ""
+
+
 class Tools:
     class Valves(BaseModel):
         OPENROUTER_API_KEY: str = Field(default="", description="OpenRouter API key (https://openrouter.ai/settings/keys).")
@@ -121,6 +214,19 @@ class Tools:
             default="/app/backend/data/voice_memos",
             description="Folder (inside the Open WebUI container) where each memo's MP3 and a small .json sidecar are kept.",
         )
+        FORMATTER_MODEL: str = Field(
+            default="mistralai/mistral-small-24b-instruct-2501",
+            description="Small OpenRouter chat model that adds expression tags like [happy] or [whispering] to the memo text before it is spoken. Empty = off (the text is spoken as given). Skipped when the text already has tags.",
+        )
+        FORMATTER_PROMPT: str = Field(
+            default="",
+            description="System prompt for the formatter model. Empty = the built-in prompt with the Fish Audio tag guide.",
+        )
+        FORMATTER_MIN_WORD_MATCH: float = Field(
+            default=0.9,
+            description="0 to 1. How closely the formatted text's words must match the original (tags ignored). If the formatter rewrites more than this allows, the original text is spoken instead. 1 = no word changes at all.",
+        )
+        FORMATTER_TIMEOUT_SECONDS: int = Field(default=30, description="Timeout for the formatter call. On timeout the original text is spoken.")
         MAX_CHARS: int = Field(default=3000, description="Longest memo text accepted, in characters.")
         UPLOAD_TO_OPEN_WEBUI: bool = Field(
             default=True,
@@ -189,6 +295,7 @@ class Tools:
             f"- record_voice_memo(text, title, voice): speaks `text` aloud and saves it as an MP3. `text` is the exact words, "
             f"plain sentences with no Markdown, at most {v.MAX_CHARS} characters (split longer memos into several calls). "
             "Expression goes in square brackets and is performed, not spoken. Mood tags work best at the start of a sentence: [happy] [sad] [angry] [excited] [calm] [nervous]. Tone and sound tags can go anywhere: [whispering] [shouting] [soft tone] [laughing] [sighing] [break]. Any short description also works, e.g. [slightly sad]. Never use *asterisks* or (stage directions): they are read aloud. `title` is optional; pass \"\" for an automatic one. `voice` is optional; pass \"\" (the normal choice). Never invent a voice name; only a 32-character hex id from the user is valid.\n"
+            "- Expression tags are optional. If you write none, the tool adds suitable ones itself; do not add them just to be safe.\n"
             "- The result contains a Markdown link: copy it into your reply, exactly as given, so the user can play the memo.\n"
             "- If the user wants it by email, use the 'Full link' line from the result in the email body. It opens only "
             "while the user is logged in to Open WebUI.\n"
@@ -229,8 +336,9 @@ class Tools:
         voice = (voice.lower() or v.DEFAULT_VOICE)
 
         await _emit(__event_emitter__, {"type": "status", "data": {"description": "Recording voice memo...", "done": False}})
+        spoken, _why = await asyncio.to_thread(add_expression_tags, v, text)
         try:
-            audio, _ctype = await asyncio.to_thread(synthesize, v, text, voice)
+            audio, _ctype = await asyncio.to_thread(synthesize, v, spoken, voice)
         except MemoError as e:
             await _emit(__event_emitter__, {"type": "status", "data": {"description": "Voice memo failed", "done": True}})
             return self._fail(e)
@@ -263,6 +371,7 @@ class Tools:
                             "model": v.TTS_MODEL,
                             "chars": len(text),
                             "text": text,
+                            **({"spoken_text": spoken} if spoken != text else {}),
                             "url": url,
                         },
                         indent=1,
