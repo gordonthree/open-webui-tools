@@ -70,7 +70,7 @@ class LoopTests(unittest.TestCase):
 
         with mock.patch("sys.argv", args), mock.patch.object(rp, "parse_secrets", return_value={}), \
                 mock.patch.object(rp, "server_connection", return_value=("http://x", "k")), \
-                mock.patch.object(rp.agent_duo, "fetch_tool_ids", return_value=["agent_notes"]), \
+                mock.patch.object(rp, "fetch_tool_ids", return_value=["agent_notes"]), \
                 mock.patch.object(rp, "run_chunk", side_effect=fake_chunk), mock.patch.object(rp.time, "sleep"):
             code = rp.main()
         return code, calls
@@ -87,7 +87,7 @@ class LoopTests(unittest.TestCase):
         self.assertEqual((code, len(calls)), (1, 2))
 
     def test_retries_a_failed_chunk_then_gives_up(self):
-        err = rp.agent_duo.AgentError("HTTP 429 rate_limited")
+        err = rp.AgentError("HTTP 429 rate_limited")
         code, calls = self.run_main([err, err, err, err])
         self.assertEqual((code, len(calls)), (1, rp.MAX_FAILURES_IN_A_ROW))
 

@@ -2,7 +2,7 @@
 """
 Run the agent_notes rating pass (Weighting_Guidance.md, "The rating pass") for you, chunk after chunk.
 
-Each chunk is one fresh throwaway chat on the agent's own Open WebUI server, run the same way agent_duo.py
+Each chunk is one fresh throwaway chat on the agent's own Open WebUI server, run the same way src/agent_duo.py
 runs a turn (the server-side tool loop, with the tools attached to the agent's model preset): the agent
 reads ONE page of a note (10 entries) and rates up to 8 of them with agent_notes_set_weight. The script then
 works out where the next page starts from what the agent's read actually returned (the lowest ordinary entry
@@ -30,6 +30,7 @@ import json
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -37,9 +38,7 @@ import requests
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent / "src"))
 from push_tool import DEFAULT_SECRETS_FILE, configured_servers, parse_secrets, server_connection  # noqa: E402
-import agent_duo  # noqa: E402
 
 PAGE = 10
 MAX_RATINGS = 8
@@ -62,6 +61,76 @@ MEMORY_RATE = ("Use the whole range. If a difficult moment is on the page (hurt,
                "do not lower anything that was joyful. Do not give every entry the same number.")
 PERSONA_RATE = ("This is one of your persona notes, so the number is how strongly the trait is you, not how it felt: 9-10 defining, "
                 "7-8 central, 5 ordinary, 3 or lower occasional or situational. A low number does not mean bad. Do not give every entry the same number.")
+
+
+# --------------------------------------------------------------------------- #
+# Talking to the agent's Open WebUI server. These mirror the helpers in src/agent_duo.py (kept in step by hand) so this script needs
+# only `requests`, not the pydantic that importing the Pipe would drag in.
+# --------------------------------------------------------------------------- #
+
+_DETAILS_RE = re.compile(r"<details\b.*?</details>", re.S | re.I)
+
+
+class AgentError(Exception):
+    pass
+
+
+def _headers(key: str) -> dict:
+    return {"Authorization": f"Bearer {key}"}
+
+
+def _check(resp, what: str) -> None:
+    if resp.status_code != 200:
+        raise AgentError(f"{what} failed (HTTP {resp.status_code}): {str(resp.text)[:200]}")
+
+
+def strip_details(text: str) -> str:
+    return _DETAILS_RE.sub("", text or "").strip()
+
+
+def fetch_tool_ids(url: str, key: str, model_id: str) -> List[str]:
+    """The tool ids attached to the agent's model preset. Open WebUI's UI sends these itself; the API doesn't."""
+    resp = requests.get(f"{url}/api/v1/models/model", params={"id": model_id}, headers=_headers(key), timeout=20)
+    if resp.status_code == 404:
+        return []
+    _check(resp, "Reading the model preset")
+    ids = ((resp.json().get("meta") or {}).get("toolIds")) or []
+    return [i for i in ids if isinstance(i, str)]
+
+
+def create_backing_chat(url: str, key: str, model_id: str, label: str, prompt: str) -> "tuple[str, str]":
+    """A throwaway chat holding one user message and an empty assistant message; returns (chat_id, assistant_id)."""
+    user_id, asst_id, now = str(uuid.uuid4()), str(uuid.uuid4()), int(time.time())
+    umsg = {"id": user_id, "parentId": None, "childrenIds": [asst_id], "role": "user", "content": prompt[:200], "timestamp": now, "models": [model_id]}
+    amsg = {"id": asst_id, "parentId": user_id, "childrenIds": [], "role": "assistant", "content": "", "model": model_id, "modelName": model_id, "timestamp": now}
+    chat = {
+        "title": f"[rating_pass] {label}", "models": [model_id], "timestamp": now * 1000,
+        "history": {"messages": {user_id: umsg, asst_id: amsg}, "currentId": asst_id},
+        "messages": [umsg, amsg],
+    }
+    resp = requests.post(f"{url}/api/v1/chats/new", headers=_headers(key), json={"chat": chat}, timeout=30)
+    _check(resp, "Creating the chat")
+    return resp.json()["id"], asst_id
+
+
+def start_turn(url: str, key: str, model_id: str, chat_id: str, asst_id: str, tool_ids: List[str], messages: List[dict]) -> None:
+    body = {"model": model_id, "stream": True, "chat_id": chat_id, "id": asst_id, "session_id": str(uuid.uuid4()), "messages": messages}
+    if tool_ids:
+        body["tool_ids"] = tool_ids
+    _check(requests.post(f"{url}/api/chat/completions", headers=_headers(key), json=body, timeout=60), "Starting the turn")
+
+
+def read_turn(url: str, key: str, chat_id: str, asst_id: str) -> dict:
+    resp = requests.get(f"{url}/api/v1/chats/{chat_id}", headers=_headers(key), timeout=30)
+    _check(resp, "Reading the chat")
+    return (((resp.json().get("chat") or {}).get("history") or {}).get("messages") or {}).get(asst_id) or {}
+
+
+def delete_chat(url: str, key: str, chat_id: str) -> None:
+    try:
+        requests.delete(f"{url}/api/v1/chats/{chat_id}", headers=_headers(key), timeout=20)
+    except requests.RequestException:
+        pass  # a leftover chat titled "[rating_pass] ..." is harmless
 
 
 def build_prompt(note: str, before: Optional[int], max_ratings: int = MAX_RATINGS, persona: bool = False) -> str:
@@ -116,23 +185,23 @@ def reply_number(reply: str) -> Optional[int]:
 
 
 def run_chunk(url: str, key: str, model: str, tool_ids: List[str], prompt: str, keep_chats: bool) -> "tuple[str, Any]":
-    chat_id, asst_id = agent_duo.create_backing_chat(url, key, model, "rating pass", prompt)
+    chat_id, asst_id = create_backing_chat(url, key, model, "rating pass", prompt)
     try:
-        agent_duo.start_turn(url, key, model, chat_id, asst_id, tool_ids, [{"role": "user", "content": prompt}])
+        start_turn(url, key, model, chat_id, asst_id, tool_ids, [{"role": "user", "content": prompt}])
         deadline = time.monotonic() + TURN_TIMEOUT_SECONDS
         while True:
             time.sleep(POLL_SECONDS)
-            msg = agent_duo.read_turn(url, key, chat_id, asst_id)
+            msg = read_turn(url, key, chat_id, asst_id)
             if msg.get("error"):
                 err = msg["error"]
-                raise agent_duo.AgentError(str(err.get("content") if isinstance(err, dict) else err)[:300])
+                raise AgentError(str(err.get("content") if isinstance(err, dict) else err)[:300])
             if msg.get("done"):
-                return agent_duo.strip_details(msg.get("content") or ""), msg.get("output") or []
+                return strip_details(msg.get("content") or ""), msg.get("output") or []
             if time.monotonic() > deadline:
-                raise agent_duo.AgentError(f"no reply within {TURN_TIMEOUT_SECONDS} seconds")
+                raise AgentError(f"no reply within {TURN_TIMEOUT_SECONDS} seconds")
     finally:
         if not keep_chats:
-            agent_duo.delete_chat(url, key, chat_id)
+            delete_chat(url, key, chat_id)
 
 
 def is_rate_limit(text: str) -> bool:
@@ -158,7 +227,7 @@ def main() -> int:
     if args.server != "local" and args.server.lower() not in configured_servers(values):
         ap.error(f"Unknown server {args.server!r}; secrets.md configures: {['local'] + configured_servers(values)}.")
     url, key = server_connection(values, args.server.lower())
-    tool_ids = agent_duo.fetch_tool_ids(url, key, args.model)
+    tool_ids = fetch_tool_ids(url, key, args.model)
     print(f"server {args.server} ({url}), model {args.model}, tools attached: {', '.join(tool_ids) or 'NONE'}")
     if not any("agent_notes" in t for t in tool_ids):
         print("warning: no agent_notes tool is attached to that model preset; the agent could not rate anything.")
@@ -174,7 +243,7 @@ def main() -> int:
         label = "newest page" if before is None else f"before={before}"
         try:
             reply, output = run_chunk(url, key, args.model, tool_ids, prompt, args.keep_chats)
-        except (agent_duo.AgentError, requests.RequestException) as ex:
+        except (AgentError, requests.RequestException) as ex:
             failures += 1
             wait = RATE_LIMIT_WAIT_SECONDS if is_rate_limit(str(ex)) else args.delay * 2
             print(f"chunk {n} ({label}) failed [{failures}/{MAX_FAILURES_IN_A_ROW}]: {ex}; waiting {wait:.0f}s and retrying")
