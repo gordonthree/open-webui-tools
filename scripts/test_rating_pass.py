@@ -29,6 +29,11 @@ class PromptTests(unittest.TestCase):
         self.assertIn('"internal-life"', later)
 
 
+    def test_persona_notes_get_the_strength_of_character_wording(self):
+        self.assertIn("how strongly the trait is you", rp.build_prompt("Mara Voss - Speech", None, persona=True))
+        self.assertNotIn("how strongly the trait", rp.build_prompt("internal-life", None))
+
+
 class InspectTests(unittest.TestCase):
     def test_lowest_is_from_the_ordinary_entries_not_the_strong_ones(self):
         got = rp.inspect_output(chunk_output([204, 205, 213], [205, 206]))

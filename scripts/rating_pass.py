@@ -21,6 +21,7 @@ Usage:
     python scripts/rating_pass.py --model medium-mara --note internal-life --chunks 5
     python scripts/rating_pass.py --model medium-mara --note internal-life --before 204 --delay 60
     python scripts/rating_pass.py --server hannah --model hannah-long --note some-note
+    python scripts/rating_pass.py --model medium-mara --note "Mara Voss - Speech" --persona
 
 --model is the agent's model preset id on that server (agent_duo's defaults are medium-mara and hannah-long).
 """
@@ -53,17 +54,23 @@ This is one small chunk: read ONE page of entries, rate up to {max_ratings} of t
 
 1. {read_step}
 2. Of the entries on that one page, call agent_notes_set_weight for each one that is NOT 5-neutral to you, up to {max_ratings} calls in all. Leave the neutral ones alone: they already sit at 5. Do not read a second page.
-3. Use the whole range. If a difficult moment is on the page (hurt, doubt, loss, frustration, fear, shame), rate it low; do not lower anything that was joyful. Do not give every entry the same number.
+3. {rate_step}
 4. Finish with: the note name, how many entries you rated, and the lowest entry number among the page's ordinary entries (the "entries" list, NOT the "strong_memories" lists). Nothing else."""
 
 
-def build_prompt(note: str, before: Optional[int], max_ratings: int = MAX_RATINGS) -> str:
+MEMORY_RATE = ("Use the whole range. If a difficult moment is on the page (hurt, doubt, loss, frustration, fear, shame), rate it low; "
+               "do not lower anything that was joyful. Do not give every entry the same number.")
+PERSONA_RATE = ("This is one of your persona notes, so the number is how strongly the trait is you, not how it felt: 9-10 defining, "
+                "7-8 central, 5 ordinary, 3 or lower occasional or situational. A low number does not mean bad. Do not give every entry the same number.")
+
+
+def build_prompt(note: str, before: Optional[int], max_ratings: int = MAX_RATINGS, persona: bool = False) -> str:
     if before is None:
         step = f'Call agent_notes_read with name="{note}", verbose=false, count=false, limit={PAGE}.'
     else:
         step = (f'Call agent_notes_read with name="{note}", verbose=false, count=false, limit={PAGE} and before={before} '
                 f"(the argument is named before). It shows the {PAGE} entries just older than {before}.")
-    return PROMPT.format(note=note, read_step=step, max_ratings=max_ratings)
+    return PROMPT.format(note=note, read_step=step, max_ratings=max_ratings, rate_step=PERSONA_RATE if persona else MEMORY_RATE)
 
 
 def _result_text(item: dict) -> str:
@@ -141,6 +148,7 @@ def main() -> int:
     ap.add_argument("--chunks", type=int, default=30, help="most chunks to run this time (default 30)")
     ap.add_argument("--delay", type=float, default=45, help="seconds to wait between chunks (default 45)")
     ap.add_argument("--max-ratings", type=int, default=MAX_RATINGS, help=f"most ratings per chunk (default {MAX_RATINGS})")
+    ap.add_argument("--persona", action="store_true", help="the note is a persona facet (kind persona): rate how strongly each trait is hers, not how it felt")
     ap.add_argument("--keep-chats", action="store_true", help="leave each chunk's throwaway chat in place to inspect its tool calls")
     ap.add_argument("--dry-run", action="store_true", help="print the prompt and the server details, call nothing that changes anything")
     ap.add_argument("--secrets", type=Path, default=DEFAULT_SECRETS_FILE)
@@ -155,14 +163,14 @@ def main() -> int:
     if not any("agent_notes" in t for t in tool_ids):
         print("warning: no agent_notes tool is attached to that model preset; the agent could not rate anything.")
     if args.dry_run:
-        print("\n" + build_prompt(args.note, args.before, args.max_ratings))
+        print("\n" + build_prompt(args.note, args.before, args.max_ratings, args.persona))
         return 0
 
     before = args.before
     failures = 0
     total_rated = 0
     for n in range(1, args.chunks + 1):
-        prompt = build_prompt(args.note, before, args.max_ratings)
+        prompt = build_prompt(args.note, before, args.max_ratings, args.persona)
         label = "newest page" if before is None else f"before={before}"
         try:
             reply, output = run_chunk(url, key, args.model, tool_ids, prompt, args.keep_chats)

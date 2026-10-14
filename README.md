@@ -570,7 +570,7 @@ chunked rating pass from `Weighting_Guidance.md` for you: each chunk is a fresh 
 server-side tool loop `agent_duo.py` uses, with the tools attached to her model preset), in which she reads one page of the note and rates
 up to 8 entries. The script takes the next `before=` from what her read actually returned (not from what she says), waits `--delay`
 seconds, and goes on until the note's start; a rate-limit error is waited out and retried, and it stops if a page doesn't move back or her
-read never ran. `--dry-run` prints the prompt and the tools attached to the preset; `--keep-chats` leaves each chunk's chat to inspect.
+read never ran. `--dry-run` prints the prompt and the tools attached to the preset; `--persona` rates strength of character for a persona facet; `--keep-chats` leaves each chunk's chat to inspect.
 It is still her rating her own memories on her own model; the script only does the "repeat, with before=NNN" part. Tests:
 `cd scripts && python3 -m unittest test_rating_pass`.
 
