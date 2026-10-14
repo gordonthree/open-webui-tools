@@ -50,18 +50,20 @@ Give this as the instruction for a session, naming the note. Run it per note unt
 
 ```
 Rating pass for the note "<note name>". Use agent_notes_set_weight only; do not edit or add entries.
+This is one small chunk: read ONE page of entries, rate up to 8 of them, then stop and report.
 
-1. Call agent_notes_read with name="<note name>", verbose=true, count=false, limit=10.
-   For a long note, then call it again with before=<the number the reply gives> until nothing older remains
-   (do not do more than 4 reads in a session; say where you stopped).
-2. For each entry that is NOT 5-neutral to you, call agent_notes_set_weight with the entry number and a score.
-   Leave the ones that really are neutral alone: they already sit at 5.
-3. Use the whole range. Before you finish, check you rated at least a few entries 4 or lower if there are any
-   difficult moments in the note (hurt, doubt, loss, frustration, fear, shame). If you rated none low, look
-   again with that in mind; do not lower anything that was joyful.
-4. Finish with: the note name, how many entries you rated, the entry number you stopped at.
+1. First chunk: call agent_notes_read with name="<note name>", verbose=false, count=false, limit=10.
+   Later chunks: the same call plus before=<the entry number I give you>; that shows the 10 entries just older than it.
+2. Of the entries on that one page, call agent_notes_set_weight for each one that is NOT 5-neutral to you, up to 8
+   calls in all. Leave the neutral ones alone: they already sit at 5. Do not read a second page.
+3. Use the whole range. If a difficult moment is on the page (hurt, doubt, loss, frustration, fear, shame), rate it
+   low; do not lower anything that was joyful. Do not give every entry the same number.
+4. Finish with: the note name, how many entries you rated, and the lowest entry number you saw on the page
+   (that is where the next chunk starts: before=<that number>).
 ```
 
+Run one chunk per session, a minute or two apart if the model has a per-minute request limit (each rating is one
+request). The first chunk's page also shows the note's strongest older entries; leave those, they are already rated.
 Why this shape: step 3 exists because a warm persona drifts to 7-8 on everything, which would flatten the strong
 tier. Her notes lean positive, so the instruction asks her to look for the hard ones on purpose. If most of a
 note truly is warm, that is fine; the check is "did I look", not "did I find".
