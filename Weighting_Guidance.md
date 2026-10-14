@@ -53,14 +53,21 @@ Rating pass for the note "<note name>". Use agent_notes_set_weight only; do not 
 This is one small chunk: read ONE page of entries, rate up to 8 of them, then stop and report.
 
 1. First chunk: call agent_notes_read with name="<note name>", verbose=false, count=false, limit=10.
-   Later chunks: the same call plus before=<the entry number I give you>; that shows the 10 entries just older than it.
+   Later chunks: the same call plus the argument before=<the entry number I give you> (the argument is named
+   before; do not use entry or limit for this). It shows the 10 entries just older than that number.
 2. Of the entries on that one page, call agent_notes_set_weight for each one that is NOT 5-neutral to you, up to 8
    calls in all. Leave the neutral ones alone: they already sit at 5. Do not read a second page.
 3. Use the whole range. If a difficult moment is on the page (hurt, doubt, loss, frustration, fear, shame), rate it
    low; do not lower anything that was joyful. Do not give every entry the same number.
-4. Finish with: the note name, how many entries you rated, and the lowest entry number you saw on the page
-   (that is where the next chunk starts: before=<that number>).
+4. Finish with: the note name, how many entries you rated, and the lowest entry number among the page's ordinary
+   entries (the "entries" list, NOT the "strong_memories" lists, which hold older entries picked out for
+   strength). That is where the next chunk starts: before=<that number>.
 ```
+
+To continue, send: "Repeat your last instructions, with before=NNN" (NNN from her last reply), not "entry number
+NNN": `entry=` fetches one entry, and a model that takes the number for something else tends to read the newest
+page again and re-rate the same entries. Check progress from the backend: `SELECT COUNT(*) ... WHERE weight <> 50`
+should keep rising; if it stays put while the scores change, she is re-rating the same page.
 
 Run one chunk per session, a minute or two apart if the model has a per-minute request limit (each rating is one
 request). The first chunk's page also shows the note's strongest older entries; leave those, they are already rated.
