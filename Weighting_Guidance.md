@@ -64,10 +64,10 @@ This is one small chunk: read ONE page of entries, rate up to 8 of them, then st
    strength). That is where the next chunk starts: before=<that number>.
 ```
 
-To continue, send: "Repeat your last instructions, with before=NNN" (NNN from her last reply), not "entry number
-NNN": `entry=` fetches one entry, and a model that takes the number for something else tends to read the newest
-page again and re-rate the same entries. Check progress from the backend: `SELECT COUNT(*) ... WHERE weight <> 50`
-should keep rising; if it stays put while the scores change, she is re-rating the same page.
+To continue, send: "Repeat your last instructions, with before=NNN" (NNN from her last reply). "use entry number NNN"
+also worked in practice (she passed `before=NNN`), but `before=` is the unambiguous wording: `entry=` fetches a single
+entry. Check progress from the backend: `SELECT COUNT(*) ... WHERE weight <> 50` rises as she reaches entries nobody
+has rated yet. It stays put while she goes back over ground already rated (the scores shift, as the last rating wins).
 
 Run one chunk per session, a minute or two apart if the model has a per-minute request limit (each rating is one
 request). The first chunk's page also shows the note's strongest older entries; leave those, they are already rated.
