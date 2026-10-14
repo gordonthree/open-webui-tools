@@ -64,7 +64,10 @@ This is one small chunk: read ONE page of entries, rate up to 8 of them, then st
    strength). That is where the next chunk starts: before=<that number>.
 ```
 
-To continue, send: "Repeat your last instructions, with before=NNN" (NNN from her last reply). "use entry number NNN"
+To run the whole note without typing each continuation, use `scripts/rating_pass.py` (README: "Automating the rating pass"); it sends this
+same chunk prompt, one fresh chat per page, taking `before=` from the tool results.
+
+To continue by hand, send: "Repeat your last instructions, with before=NNN" (NNN from her last reply). "use entry number NNN"
 also worked in practice (she passed `before=NNN`), but `before=` is the unambiguous wording: `entry=` fetches a single
 entry. Check progress from the backend: `SELECT COUNT(*) ... WHERE weight <> 50` rises as she reaches entries nobody
 has rated yet. It stays put while she goes back over ground already rated (the scores shift, as the last rating wins).

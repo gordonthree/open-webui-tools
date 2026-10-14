@@ -563,6 +563,17 @@ Browse, search, create, append, edit/delete entries, rename/re-comment and delet
 HTML, stdlib only apart from the `pydantic` that importing `agent_notes` needs. No auth and no CSRF
 protection by design — trusted LAN only. Each row of the home page has two small buttons, each behind a browser confirmation: a red ✕ that deletes the note and a trash can that deletes all its entries but keeps the note (name, comment, tags; its summary goes stale; entry numbers carry on) — the latter is `empty_note_db`, deliberately not a model tool. A note page lists its entries newest first. Tests: `cd scripts && python3 -m unittest test_notes_web -v`.
 
+### Automating the rating pass (scripts/rating_pass.py)
+
+`python3 scripts/rating_pass.py --model medium-mara --note internal-life [--before N] [--chunks 30] [--delay 45] [--server hannah]` runs the
+chunked rating pass from `Weighting_Guidance.md` for you: each chunk is a fresh throwaway chat on the agent's own server (the same
+server-side tool loop `agent_duo.py` uses, with the tools attached to her model preset), in which she reads one page of the note and rates
+up to 8 entries. The script takes the next `before=` from what her read actually returned (not from what she says), waits `--delay`
+seconds, and goes on until the note's start; a rate-limit error is waited out and retried, and it stops if a page doesn't move back or her
+read never ran. `--dry-run` prints the prompt and the tools attached to the preset; `--keep-chats` leaves each chunk's chat to inspect.
+It is still her rating her own memories on her own model; the script only does the "repeat, with before=NNN" part. Tests:
+`cd scripts && python3 -m unittest test_rating_pass`.
+
 ### Host access to the databases (ACLs)
 
 The notes database (`agent_notes.sqlite3`) lives in OWUI's data volume, `<install>/data/`, and the ComfyUI job
