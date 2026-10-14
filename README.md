@@ -344,6 +344,16 @@ budget still carries both kinds, and whole entries only. The reply says how many
 ten), `sample=N` returns N random entries from outside the newest ones, `count=false` keeps a sweep out of the popularity counts.
 `limit` still means "how many recent entries" (capped by `MAX_READ_ENTRIES`), so existing callers keep working.
 
+**Note kind and summary limit (v1.13.0).** Two owner-set columns on `note_id`, changed with `agent_notes_update` (curation tool) or
+on a note's page in `notes_web.py`; the everyday tool cannot change them, so notes the agents create start as plain memory notes
+with the default limit. `kind` is `memory` (the default: a weight is how it felt, so `agent_notes_read` offers strong positive and
+strong negative older entries) or `persona` (a weight is how strongly the trait is the agent's: a read offers only the strong
+side, and `agent_notes_read_tagged` fills its size budget heaviest entry first, listed strongest first, instead of newest first).
+`summary_max` (NULL = the default 500, otherwise 100-2000) is that note's summary length limit, enforced by `update_summary`
+and shown by `agent_notes_list` as "up to N"; a `Kind` column appears there only when some note is a persona note. The old
+fixed 500-character CHECK on `note_summary` is replaced on first use (existing summaries are copied over) since a CHECK can't
+vary per note. `Nightly_Summarizer.md` and `Weighting_Guidance.md` say how the summarizer and the agents use them.
+
 **Search is a card catalog (v1.12.0).** `agent_notes_search` no longer returns whole entries. It returns cards - note, entry
 number, score, date and a snippet of `SEARCH_SNIPPET_CHARS` (120) characters cut around the match - for entries containing *all*
 the query's words (any case), ordered by strength of feeling first (furthest score from neutral, either direction) and then
@@ -370,10 +380,10 @@ summaries and bare entry-text strings. `verbose=true` restores the full detail.
 | `agent_notes_append` | `name`, `text` required; `continues=true` and `weight` as for create (every piece of a long text gets the weight) |
 | `agent_notes_edit_entry` | `name`, `entry_no` (e.g. `3` or `"#3"`), `text` — all required; `weight` optional (omitted = keep the current one) |
 | `agent_notes_delete_entry` | `name`, `entry_no` — both required. Other entries keep their numbers; numbers are never reused |
-| `agent_notes_update` | `name` required; any of `new_name`, `comment`, `clear_comment=true` (an empty `comment` means "unchanged", so clearing needs the flag), or `author_name` (re-attributes the note's starter, not its entries; alone it leaves `updated_at` alone so summaries stay current) |
+| `agent_notes_update` | `name` required; any of `new_name`, `comment`, `clear_comment=true` (an empty `comment` means "unchanged", so clearing needs the flag), `author_name` (re-attributes the note's starter, not its entries), `kind` (`memory` or `persona`) or `summary_max` (this note's own summary limit, 100-2000, `reset` for the default 500). Author, kind and limit alone leave `updated_at` alone so summaries stay current |
 | `agent_notes_delete` | `name` required. Removes the note and all its entries, no confirmation |
 | `agent_notes_search` | `query` required; `limit` (cards per page, default `10`, capped by `MAX_SEARCH_RESULTS`), `page`, `note` (one note only). Returns cards, strongest feeling first then newest, plus matching notes |
-| `agent_notes_update_summary` | `name`, `summary` (≤500 chars, whitespace collapsed) required; `author_name` optional. Creates or replaces the note's one summary |
+| `agent_notes_update_summary` | `name`, `summary` (≤500 chars, or the note's own `summary_max`; whitespace collapsed) required; `author_name` optional. Creates or replaces the note's one summary |
 | `agent_notes_search_summary` | `query` required; `limit` (default `10`, capped by `MAX_SEARCH_RESULTS`). Splits the query into words, any word can match a note name or summary, ranked by words matched; each result carries `stale` |
 | `agent_notes_delete_summary` | `name` required. Refuses if the note has no summary |
 | `agent_notes_add_tags` | `name`, `tags` (one, or comma-separated) required; `create=true` to make a new tag that resembles existing ones. Refuses a new tag that looks like an existing one (returns the similar tags), reuses one that matches ignoring case/hyphens/plurals; nothing is saved if any tag is refused. Max 10 tags per note, 40 chars each. Punctuation is cleaned rather than refused (`&` becomes `and`, apostrophes dropped, other symbols become hyphens) and the reply lists the change under `adjusted` |
@@ -767,6 +777,9 @@ Note on OWUI's API: `GET /api/v1/chats/` returns only summary fields (no `folder
 membership has to be asked for via `GET /api/v1/chats/folder/{id}` or the full `GET /api/v1/chats/{id}`.
 
 ## Status notes
+
+### 2026-10-14
+`agent_notes` v1.13.0: per-note `kind` and `summary_max` (see "Note kind and summary limit"). The database moved to `/app/backend/data/agent_notes.sqlite3` (out of `comfy_outputs/`); the tool valves on each server must match.
 
 ### 2026-10-10
 Added `agent_duo.py` v1.0.0 (see "Two-agent chat (agent_duo)"): one chat, two agents on two OWUI servers, via a

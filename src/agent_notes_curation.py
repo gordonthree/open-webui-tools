@@ -1,7 +1,7 @@
 """
 title: Agent Notes Curation
 author: Gordon
-version: 1.12.0
+version: 1.13.0
 description: The upkeep half of Agent Notes (it needs the Agent Notes tool too, and the same NOTES_DB_PATH valve):
     tags (agent_notes_add_tags/agent_notes_remove_tag/agent_notes_rename_tag), summaries
     (agent_notes_update_summary/agent_notes_delete_summary), renaming a note or changing its comment
@@ -37,7 +37,10 @@ logger.setLevel(logging.INFO)
 NOTE_NAME_MAX = 60
 NOTE_COMMENT_MAX = 500
 NOTE_TEXT_MAX = 500
-SUMMARY_MAX = 500
+SUMMARY_MAX = 500  # the default; a note can carry its own limit (note_id.summary_max, set with agent_notes_update)
+SUMMARY_CEILING = 2000
+SUMMARY_FLOOR = 100
+NOTE_KINDS = ("memory", "persona")  # persona: a weight is how strongly the trait is the agent's, so there is no 'negative' side
 AUTHOR_NAME_MAX = 60
 DEFAULT_WEIGHT = 50  # as stored: neutral
 WEIGHT_MIN = 0
@@ -51,6 +54,15 @@ SCORE_NEUTRAL = 5
 SCORE_STEP = 10
 HITS_DDL = "INTEGER NOT NULL DEFAULT 0 CHECK (hits >= 0)"
 WEIGHT_DDL = f"INTEGER NOT NULL DEFAULT {DEFAULT_WEIGHT} CHECK (weight BETWEEN {WEIGHT_MIN} AND {WEIGHT_MAX})"
+# The summary's length limit is enforced in Python (per note), so the column only insists on a non-empty summary.
+SUMMARY_COLUMNS = """
+    note_pk INTEGER PRIMARY KEY REFERENCES note_id(note_pk) ON DELETE CASCADE,
+    summary_text TEXT NOT NULL CHECK (length(summary_text) >= 1),
+    author_id INTEGER REFERENCES note_author(author_id),
+    last_summarized TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')),
+    source_updated_at TEXT NOT NULL,
+    source_entries INTEGER NOT NULL
+"""
 TAG_MAX = 40
 MAX_TAGS_PER_NOTE = 10
 TAGS_SHOWN = 40  # how many in-use tags agent_notes_list lists for the model to choose from
@@ -72,7 +84,9 @@ CREATE TABLE IF NOT EXISTS note_id (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     author_id INTEGER REFERENCES note_author(author_id),
-    hits {HITS_DDL}
+    hits {HITS_DDL},
+    kind TEXT NOT NULL DEFAULT 'memory' CHECK (kind IN ('memory', 'persona')),
+    summary_max INTEGER CHECK (summary_max IS NULL OR summary_max BETWEEN {SUMMARY_FLOOR} AND {SUMMARY_CEILING})
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_note_name ON note_id(lower(note_name));
 CREATE TABLE IF NOT EXISTS note_data (
@@ -88,14 +102,7 @@ CREATE TABLE IF NOT EXISTS note_data (
     PRIMARY KEY (note_pk, entry_no)
 );
 CREATE INDEX IF NOT EXISTS idx_note_data_time ON note_data(note_pk, created_at);
-CREATE TABLE IF NOT EXISTS note_summary (
-    note_pk INTEGER PRIMARY KEY REFERENCES note_id(note_pk) ON DELETE CASCADE,
-    summary_text TEXT NOT NULL CHECK (length(summary_text) BETWEEN 1 AND {SUMMARY_MAX}),
-    author_id INTEGER REFERENCES note_author(author_id),
-    last_summarized TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')),
-    source_updated_at TEXT NOT NULL,
-    source_entries INTEGER NOT NULL
-);
+CREATE TABLE IF NOT EXISTS note_summary ({SUMMARY_COLUMNS});
 CREATE TABLE IF NOT EXISTS tag (
     tag_id INTEGER PRIMARY KEY AUTOINCREMENT,
     tag_name TEXT NOT NULL UNIQUE COLLATE NOCASE CHECK (length(tag_name) BETWEEN 1 AND {TAG_MAX})
@@ -129,6 +136,7 @@ def notes_db_connect(db_path: str) -> sqlite3.Connection:
         _migrate_authors(conn)
         _migrate_chains(conn)
         _migrate_scores(conn)
+        _migrate_note_settings(conn)
         _schema_ready.add(db_path)
     return conn
 
@@ -199,6 +207,24 @@ def _migrate_scores(conn: sqlite3.Connection) -> None:
         for table, column, ddl in (("note_id", "hits", HITS_DDL), ("note_data", "hits", HITS_DDL), ("note_data", "weight", WEIGHT_DDL)):
             if column not in [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def _migrate_note_settings(conn: sqlite3.Connection) -> None:
+    """Add note_id.kind and note_id.summary_max (both optional for an older copy of the tool: kind has a default, summary_max may
+    be NULL), and rebuild note_summary once if it still carries the old fixed 500-character CHECK, which would refuse a longer
+    per-note limit. Existing summaries are copied over unchanged."""
+    with _write_txn(conn):
+        have = [r["name"] for r in conn.execute("PRAGMA table_info(note_id)")]
+        if "kind" not in have:
+            conn.execute("ALTER TABLE note_id ADD COLUMN kind TEXT NOT NULL DEFAULT 'memory' CHECK (kind IN ('memory', 'persona'))")
+        if "summary_max" not in have:
+            conn.execute(f"ALTER TABLE note_id ADD COLUMN summary_max INTEGER CHECK (summary_max IS NULL OR summary_max BETWEEN {SUMMARY_FLOOR} AND {SUMMARY_CEILING})")
+        ddl = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'note_summary'").fetchone()
+        if ddl and re.search(r"length\(summary_text\) BETWEEN 1 AND \d+", ddl["sql"]):
+            conn.execute("ALTER TABLE note_summary RENAME TO note_summary_old")
+            conn.execute(f"CREATE TABLE note_summary ({SUMMARY_COLUMNS})")
+            conn.execute("INSERT INTO note_summary SELECT note_pk, summary_text, author_id, last_summarized, source_updated_at, source_entries FROM note_summary_old")
+            conn.execute("DROP TABLE note_summary_old")
 
 
 def _author_id(conn: sqlite3.Connection, author_name: str, now: str) -> int:
@@ -311,13 +337,33 @@ def split_tags(value: Any) -> List[str]:
     return tags
 
 
-def validate_summary(text: Any) -> str:
+def validate_summary(text: Any, limit: int = SUMMARY_MAX) -> str:
     cleaned = " ".join(str(text or "").split())  # a summary is one paragraph: collapse newlines and runs of spaces
     if not cleaned:
         raise NoteError("Summary text is required and can't be empty (use agent_notes_delete_summary to remove a summary).")
-    if len(cleaned) > SUMMARY_MAX:
-        raise NoteError(f"Summary is {len(cleaned)} characters; the limit is {SUMMARY_MAX} (over by {len(cleaned) - SUMMARY_MAX}). Tighten it.")
+    if len(cleaned) > limit:
+        raise NoteError(f"Summary is {len(cleaned)} characters; the limit is {limit} (over by {len(cleaned) - limit}). Tighten it.")
     return cleaned
+
+
+def validate_kind(value: Any) -> str:
+    kind = str(value or "").strip().lower()
+    if kind not in NOTE_KINDS:
+        raise NoteError(f"kind must be one of: {', '.join(NOTE_KINDS)}.")
+    return kind
+
+
+def validate_summary_max(value: Any) -> int:
+    """A per-note summary limit, or 0 to go back to the default (the text 'reset' also means that)."""
+    if str(value).strip().lower() in ("reset", "0"):
+        return 0
+    try:
+        number = int(str(value).strip())
+    except ValueError:
+        raise NoteError(f"summary_max must be a number from {SUMMARY_FLOOR} to {SUMMARY_CEILING}, or 'reset' for the default of {SUMMARY_MAX}.") from None
+    if not SUMMARY_FLOOR <= number <= SUMMARY_CEILING:
+        raise NoteError(f"summary_max must be from {SUMMARY_FLOOR} to {SUMMARY_CEILING}, or 'reset' for the default of {SUMMARY_MAX}.")
+    return number
 
 
 def validate_timestamp(value: Any) -> Optional[str]:
@@ -544,6 +590,7 @@ def update_summary_db(db_path: str, name: str, summary: str, author: str) -> Dic
     try:
         with _write_txn(conn):
             note = _get_note(conn, name)
+            summary = validate_summary(summary, note["summary_max"] or SUMMARY_MAX)
             now = _now_iso()
             entries = conn.execute("SELECT COUNT(*) FROM note_data WHERE note_pk = ?", (note["note_pk"],)).fetchone()[0]
             existed = conn.execute("SELECT 1 FROM note_summary WHERE note_pk = ?", (note["note_pk"],)).fetchone() is not None
@@ -666,7 +713,8 @@ def read_view_db(
             exclude = f"AND d.entry_no NOT IN ({','.join('?' * len(skip))})" if skip else ""
             if strong_each > 0:
                 out["positive"] = fetch(f"{exclude} AND {_SCORE_SQL} >= ?", skip + [high], f"d.weight DESC, d.created_at DESC", strong_each)
-                out["negative"] = fetch(f"{exclude} AND {_SCORE_SQL} <= ?", skip + [low], f"d.weight ASC, d.created_at DESC", strong_each)
+                if note["kind"] != "persona":  # in a persona note a low weight is a weak trait, not a painful memory
+                    out["negative"] = fetch(f"{exclude} AND {_SCORE_SQL} <= ?", skip + [low], f"d.weight ASC, d.created_at DESC", strong_each)
         return out
     finally:
         conn.close()
@@ -685,7 +733,7 @@ def list_notes_db(db_path: str, limit: int, needs_summary: bool = False, tag: Op
                 raise NoteError(f"No note is tagged {tag!r}." + (f" Similar tags: {', '.join(repr(n) for n in similar)}." if similar else " Use agent_notes_list_tags to see the tags in use."))
             tag = match
         rows = conn.execute(
-            "SELECT * FROM (SELECT n.note_pk, n.note_name, n.note_comment, n.updated_at, n.hits, COUNT(d.entry_no) AS entries, a.author_name, "
+            "SELECT * FROM (SELECT n.note_pk, n.note_name, n.note_comment, n.updated_at, n.hits, n.kind, n.summary_max, COUNT(d.entry_no) AS entries, a.author_name, "
             f"CASE WHEN s.note_pk IS NULL THEN CASE WHEN (SELECT COALESCE(SUM(length(x.note_text)), 0) FROM note_data x WHERE x.note_pk = n.note_pk) < {int(min_summary_chars)} THEN 'short' ELSE 'none' END "
             f"WHEN {_STALE_SQL} THEN 'stale' ELSE 'current' END AS summary_state, "
             "(SELECT group_concat(tag_name, ', ') FROM (SELECT t.tag_name FROM note_tag nt JOIN tag t ON t.tag_id = nt.tag_id WHERE nt.note_pk = n.note_pk ORDER BY t.tag_name)) AS tags "
@@ -872,10 +920,13 @@ def delete_entry_db(db_path: str, name: str, entry_no: str) -> Dict[str, Any]:
         conn.close()
 
 
-def update_note_db(db_path: str, name: str, new_name: Optional[str], comment: Optional[str], new_author: Optional[str] = None) -> Dict[str, Any]:
-    """new_name/comment/new_author of None mean 'leave unchanged'; pass comment='' to clear it. new_author changes who
-    the note is recorded as started by (its entries keep their own authors). A change of author alone doesn't touch
-    updated_at, so it never makes the note's summary stale."""
+def update_note_db(
+    db_path: str, name: str, new_name: Optional[str], comment: Optional[str], new_author: Optional[str] = None,
+    kind: Optional[str] = None, summary_max: Optional[int] = None,
+) -> Dict[str, Any]:
+    """new_name/comment/new_author/kind/summary_max of None mean 'leave unchanged'; pass comment='' to clear it, summary_max=0 to go
+    back to the default limit. new_author changes who the note is recorded as started by (its entries keep their own authors).
+    A change of author, kind or summary limit alone doesn't touch updated_at, so it never makes the note's summary stale."""
     conn = notes_db_connect(db_path)
     try:
         try:
@@ -896,11 +947,19 @@ def update_note_db(db_path: str, name: str, new_name: Optional[str], comment: Op
                     )
                 if new_author is not None:
                     conn.execute("UPDATE note_id SET author_id = ? WHERE note_pk = ?", (_author_id(conn, new_author, _now_iso()), note["note_pk"]))
+                if kind is not None:
+                    conn.execute("UPDATE note_id SET kind = ? WHERE note_pk = ?", (kind, note["note_pk"]))
+                if summary_max is not None:
+                    conn.execute("UPDATE note_id SET summary_max = ? WHERE note_pk = ?", (summary_max or None, note["note_pk"]))
         except sqlite3.IntegrityError:
             raise _name_taken_error(new_name or name)
         out = {"old_name": note["note_name"], "note_name": final_name, "note_comment": final_comment}
         if new_author is not None:
             out["author"] = new_author
+        if kind is not None:
+            out["kind"] = kind
+        if summary_max is not None:
+            out["summary_limit"] = summary_max or SUMMARY_MAX
         return out
     finally:
         conn.close()
@@ -1058,7 +1117,7 @@ def tagged_notes_db(db_path: str, tags: List[str], match_all: bool) -> "tuple[Li
             raise NoteError(f"No note is tagged {named}. Use agent_notes_list_tags to see the tags in use.")
         marks = ",".join("?" for _ in found)
         rows = conn.execute(
-            f"SELECT n.note_pk, n.note_name, n.updated_at, n.hits, COUNT(DISTINCT t.tag_id) AS matched FROM note_id n "
+            f"SELECT n.note_pk, n.note_name, n.updated_at, n.hits, n.kind, COUNT(DISTINCT t.tag_id) AS matched FROM note_id n "
             f"JOIN note_tag nt ON nt.note_pk = n.note_pk JOIN tag t ON t.tag_id = nt.tag_id WHERE t.tag_name IN ({marks}) "
             f"GROUP BY n.note_pk HAVING matched >= ? ORDER BY matched DESC, n.updated_at DESC, n.note_pk DESC",
             found + [len(found) if match_all else 1],
@@ -1072,8 +1131,10 @@ def tagged_notes_db(db_path: str, tags: List[str], match_all: bool) -> "tuple[Li
                 "WHERE d.note_pk = ? ORDER BY d.created_at DESC, d.entry_no DESC",
                 (r["note_pk"],),
             ).fetchall()
+            if r["kind"] == "persona":  # strongest traits first (the packer fills in this order); the newest of equal weight first
+                entries = sorted(entries, key=lambda e: -e["weight"])
             notes.append({
-                "note_name": r["note_name"], "tags": note_tags, "matched_tags": [t for t in note_tags if t in found],
+                "note_name": r["note_name"], "kind": r["kind"], "tags": note_tags, "matched_tags": [t for t in note_tags if t in found],
                 "summary": summary["summary_text"] if summary else None,
                 "entries": [{"entry_no": e["entry_no"], "author": e["author_name"] or "unknown", "created_at": e["created_at"], "text": e["note_text"], "hits": e["hits"], "weight": weight_to_score(e["weight"]), **_chain_marks(e)} for e in entries],
                 "hits": r["hits"],
@@ -1093,9 +1154,10 @@ def _size(obj: Any) -> int:
 def _shape_tagged(note: Dict[str, Any], verbose: bool) -> Dict[str, Any]:
     """The note as the model will receive it. Plain mode keeps only what a reader needs: the name, the summary if
     there is one, and the entry texts as bare strings."""
+    persona = note.get("kind") == "persona"
     if verbose:
-        return {**note, "_verbose": True}
-    shaped: Dict[str, Any] = {"note_name": note["note_name"]}
+        return {**note, "_verbose": True, **({"_persona": True} if persona else {})}
+    shaped: Dict[str, Any] = {"note_name": note["note_name"], **({"_persona": True} if persona else {})}
     if note["summary"]:
         shaped["summary"] = note["summary"]
     # a piece of a long text keeps its links, so it's a small object; every other entry stays a bare string
@@ -1136,7 +1198,8 @@ def pack_tagged(notes: List[Dict[str, Any]], budget: int) -> "tuple[List[Dict[st
             note["entries"].append(note["_pending"].pop(0))
     for note in packed:
         note.pop("_pending")
-        note["entries"].reverse()  # newest-first while packing; read in time order
+        if not note.pop("_persona", False):
+            note["entries"].reverse()  # newest-first while packing; read in time order (a persona note stays strongest-first)
         hidden = note.pop("total_entries") - len(note["entries"])
         verbose = note.pop("_verbose", False)
         if hidden or verbose:
@@ -1245,13 +1308,14 @@ def help_topics(
             "tags, renaming and deleting",
             "These tools are in the separate Agent Notes Curation tool; if you were not given them (agent_notes_add_tags and the rest), you cannot do this, so tell the user. Tags group related notes. agent_notes_add_tags name, tags (one, or comma-separated) - a new tag that looks like an existing one is refused and the similar tags are listed; "
             "use the existing one, or pass create=true if the new tag really is different. agent_notes_remove_tag, agent_notes_list_tags and agent_notes_rename_tag (merges into an existing tag) keep them tidy.\n"
-            "agent_notes_update name: rename the note (new_name=), change its comment (comment=; clear_comment=true removes it) or the author shown (author_name=).\n"
+            "agent_notes_update name: rename the note (new_name=), change its comment (comment=; clear_comment=true removes it) or the author shown (author_name=). "
+            "kind= 'persona' marks a note whose weights mean how strongly a trait is the agent's (reads list the strongest first; the default is 'memory'); summary_max= sets that note's own summary length limit (100-2000; 'reset' for the default).\n"
             "agent_notes_delete name removes the whole note and all its entries permanently, with no confirmation: use it only when asked to.",
         ),
         "summaries": (
             "the per-note summary",
             "These tools are in the separate Agent Notes Curation tool; if you were not given them (agent_notes_add_tags and the rest), you cannot do this, so tell the user. "
-            f"A note can carry one summary of at most {SUMMARY_MAX} characters, written to describe what the note contains so other agents can find it by searching. "
+            f"A note can carry one summary of at most {SUMMARY_MAX} characters (agent_notes_list shows 'up to N' for a note with its own limit), written to describe what the note contains so other agents can find it by searching. "
             "agent_notes_update_summary name, summary creates or replaces it; agent_notes_search_summary finds notes by it; agent_notes_delete_summary removes it.\n"
             "A summary goes stale when the note changes; agent_notes_list needs_summary=true lists notes whose summary is missing or stale "
             f"(notes under {min_summary} characters of text are shown as short and left out: just read them). Describe the note, do not copy it.",
@@ -1397,12 +1461,12 @@ class Tools:
 
     async def agent_notes_update(
         self, name: str, new_name: Optional[str] = None, comment: Optional[str] = None, clear_comment: bool = False,
-        author_name: Optional[str] = None
+        author_name: Optional[str] = None, kind: Optional[str] = None, summary_max: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Rename a note, change its comment, and/or change who is recorded as its author. Entries are
-        untouched (each keeps its own author). Give at least one of new_name, comment,
-        clear_comment, or author_name.
+        Rename a note, change its comment, who is recorded as its author, its kind, and/or its summary length limit.
+        Entries are untouched (each keeps its own author). Give at least one of new_name, comment, clear_comment,
+        author_name, kind, or summary_max. Changing the author, kind or limit never makes the summary stale.
 
         LIMITS: note name 60 characters, comment 500, author name 60 (a call over any of them is
         refused, nothing is changed).
@@ -1412,14 +1476,18 @@ class Tools:
         :param comment: The new comment (at most 500 characters). Pass "" (or omit) to keep the current comment.
         :param clear_comment: true to erase the comment entirely. Pass false (the normal choice) otherwise.
         :param author_name: Record this as the note's author instead (at most 60 characters). Pass "" (or omit) to leave the author as it is.
+        :param kind: "memory" (the normal kind: a weight is how it felt, 1 painful to 10 joyful) or "persona" (a weight is how strongly the trait is the agent's; reads list the strongest first and show no negative side). Pass "" (or omit) to leave it.
+        :param summary_max: This note's own summary length limit, 100 to 2000 characters; "reset" returns it to the default of 500. Pass "" (or omit) to leave it.
         """
         try:
             wants_name = not is_unset(new_name)
             wants_comment = not is_unset(comment)
             wants_author = not is_unset(author_name)
+            wants_kind = not is_unset(kind)
+            wants_max = not is_unset(summary_max)
             clearing = _to_bool(clear_comment)
-            if not (wants_name or wants_comment or clearing or wants_author):
-                raise NoteError("Nothing to update - give new_name, comment, clear_comment=true, or author_name.")
+            if not (wants_name or wants_comment or clearing or wants_author or wants_kind or wants_max):
+                raise NoteError("Nothing to update - give new_name, comment, clear_comment=true, author_name, kind or summary_max.")
             if clearing and wants_comment:
                 raise NoteError("Give either comment or clear_comment=true, not both.")
             result = await asyncio.to_thread(
@@ -1429,6 +1497,8 @@ class Tools:
                 validate_name(new_name) if wants_name else None,
                 "" if clearing else (validate_comment(comment) if wants_comment else None),
                 validate_author(author_name) if wants_author else None,
+                validate_kind(kind) if wants_kind else None,
+                validate_summary_max(summary_max) if wants_max else None,
             )
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
@@ -1525,11 +1595,11 @@ class Tools:
         (agent_notes_read) so the summary reflects all of it.
 
         Write for retrieval: name the key people, places, decisions and topics in plain words, since
-        agent_notes_search_summary matches on the words used. LIMIT: 500 characters (a longer one is refused,
-        nothing is saved).
+        agent_notes_search_summary matches on the words used. LIMIT: 500 characters unless agent_notes_list shows
+        "up to N" for the note (a longer one is refused, nothing is saved).
 
         :param name: The note's name, as shown by agent_notes_list (case doesn't matter).
-        :param summary: The summary, at most 500 characters, one paragraph.
+        :param summary: The summary, one paragraph, within the note's limit.
         :param author_name: Who wrote the summary, at most 60 characters. Pass "" (or omit) to be recorded under your model's name.
         """
         try:
@@ -1537,7 +1607,7 @@ class Tools:
                 update_summary_db,
                 self.valves.NOTES_DB_PATH,
                 validate_name(name),
-                validate_summary(summary),
+                summary,
                 resolve_author(author_name, __model__),
             )
         except (ValueError, sqlite3.Error) as e:

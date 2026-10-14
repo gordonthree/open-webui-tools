@@ -30,6 +30,17 @@ class HandlerTests(unittest.TestCase):
     def get(self, path, **query):
         return web.handle_get(self.db, path, {k: [v] for k, v in query.items()})
 
+    def test_update_form_sets_kind_and_summary_limit_and_blank_resets_it(self):
+        self.post("/create", name="Facet", text="x")
+        self.post("/update", name="Facet", new_name="Facet", comment="", kind="persona", summary_max="900")
+        row = web.notes.read_note_db(self.db, "Facet", 5)["note"]
+        self.assertEqual((row["kind"], row["summary_max"]), ("persona", 900))
+        self.assertIn("<option selected>persona</option>", self.get("/note", name="Facet")[2])
+        self.post("/update", name="Facet", new_name="Facet", comment="", kind="persona", summary_max="")
+        self.assertIsNone(web.notes.read_note_db(self.db, "Facet", 5)["note"]["summary_max"])
+        self.post("/update", name="Facet", new_name="Facet", comment="")  # a post that doesn't mention them leaves them alone
+        self.assertEqual(web.notes.read_note_db(self.db, "Facet", 5)["note"]["kind"], "persona")
+
     def test_empty_index_has_create_form(self):
         status, _, body = self.get("/")
         self.assertEqual(status, 200)

@@ -1023,16 +1023,10 @@ class SummaryTests(NotesTestCase):
         self.assertIn("limit is 500", long["error"])
         self.assertEqual(self.sql("SELECT COUNT(*) FROM note_summary"), [(0,)])
 
-    def test_summary_whitespace_is_collapsed_and_database_enforces_limit(self):
+    def test_summary_whitespace_is_collapsed(self):
         self.create("n", "x")
         self.summarize(text="line one\n\nline   two")
         self.assertEqual(self.sql("SELECT summary_text FROM note_summary"), [("line one line two",)])
-        with self.assertRaises(sqlite3.IntegrityError):
-            conn = sqlite3.connect(self.db)
-            try:
-                conn.execute("UPDATE note_summary SET summary_text = ?", ("z" * 501,))
-            finally:
-                conn.close()
 
     def test_author_and_read_note_shows_summary_and_staleness(self):
         self.create("n", "x")
@@ -1487,3 +1481,111 @@ class OpenWebUICoercionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoteSettingsTests(NotesTestCase):
+    """note_id.kind and note_id.summary_max: set by the curation tool's agent_notes_update, defaults for everything else."""
+    def update(self, name="n", **kw):
+        return self.run_async(self.tool.agent_notes_update(name, **kw))
+
+    def summarize(self, text, name="n"):
+        return self.run_async(self.tool.agent_notes_update_summary(name, text))
+
+    def test_defaults_and_validation(self):
+        self.create("n", "x")
+        self.assertEqual(self.sql("SELECT kind, summary_max FROM note_id"), [("memory", None)])
+        for bad in ({"kind": "feelings"}, {"summary_max": "50"}, {"summary_max": "5000"}, {"summary_max": "lots"}):
+            self.assertFalse(self.update(**bad)["success"], bad)
+        self.assertFalse(self.update()["success"])  # nothing to change
+
+    def test_set_and_reset(self):
+        self.create("n", "x")
+        got = self.update(kind="Persona", summary_max="1000")
+        self.assertEqual((got["success"], got["kind"], got["summary_limit"]), (True, "persona", 1000))
+        self.assertEqual(self.sql("SELECT kind, summary_max FROM note_id"), [("persona", 1000)])
+        got = self.update(summary_max="reset")
+        self.assertEqual(got["summary_limit"], 500)
+        self.assertEqual(self.sql("SELECT kind, summary_max FROM note_id"), [("persona", None)])
+
+    def test_changing_them_does_not_make_the_summary_stale(self):
+        self.create("n", "x")
+        self.summarize("a summary")
+        self.update(kind="persona", summary_max="800")
+        self.assertEqual(self.run_async(self.tool.agent_notes_list(needs_summary=True))["count"], 0)
+
+    def test_summary_limit_is_per_note(self):
+        self.create("n", "x")
+        self.create("m", "x")
+        self.update(summary_max="1000")
+        self.assertTrue(self.summarize("y" * 900)["success"])
+        refused = self.summarize("y" * 900, name="m")
+        self.assertFalse(refused["success"])
+        self.assertIn("limit is 500", refused["error"])
+        self.assertFalse(self.summarize("y" * 1001)["success"])
+
+    def test_list_shows_limit_and_kind_only_when_they_differ(self):
+        self.create("n", "x")
+        self.create("m", "x")
+        plain = self.run_async(self.tool.agent_notes_list())["table"]
+        self.assertNotIn("Kind", plain)
+        self.assertNotIn("up to", plain)
+        self.update(kind="persona", summary_max="1000")
+        shown = self.run_async(self.tool.agent_notes_list())["table"]
+        self.assertIn("| Kind |", shown)
+        self.assertIn("| persona |", shown)
+        self.assertIn("none, up to 1000", shown)
+        self.assertEqual(shown.count("up to"), 1)
+
+    def test_persona_read_has_no_negative_side(self):
+        self.create("n", "e1")
+        for i in range(2, 9):
+            self.run_async(self.tool.agent_notes_append("n", f"e{i}", weight="2" if i == 3 else "9" if i == 4 else None))
+        self.tool.valves.READ_DEFAULT_RECENT = 2
+        before = self.run_async(self.tool.agent_notes_read("n"))["strong_memories"]
+        self.assertEqual(([e["entry_no"] for e in before["positive"]], [e["entry_no"] for e in before["negative"]]), ([4], [3]))
+        self.update(kind="persona")
+        after = self.run_async(self.tool.agent_notes_read("n"))["strong_memories"]
+        self.assertEqual(([e["entry_no"] for e in after["positive"]], "negative" in after and after["negative"]), ([4], False))
+
+    def test_persona_notes_pack_strongest_first_in_a_tight_tagged_read(self):
+        self.create("p", "plain one")
+        for text, weight in (("core trait", "9"), ("passing mood", "2"), ("middling", None), ("another core", "8")):
+            self.run_async(self.tool.agent_notes_append("p", text, weight=weight))
+        self.run_async(self.tool.agent_notes_add_tags("p", "facet", True))
+        self.update(name="p", kind="persona")
+        self.tool.valves.MAX_TAGGED_CHARS = 500
+        got = self.run_async(self.tool.agent_notes_read_tagged("facet"))["notes"][0]
+        self.assertEqual(got["entries"][0]["text"], "core trait")  # heaviest first, whatever the budget cut
+        self.assertEqual({e["text"] if isinstance(e, dict) else e for e in got["entries"][:2]}, {"core trait", "another core"})
+        self.tool.valves.MAX_TAGGED_CHARS = 6000
+        full = self.run_async(self.tool.agent_notes_read_tagged("facet"))["notes"][0]
+        texts = [e["text"] if isinstance(e, dict) else e for e in full["entries"]]
+        self.assertEqual(texts[:2], ["core trait", "another core"])
+        self.assertEqual(texts[-1], "passing mood")
+
+
+class SettingsMigrationTests(NotesTestCase):
+    def test_old_database_gets_columns_and_a_longer_summary_allowed(self):
+        Path(self.db).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.db)
+        conn.executescript("""
+            CREATE TABLE note_id (note_pk INTEGER PRIMARY KEY AUTOINCREMENT, note_name TEXT NOT NULL, note_comment TEXT NOT NULL DEFAULT '',
+                next_entry_no INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE note_data (note_pk INTEGER NOT NULL, entry_no INTEGER NOT NULL, note_text TEXT NOT NULL, created_at TEXT NOT NULL,
+                edited_at TEXT, PRIMARY KEY (note_pk, entry_no));
+            CREATE TABLE note_summary (note_pk INTEGER PRIMARY KEY REFERENCES note_id(note_pk) ON DELETE CASCADE,
+                summary_text TEXT NOT NULL CHECK (length(summary_text) BETWEEN 1 AND 500), author_id INTEGER,
+                last_summarized TEXT NOT NULL DEFAULT 'x', source_updated_at TEXT NOT NULL, source_entries INTEGER NOT NULL);
+            INSERT INTO note_id VALUES (1, 'old', '', 2, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+            INSERT INTO note_data VALUES (1, 1, 'text', '2026-01-01T00:00:00+00:00', NULL);
+            INSERT INTO note_summary VALUES (1, 'kept summary', NULL, 'x', '2026-01-01T00:00:00+00:00', 1);
+        """)
+        conn.close()
+        self.run_async(self.tool.agent_notes_list())
+        self.assertEqual(self.sql("SELECT kind, summary_max FROM note_id"), [("memory", None)])
+        self.assertEqual(self.sql("SELECT summary_text FROM note_summary"), [("kept summary",)])
+        self.run_async(self.tool.agent_notes_update("old", summary_max="1000"))
+        self.assertTrue(self.run_async(self.tool.agent_notes_update_summary("old", "z" * 900))["success"])
+        mod._schema_ready.discard(self.db)  # a second process migrating again changes nothing
+        self.run_async(self.tool.agent_notes_list())
+        self.assertEqual(self.sql("SELECT length(summary_text) FROM note_summary"), [(900,)])

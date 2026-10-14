@@ -203,6 +203,7 @@ def render_note(db: str, name: str) -> str:
             f"<form method='post' action='/delete_entry'>{hidden}<input type='hidden' name='entry_no' value='{r['entry_no']}'>"
             f"<button class='danger'>Delete entry #{r['entry_no']}</button></form></details></div>"
         )
+    kind_options = "".join(f"<option{' selected' if k == note['kind'] else ''}>{k}</option>" for k in notes.NOTE_KINDS)
     body += (
         f"<h3>Append entry</h3><form method='post' action='/append'>{hidden}"
         f"<textarea name='text' rows='3' maxlength='{notes.NOTE_TEXT_MAX}' required></textarea><button>Append</button></form>"
@@ -210,6 +211,9 @@ def render_note(db: str, name: str) -> str:
         f"<p><input type='text' name='new_name' value='{e(n)}' maxlength='{notes.NOTE_NAME_MAX}'></p>"
         f"<p><input type='text' name='comment' value='{e(note['note_comment'])}' maxlength='{notes.NOTE_COMMENT_MAX}'></p>"
         f"<p><input type='text' name='author' value='{e(result['started_by'] or '')}' maxlength='{notes.AUTHOR_NAME_MAX}' placeholder='author'></p>"
+        f"<p><label>Kind <select name='kind'>{kind_options}</select></label> "
+        f"<label>Summary limit <input type='text' name='summary_max' value='{note['summary_max'] or ''}' size='5' placeholder='{notes.SUMMARY_MAX}'></label> "
+        f"<span class='muted'>persona: a weight is how strongly the trait is the agent's; blank limit = default</span></p>"
         f"<button>Save</button></form></details>"
         f"<form method='post' action='/reset_hits'>{hidden}<button>Reset read counts (this note and all its entries)</button></form>"
         f"<details><summary class='danger'>delete note</summary><form method='post' action='/delete_note'>{hidden}"
@@ -266,7 +270,9 @@ def handle_post(db: str, path: str, form: Dict[str, str], author: str = DEFAULT_
         if path == "/update":
             new_name = notes.validate_name(form.get("new_name"))
             author_text = (form.get("author") or "").strip()
-            done = notes.update_note_db(db, name(), new_name, notes.validate_comment(form.get("comment")), notes.validate_author(author_text) if author_text else None)
+            done = notes.update_note_db(db, name(), new_name, notes.validate_comment(form.get("comment")), notes.validate_author(author_text) if author_text else None,
+                                       notes.validate_kind(form.get("kind")) if "kind" in form else None,
+                                       notes.validate_summary_max((form.get("summary_max") or "").strip() or "reset") if "summary_max" in form else None)
             return redirect(note_url(done["note_name"]))
         if path == "/add_tag":  # a person decides what's a new tag, so no similar-tag check here
             done = notes.add_tags_db(db, name(), notes.split_tags(form.get("tags")), create=True)

@@ -15,10 +15,14 @@ depends on the kind of note, and that is the part a small model will not work ou
 For memories, distance from 5 is the strength: a 1 and a 10 are both unforgettable. For persona traits,
 the number is only the strength of the character, and low means "weakly her", not "bad".
 
+Mark persona notes as such so the tools read them that way: the owner runs `agent_notes_update` with
+`kind="persona"` (curation tool) or picks the kind on the note's page in `notes_web.py`. Until a note is marked, it is
+read like a memory note (a weight of 3 would be offered as a painful memory). The agents cannot change the kind.
+
 How the tools use it: the everyday `agent_notes_read` returns the newest entries plus the strongest older
 ones (3 or lower, 7 or higher), so an entry left at 5 can drop out of sight once a note is long. Rating is how
-a memory stays reachable. In persona notes, a weight (once packed by weight, see the end of this file) is how a
-core trait survives a tight context budget.
+a memory stays reachable. In persona notes, a weight on a `persona` note is how a core trait survives a tight context budget: `agent_notes_read_tagged`
+fills its budget heaviest-first for those notes.
 
 ---
 
@@ -142,10 +146,6 @@ not neutral, but that skews every unrated write the same way and I would not do 
 ## What I would change in the tools to support this (not built)
 
 - `REQUIRE_WEIGHT` valve, as above (create, append and edit_entry; `set_weight` already requires a value).
-- Packing the tagged read (`agent_notes_read_tagged`) so heavier entries are kept when the budget is tight,
-  instead of newest-first. Worth building only if the tag read is actually truncating persona notes; check the
-  `MAX_TAGGED_CHARS` valve first (the persona is about 9,300 characters of text, about 14,000 once the JSON
-  overhead is counted).
-- Persona notes need a different reading of the number than memories; the cleanest way is the prompt, as above,
-  but if it ever confuses a model a per-note flag (like a tag) could say "weights here mean strength of
-  character". Not worth building until a model gets it wrong.
+- (Built in v1.13.0, no longer pending: a per-note `kind`, and heaviest-first packing of the tagged read for
+  persona notes. Still check the `MAX_TAGGED_CHARS` valve: the persona is about 9,300 characters of text, about
+  14,000 once the JSON overhead is counted.)
