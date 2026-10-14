@@ -33,6 +33,7 @@ comfy_sdxl_graph: <tool-id>
 comfy_sdxl_retrieve: <tool-id>
 comfy_sdxl_poses: <tool-id>
 agent_notes: <tool-id>
+agent_notes_curation: <tool-id>   # the upkeep half of agent_notes; leave out until it exists, then create it with `push_tool.py agent_notes_curation --create`
 voice_memo: <tool-id>
 openrouter_image: <tool-id>
 agent_duo: <function-id>

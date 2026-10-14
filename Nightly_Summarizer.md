@@ -1,8 +1,9 @@
 # Nightly Summarizer
 
 System prompt for a scheduled sub agent that keeps the `agent_notes` summaries current, so other
-agents can find the right note with `agent_notes_search_summary`. It needs only the Agent Notes tool
-(`agent_notes_list`, `agent_notes_read`, `agent_notes_update_summary`).
+agents can find the right note with `agent_notes_search_summary`. It needs the Agent Notes tool
+(`agent_notes_list`, `agent_notes_read`) **and** the Agent Notes Curation tool (`agent_notes_update_summary`, which
+lives there since the toolbox was split in two) - enable both on the summarizer's model.
 
 Setup notes:
 

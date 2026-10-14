@@ -23,6 +23,11 @@ Functions: `agent_duo` is an Open WebUI *Function* (a Pipe), not a Tool, so it g
 /api/v1/functions/ instead of /api/v1/tools/. Its id is the bare `agent_duo: <id>` line like a tool's
 (on the default server only - it isn't part of `all`, and other servers only get it when asked for by name).
 
+A tool that doesn't exist on the server yet is created only with --create (a new private tool whose id is the tool's file
+name, named from its `title:` header; share it or attach it to models in the OWUI web UI afterwards); without --create
+the script refuses, as before. Tools only - not Functions. agent_notes and agent_notes_curation are generated from
+src/agent_notes_full.py: run scripts/build_agent_notes.py first.
+
 Usage:
     python scripts/push_tool.py comfy_sdxl_direct
     python scripts/push_tool.py comfy_sdxl_graph comfy_sdxl_retrieve
@@ -45,7 +50,7 @@ SRC_DIR = REPO_ROOT / "src"
 DEFAULT_SECRETS_FILE = REPO_ROOT / "secrets.md"
 BACKUP_DIR = REPO_ROOT / "tmp"
 
-TOOL_NAMES = ["comfy_sdxl_direct", "comfy_sdxl_graph", "comfy_sdxl_retrieve", "comfy_sdxl_poses", "agent_notes", "nextcloud_mail", "voice_memo", "openrouter_image"]
+TOOL_NAMES = ["comfy_sdxl_direct", "comfy_sdxl_graph", "comfy_sdxl_retrieve", "comfy_sdxl_poses", "agent_notes", "nextcloud_mail", "voice_memo", "openrouter_image", "agent_notes_curation"]
 FUNCTION_NAMES = ["agent_duo"]  # Open WebUI Functions (Pipes), pushed via /api/v1/functions/ - not part of 'all'
 
 _KV_RE = re.compile(r"^([A-Za-z0-9_]+):\s*(.+?)\s*$")
@@ -93,7 +98,23 @@ def api_kind(name: str) -> str:
     return "functions" if name in FUNCTION_NAMES else "tools"
 
 
-def push_one(tool_name: str, base_url: str, api_key: str, tool_id: str, dry_run: bool, server: str = "local") -> None:
+def create_one(tool_name: str, tag: str, base_url: str, api_key: str, tool_id: str, content: str, dry_run: bool) -> None:
+    """Create a tool that isn't on the server yet. Its name and description come from the source file's header."""
+    title = re.search(r"^title:\s*(.+)$", content, re.M)
+    desc = re.search(r"^description:\s*(.+)$", content, re.M)
+    name = title.group(1).strip() if title else tool_name
+    if dry_run:
+        print(f"[{tag}] id={tool_id} does not exist on the server; would CREATE it as {name!r} ({len(content)} bytes)")
+        return
+    body = {"id": tool_id, "name": name, "content": content, "meta": {"description": desc.group(1).strip() if desc else ""}, "access_grants": []}
+    resp = requests.post(f"{base_url}/api/v1/tools/create", headers={"Authorization": f"Bearer {api_key}"}, json=body, timeout=30)
+    made = resp.json() if resp.status_code == 200 else None
+    if not made:
+        sys.exit(f"[{tag}] Create failed ({resp.status_code}): {resp.text[:500]}")
+    print(f"[{tag}] created OK - id={made.get('id')} name={made.get('name')!r} (private to this account; share it or attach it to models in the OWUI web UI)")
+
+
+def push_one(tool_name: str, base_url: str, api_key: str, tool_id: str, dry_run: bool, server: str = "local", create: bool = False) -> None:
     kind = api_kind(tool_name)
     tag = tool_name if server == "local" else f"{server}/{tool_name}"
     local_path = SRC_DIR / f"{tool_name}.py"
@@ -103,10 +124,12 @@ def push_one(tool_name: str, base_url: str, api_key: str, tool_id: str, dry_run:
 
     headers = {"Authorization": f"Bearer {api_key}"}
     get_resp = requests.get(f"{base_url}/api/v1/{kind}/id/{tool_id}", headers=headers, timeout=15)
+    if create and kind == "tools" and get_resp.status_code in (401, 404):  # OWUI answers 401 or 404 for a tool id it doesn't have
+        return create_one(tool_name, tag, base_url, api_key, tool_id, new_content, dry_run)
     if get_resp.status_code != 200:
         sys.exit(
             f"[{tag}] Could not fetch {kind[:-1]} {tool_id!r} ({get_resp.status_code}): {get_resp.text[:300]}\n"
-            "Check the id in secrets.md and that your API key's account owns (or is admin over) this tool."
+            "Check the id in secrets.md and that your API key's account owns (or is admin over) this tool. A tool that doesn't exist yet needs --create."
         )
     current = get_resp.json()
 
@@ -170,9 +193,13 @@ def server_connection(values: dict, server: str) -> "tuple[str, str]":
     return require(values, f"OWUI_{upper}_URL").rstrip("/"), require(values, f"OWUI_{upper}_KEY")
 
 
-def resolve_tool_id(values: dict, server: str, tool_name: str, base_url: str, api_key: str) -> str:
-    """local: the bare `<tool>` line. Other servers: an `X_<tool>` line if there is one, else the id the server itself lists."""
+def resolve_tool_id(values: dict, server: str, tool_name: str, base_url: str, api_key: str, create: bool = False) -> str:
+    """local: the bare `<tool>` line (with --create and no such line, the tool's file name - the id it will be created under).
+    Other servers: an `X_<tool>` line if there is one, else the id the server itself lists (with --create, the file name)."""
     if server == "local":
+        existing = values.get(tool_name)
+        if create and (not existing or existing.startswith("<")):
+            return tool_name
         return require(values, tool_name)
     override = values.get(f"{server.upper()}_{tool_name}")
     if override and not override.startswith("<"):
@@ -182,11 +209,11 @@ def resolve_tool_id(values: dict, server: str, tool_name: str, base_url: str, ap
     if resp.status_code != 200:
         sys.exit(f"[{server}/{tool_name}] Could not list {kind} on {server} ({resp.status_code}): {resp.text[:300]}")
     ids = [t.get("id") for t in resp.json() if isinstance(t, dict)]
-    if tool_name in ids:
+    if tool_name in ids or (create and api_kind(tool_name) == "tools"):
         return tool_name
     sys.exit(
         f"[{server}/{tool_name}] No tool with id {tool_name!r} on {server} (it has: {ids}). push_tool.py only updates an existing tool: "
-        f"import it once through OWUI's web UI, or add a `{server.upper()}_{tool_name}: <id>` line to secrets.md."
+        f"pass --create to create it, import it once through OWUI's web UI, or add a `{server.upper()}_{tool_name}: <id>` line to secrets.md."
     )
 
 
@@ -195,6 +222,7 @@ def main() -> None:
     parser.add_argument("tools", nargs="+", help=f"One or more of {TOOL_NAMES + FUNCTION_NAMES}, or 'all' (the tools).")
     parser.add_argument("--server", action="append", metavar="NAME", help="Server to push to: local (the default), a name configured as OWUI_<NAME>_URL/_KEY, or 'all'. May be repeated.")
     parser.add_argument("--secrets-file", type=Path, default=DEFAULT_SECRETS_FILE)
+    parser.add_argument("--create", action="store_true", help="Create a tool that doesn't exist on the server yet (otherwise that is an error). Tools only.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would change without pushing.")
     args = parser.parse_args()
 
@@ -221,7 +249,7 @@ def main() -> None:
         try:
             base_url, api_key = server_connection(values, server)
             for name in names:
-                push_one(name, base_url, api_key, resolve_tool_id(values, server, name, base_url, api_key), args.dry_run, server)
+                push_one(name, base_url, api_key, resolve_tool_id(values, server, name, base_url, api_key, args.create), args.dry_run, server, args.create)
         except SystemExit as ex:  # push_one and friends exit with a message; keep going to the next server
             print(ex.code if isinstance(ex.code, str) else f"[{server}] failed", file=sys.stderr)
             failed.append(server)

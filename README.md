@@ -38,10 +38,14 @@ Current tools:
   straight into `generate_image`'s or `run_workflow`'s own `source_image` argument. This tool never
   renders anything itself — it's a catalog, same spirit as `run_workflow`'s workflow templates.
 
-- `agent_notes.py` → `agent_notes_list`, `agent_notes_read`, `agent_notes_create`, `agent_notes_append`, `agent_notes_edit_entry`,
-  `agent_notes_delete_entry`, `agent_notes_update`, `agent_notes_delete`, `agent_notes_search`, `agent_notes_add_tags`, `agent_notes_remove_tag`, `agent_notes_list_tags`, `agent_notes_read_tagged`,
-  `agent_notes_rename_tag`, `agent_notes_set_weight`, `agent_notes_reset_hits`, `agent_notes_rank_entries`, `agent_notes_help` (plus the summary methods) — a persistent notebook for agents,
-  an easier-to-drive alternative to Open WebUI's built-in `note` tool. Unrelated to ComfyUI. A note
+- `agent_notes.py` (generated, see below) → `agent_notes_help`, `agent_notes_list`, `agent_notes_list_tags`, `agent_notes_search`,
+  `agent_notes_search_summary`, `agent_notes_read`, `agent_notes_read_tagged`, `agent_notes_create`, `agent_notes_append`,
+  `agent_notes_edit_entry`, `agent_notes_set_weight`, `agent_notes_rank_entries` — the everyday half of a persistent notebook for agents,
+  and `agent_notes_curation.py` (generated) → `agent_notes_add_tags`, `agent_notes_remove_tag`, `agent_notes_rename_tag`,
+  `agent_notes_update`, `agent_notes_update_summary`, `agent_notes_delete_summary`, `agent_notes_delete`,
+  `agent_notes_delete_entry`, `agent_notes_reset_hits` — the upkeep half. Two tools over one database so a small-context
+  conversational model carries only the descriptions it needs (about 2,300 tokens against 3,400 for all 21 methods).
+  Both are generated from `src/agent_notes_full.py`. Together they are an easier-to-drive alternative to Open WebUI's built-in `note` tool. Unrelated to ComfyUI. A note
   is a name plus an append-only log of short numbered entries, in its **own** SQLite file
   (`agent_notes.sqlite3`, `NOTES_DB_PATH` valve — not the job database, though it defaults to the
   same folder). Notes are addressed by name (unique, case-insensitive) and entries by number; there
@@ -270,7 +274,26 @@ status note below for how this was found.
 |---|---|
 | `pose_id` | Required. A pose's id, as shown by `list_poses` |
 
-### `agent_notes` tool arguments (agent_notes.py)
+### `agent_notes` tool arguments (agent_notes_full.py → agent_notes.py, agent_notes_curation.py)
+
+**One source, two deployable tools.** `src/agent_notes_full.py` is the only file to edit: the database layer, validation
+and all 21 tool methods, and what `src/test_agent_notes.py` and the other tests exercise. `scripts/build_agent_notes.py`
+generates the two files Open WebUI gets from it (each is a complete, self-contained tool, since OWUI can't import
+siblings; `# GENERATED` marks them) by cutting the other tool's methods and valves out:
+
+| Tool (id) | Methods | Valves |
+|---|---|---|
+| **Agent Notes** (`agent_notes`) | `help`, `list`, `list_tags`, `search`, `search_summary`, `read`, `read_tagged`, `create`, `append`, `edit_entry`, `set_weight`, `rank_entries` | all of them |
+| **Agent Notes Curation** (`agent_notes_curation`) | `add_tags`, `remove_tag`, `rename_tag`, `update`, `update_summary`, `delete_summary`, `delete`, `delete_entry`, `reset_hits` | `NOTES_DB_PATH` only |
+
+A method must be assigned to exactly one of the two lists in the build script (it refuses to build otherwise). After editing
+`agent_notes_full.py` run `python3 scripts/build_agent_notes.py` (`--check` exits 1 if a generated file is stale, and
+`test_agent_notes_split` fails on that too). Give a conversational model **Agent Notes**; give a curating or
+summarizing agent **both**. The curation tool has no `help` of its own (two methods with one name would clash): the everyday
+tool's `agent_notes_help` explains the curation tools too and says which tool they live in. Both tools have a
+`NOTES_DB_PATH` valve and must be pointed at the same file. The tables below list every method; the ones in the
+curation list above belong to the second tool. `notes_web.py`, `agent_duo` and the autonomy charter are unaffected: they use
+the database functions (in both files) or the everyday methods.
 
 Same `""`/`false` = omitted convention as above. Limits: note name 60 characters, note comment 500,
 entry text 500 — enforced by the tool (with an actionable message) and by SQLite `CHECK`s.
@@ -533,13 +556,13 @@ Each tool has a matching `test_*.py` file that simulates ComfyUI's HTTP API with
 module — no live ComfyUI or Open WebUI server needed. Run all of them from `src/`:
 
 ```
-python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes test_agent_duo test_voice_memo test_openrouter_image -v
+python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes test_agent_notes_split test_agent_duo test_voice_memo test_openrouter_image -v
 ```
 
 `scripts/import_server_history.py` has its own test file the same way — run from `scripts/`:
 
 ```
-python -m unittest test_import_server_history -v
+python -m unittest test_import_server_history test_push_tool test_notes_web -v
 ```
 
 `pydantic` and `requests` need to be installed in whatever Python environment runs the tests
@@ -565,7 +588,17 @@ failing doesn't stop the others; the exit status reports it. Backups of a non-lo
 `tmp/<tool>_<server>_<timestamp>.py`. Note that pushing a tool that migrates its database (like `agent_notes`)
 upgrades the notes database on *that* server the first time it runs there.
 
-**`push_tool.py` only updates a tool that already exists in OWUI — it can't create one.** For a
+**Generated tools.** `agent_notes` and `agent_notes_curation` are generated: run `python3 scripts/build_agent_notes.py`
+before pushing them (the tests fail if they're stale).
+
+**`--create`.** Without it `push_tool.py` only updates a tool that already exists in OWUI. With `--create`, a tool the
+server doesn't have yet is created (`POST /api/v1/tools/create`; id = the file name, name from the `title:` header,
+private to the API key's account — share it or attach it to models in the web UI afterwards). Tools only, not Functions.
+`--dry-run` shows what would be created. First deploy of the curation tool:
+`python3 scripts/push_tool.py agent_notes_curation --server all --create`, then (local) add its id to `secrets.md`
+as `agent_notes_curation: agent_notes_curation`.
+
+**Without `--create`, `push_tool.py` can't create a tool.** For a
 brand-new tool (like `comfy_sdxl_poses` the first time), import it once through OWUI's web UI
 (Workspace → Tools → "+" → paste `src/<name>.py`'s content, or Import), copy the id OWUI assigns
 it into your local `secrets.md`, and `push_tool.py` can update it like the others from then on.

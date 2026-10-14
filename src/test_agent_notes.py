@@ -11,7 +11,7 @@ import unittest
 from typing import Optional
 from pathlib import Path
 
-import agent_notes as mod
+import agent_notes_full as mod  # the single source; the two deployable tools are generated from it (see test_agent_notes_split)
 
 
 class NotesTestCase(unittest.TestCase):
@@ -370,7 +370,7 @@ class ListAndSearchTests(NotesTestCase):
     def test_rank_and_web_style_reads_do_not_count(self):
         self.create("n", "one")
         self.run_async(self.tool.agent_notes_rank_entries("n", "most_popular"))
-        import agent_notes as m
+        import agent_notes_full as m
         m.read_note_db(self.db, "n", 50)  # what notes_web uses
         self.assertEqual(self.hits(), (0, [0]))
 
