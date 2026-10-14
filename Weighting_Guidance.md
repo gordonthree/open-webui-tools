@@ -44,9 +44,9 @@ In my own persona notes ("<Name> - Identity", "- Psychology", and so on) the wei
 9-10 defining, 7-8 central, 5 ordinary, 3 or lower occasional or situational. It is not good or bad there.
 ```
 
-### The rating pass (one note per session)
+### The rating pass (one small chunk per session)
 
-Give this as the instruction for a session, naming the note. Run it per note until the notes are done.
+Give this as the instruction for a session, naming the note (and, after the first chunk, the entry number to start before). Repeat until the note is done.
 
 ```
 Rating pass for the note "<note name>". Use agent_notes_set_weight only; do not edit or add entries.
