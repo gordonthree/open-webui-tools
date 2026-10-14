@@ -317,16 +317,40 @@ within 15 minutes of the last, with no successful write to that note in between.
 `MAX_CONTINUATION_ENTRIES` entries is still refused and isn't counted. The counts live in memory (OWUI keeps the loaded tool cached while its source is unchanged), so a restart or a new
 push just resets them.
 
-Popularity and weight (v1.9.0): `note_id.hits` and `note_data.hits` count reads; `note_data.weight` (0–100, default
-50, enforced by a `CHECK`) is a rating a model sets with `agent_notes_set_weight` — lower for entries it judges
-negative, higher for positive. A "read" is counted by `agent_notes_read` (the note, plus each entry returned),
-`agent_notes_read_tagged` (each note and entry actually delivered, after the size limit) and `agent_notes_search`
-(each matching entry; not the note). `agent_notes_rank_entries` and `notes_web.py` never count, so asking for the most
-popular entries doesn't make them more popular. A failed count is logged and never fails the read. Neither
-counter nor weight touches `updated_at`, so summaries don't go stale. Plain replies show an entry's `weight` only when it
-isn't 50; `verbose=true` adds `hits` and `weight` everywhere (and a Reads column in `agent_notes_list`). The web viewer
-shows each note's and entry's read count and weight and has reset buttons (per entry, and per note), no search yet.
-All three columns are added in place on first connect with defaults, so an older copy of the tool still works.
+Popularity and weight (v1.9.0, reworked in v1.12.0): `note_id.hits` and `note_data.hits` count reads. `note_data.weight` is
+how a model records a *feeling* about an entry: a score from **1 to 10, 5 neutral** (lower = negative or painful, higher = positive or
+joyful; the distance from 5 is how strong the memory is). It is stored as score × 10 in the existing 0–100 column
+(`CHECK`ed), so the default of 50 and every older value need no migration; a value between multiples of ten is shown
+rounded. The scale is converted at the database-function boundary (`create_note_db` etc. take and return scores;
+`weight_to_score()` converts a stored value for display, and the web viewer uses it). A coarse scale because a
+hundred-point one invites small models to pick arbitrary, inconsistent numbers.
+A "read" is counted by `agent_notes_read` (the note, plus each entry delivered, strong memories included; `count=false` skips it
+for routine sweeps) and `agent_notes_read_tagged` (each note and entry actually delivered). Search cards are *not* reads
+(a card is a few words of the text); fetching the entry with `agent_notes_read entry=N` is. `agent_notes_rank_entries` and
+`notes_web.py` never count either, so asking for the most popular entries doesn't make them more popular. A failed count is
+logged and never fails the read. Neither counter nor weight touches `updated_at`, so summaries don't go stale. Plain replies
+show an entry's `weight` only when it isn't 5; `verbose=true` adds `hits` and `weight` everywhere (and a Reads column in
+`agent_notes_list`). The web viewer shows each note's and entry's read count and score and has reset buttons.
+
+**Reading in tiers (v1.12.0).** `agent_notes_read` used to return the newest 50 entries (up to ~17,000 characters on the
+big notes - over half of an 8k context) and said nothing about the rest. Now a default read returns, in one reply kept to
+`READ_MAX_CHARS` (default 6000 characters):
+the `READ_DEFAULT_RECENT` (10) newest entries; plus under `strong_memories` up to `READ_STRONG_EACH` (5) of the note's strongest
+older *positive* memories (score ≥ `STRONG_HIGH`, default 7) and 5 *negative* ones (score ≤ `STRONG_LOW`, default 3), strongest first.
+Strength is distance from neutral in either direction, so a painful memory is as likely to come along as a joyful one.
+The size budget is shared out one entry at a time (newest, strongest positive, strongest negative, next newest...), so a tight
+budget still carries both kinds, and whole entries only. The reply says how many entries it left out. Other modes: `before=N` pages back
+(older than entry N, with where to continue), `entry="12, 15"` reads those entries in full (the follow-up to a search card, at most
+ten), `sample=N` returns N random entries from outside the newest ones, `count=false` keeps a sweep out of the popularity counts.
+`limit` still means "how many recent entries" (capped by `MAX_READ_ENTRIES`), so existing callers keep working.
+
+**Search is a card catalog (v1.12.0).** `agent_notes_search` no longer returns whole entries. It returns cards - note, entry
+number, score, date and a snippet of `SEARCH_SNIPPET_CHARS` (120) characters cut around the match - for entries containing *all*
+the query's words (any case), ordered by strength of feeling first (furthest score from neutral, either direction) and then
+newest, with `total_matching_entries`, `page=` for the rest, and `note=` to search one note. A search for a word that
+appears in hundreds of entries therefore surfaces the memories that mattered, cheaply; `agent_notes_read entry=N` then pulls the
+full text of the ones worth it. Notes whose name, comment or tags match are listed on the first page. (SQLite FTS5 relevance
+ranking is available in the OWUI container but would be ignored by this ordering, so matching is plain per-word `LIKE`.)
 
 `chain_id` is added in place on first connect (nullable, so an older copy of the tool can still write to the
 database; back it up first if it matters). v1.7.x briefly marked pieces with a trailing ` [continues at entry #N]`
@@ -341,23 +365,23 @@ summaries and bare entry-text strings. `verbose=true` restores the full detail.
 |---|---|
 | `agent_notes_help` | optional `topic`: `overview` (default), `find`, `read`, `write`, `long_text`, `organize`, `summaries` or `rating`; a unique prefix works. Returns a short guide (under ~1600 characters, written for small context windows) plus the other topic names. Limits and valve values in the text come from the code in force, and a test fails if any tool method isn't covered by some topic — so adding a method means adding it to `help_topics()` in `agent_notes.py` |
 | `agent_notes_list` | `limit` (default `20`, capped by `MAX_LIST_RESULTS`); `needs_summary=true` lists only notes with no summary or a stale one, skipping notes under the `MIN_SUMMARY_CHARS` valve (default 1000 characters of entry text). The table has a Summary column: none/current/stale/short (short = too small to need one) |
-| `agent_notes_read` | `name` (required); `limit` — most recent N entries, default/max `MAX_READ_ENTRIES` |
-| `agent_notes_create` | `name`, `text` (first entry) required; `comment` optional; `weight` (0–100, default 50) rates the entry; `continues=true` saves a text over 500 characters verbatim as several consecutive entries. Refuses if the name already exists — use `agent_notes_append` |
+| `agent_notes_read` | `name` (required); `limit` (recent entries, default `READ_DEFAULT_RECENT`, max `MAX_READ_ENTRIES`); `before`, `entry`, `sample`, `count`: see "Reading in tiers" above. Returns `entries` plus `strong_memories` |
+| `agent_notes_create` | `name`, `text` (first entry) required; `comment` optional; `weight` (1–10, default 5) rates the entry; `continues=true` saves a text over 500 characters verbatim as several consecutive entries. Refuses if the name already exists — use `agent_notes_append` |
 | `agent_notes_append` | `name`, `text` required; `continues=true` and `weight` as for create (every piece of a long text gets the weight) |
 | `agent_notes_edit_entry` | `name`, `entry_no` (e.g. `3` or `"#3"`), `text` — all required; `weight` optional (omitted = keep the current one) |
 | `agent_notes_delete_entry` | `name`, `entry_no` — both required. Other entries keep their numbers; numbers are never reused |
 | `agent_notes_update` | `name` required; any of `new_name`, `comment`, `clear_comment=true` (an empty `comment` means "unchanged", so clearing needs the flag), or `author_name` (re-attributes the note's starter, not its entries; alone it leaves `updated_at` alone so summaries stay current) |
 | `agent_notes_delete` | `name` required. Removes the note and all its entries, no confirmation |
-| `agent_notes_search` | `query` required; `limit` (default `10` per list, capped by `MAX_SEARCH_RESULTS`). Returns matching notes (name/comment) and matching entries, newest entries first |
+| `agent_notes_search` | `query` required; `limit` (cards per page, default `10`, capped by `MAX_SEARCH_RESULTS`), `page`, `note` (one note only). Returns cards, strongest feeling first then newest, plus matching notes |
 | `agent_notes_update_summary` | `name`, `summary` (≤500 chars, whitespace collapsed) required; `author_name` optional. Creates or replaces the note's one summary |
 | `agent_notes_search_summary` | `query` required; `limit` (default `10`, capped by `MAX_SEARCH_RESULTS`). Splits the query into words, any word can match a note name or summary, ranked by words matched; each result carries `stale` |
 | `agent_notes_delete_summary` | `name` required. Refuses if the note has no summary |
 | `agent_notes_add_tags` | `name`, `tags` (one, or comma-separated) required; `create=true` to make a new tag that resembles existing ones. Refuses a new tag that looks like an existing one (returns the similar tags), reuses one that matches ignoring case/hyphens/plurals; nothing is saved if any tag is refused. Max 10 tags per note, 40 chars each. Punctuation is cleaned rather than refused (`&` becomes `and`, apostrophes dropped, other symbols become hyphens) and the reply lists the change under `adjusted` |
 | `agent_notes_remove_tag` | `name`, `tag` required. A tag no note carries any more is deleted |
 | `agent_notes_read_tagged` | `tags` required (one or comma-separated); `match` = `any` (default, best match first) or `all`. Returns each matching note's tags, summary and newest entries within the `MAX_TAGGED_CHARS` valve (default 6000 characters): whole strings only, headings for all notes first, then entries newest-first rotating across the notes so one long note can't starve the rest. Reports `entries_not_shown` per note and `notes_left_out` |
-| `agent_notes_set_weight` | `name`, `entry_no` required, plus exactly one of `weight` (0–100) or `change` (signed amount, e.g. `-10`, clamped to 0–100). Doesn't alter text or `updated_at` |
+| `agent_notes_set_weight` | `name`, `entry_no` required, plus exactly one of `weight` (1–10) or `change` (signed amount, e.g. `-2`, clamped to 1–10; below -9 is refused). Doesn't alter text or `updated_at` |
 | `agent_notes_reset_hits` | `name` required; `entry_no` resets just that entry's read count, otherwise the note's count and all its entries' |
-| `agent_notes_rank_entries` | `name`, `by` required: `most_popular`, `least_popular`, `above_weight` or `below_weight` (the last two need `weight`; strict comparison, so `above_weight 50` = rated positive). `limit` (default `10`, capped by `MAX_SEARCH_RESULTS`). Ties go to the newest entry. Returns `weight` and `hits` with each entry and `total_matching`. Does not count as a read |
+| `agent_notes_rank_entries` | `name`, `by` required: `strongest` (strong memories on both sides, furthest from 5 first), `most_popular`, `least_popular`, `above_weight` or `below_weight` (the last two need `weight`; strict comparison, so `above_weight 5` = rated positive). `limit` (default `10`, capped by `MAX_SEARCH_RESULTS`). Ties go to the newest entry. Returns `weight` and `hits` with each entry and `total_matching`. Does not count as a read |
 | `agent_notes_list_tags` | optional `query`. Tags in use with note counts. `agent_notes_list` also takes `tag=` to filter, shows a Tags column and lists the tags in use |
 | `agent_notes_rename_tag` | `tag`, `new_tag` required; merges into `new_tag` if it already exists |
 

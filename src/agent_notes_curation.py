@@ -1,7 +1,7 @@
 """
 title: Agent Notes Curation
 author: Gordon
-version: 1.11.1
+version: 1.12.0
 description: The upkeep half of Agent Notes (it needs the Agent Notes tool too, and the same NOTES_DB_PATH valve):
     tags (agent_notes_add_tags/agent_notes_remove_tag/agent_notes_rename_tag), summaries
     (agent_notes_update_summary/agent_notes_delete_summary), renaming a note or changing its comment
@@ -40,9 +40,16 @@ NOTE_COMMENT_MAX = 500
 NOTE_TEXT_MAX = 500
 SUMMARY_MAX = 500
 AUTHOR_NAME_MAX = 60
-DEFAULT_WEIGHT = 50
+DEFAULT_WEIGHT = 50  # as stored: neutral
 WEIGHT_MIN = 0
 WEIGHT_MAX = 100
+# Models rate an entry on a coarse 1-10 scale (5 = neutral, lower = a negative memory, higher = a positive one; the distance from
+# 5 is how strong the feeling was). It is stored as score * 10 in the existing weight column, so older data and the default of 50
+# need no migration; anything stored between multiples of ten is shown rounded.
+SCORE_MIN = 1
+SCORE_MAX = 10
+SCORE_NEUTRAL = 5
+SCORE_STEP = 10
 HITS_DDL = "INTEGER NOT NULL DEFAULT 0 CHECK (hits >= 0)"
 WEIGHT_DDL = f"INTEGER NOT NULL DEFAULT {DEFAULT_WEIGHT} CHECK (weight BETWEEN {WEIGHT_MIN} AND {WEIGHT_MAX})"
 TAG_MAX = 40
@@ -348,11 +355,16 @@ def validate_timestamp(value: Any) -> Optional[str]:
     return moment.isoformat()
 
 
+def weight_to_score(stored: int) -> int:
+    """The 1-10 score a stored weight is shown as."""
+    return max(SCORE_MIN, min(SCORE_MAX, (int(stored) + SCORE_STEP // 2) // SCORE_STEP))
+
+
 def validate_weight(value: Any) -> Optional[int]:
-    """The weight a caller gave (0-100), or None when it was left out."""
-    number = _to_int(value, None, "weight", minimum=WEIGHT_MIN)
-    if number is not None and number > WEIGHT_MAX:
-        raise NoteError(f"weight must be between {WEIGHT_MIN} and {WEIGHT_MAX}, got {number}.")
+    """The 1-10 score a caller gave, or None when it was left out."""
+    number = _to_int(value, None, "weight", minimum=SCORE_MIN)
+    if number is not None and number > SCORE_MAX:
+        raise NoteError(f"weight must be a whole number from {SCORE_MIN} to {SCORE_MAX} (5 is neutral), got {number}.")
     return number
 
 
@@ -463,10 +475,10 @@ def _chain_marks(row: Any) -> Dict[str, Any]:
 
 
 def _score_marks(row: Any, verbose: bool) -> Dict[str, Any]:
-    """An entry's weight and read count for the model: both when verbose, otherwise only a weight someone deliberately set."""
+    """An entry's weight (as its 1-10 score) and read count for the model: both when verbose, otherwise only a weight someone deliberately set."""
     if verbose:
-        return {"hits": row["hits"], "weight": row["weight"]}
-    return {} if row["weight"] == DEFAULT_WEIGHT else {"weight": row["weight"]}
+        return {"hits": row["hits"], "weight": weight_to_score(row["weight"])}
+    return {} if row["weight"] == DEFAULT_WEIGHT else {"weight": weight_to_score(row["weight"])}
 
 
 def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: str, author: str, created_at: Optional[str] = None, weight: Optional[int] = None) -> Dict[str, Any]:
@@ -493,7 +505,7 @@ def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: st
                 )
                 conn.executemany(
                     "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id, chain_id, weight) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    [(cur.lastrowid, i, part, now, author_id, 1 if len(parts) > 1 else None, DEFAULT_WEIGHT if weight is None else weight) for i, part in enumerate(parts, 1)],
+                    [(cur.lastrowid, i, part, now, author_id, 1 if len(parts) > 1 else None, DEFAULT_WEIGHT if weight is None else weight * SCORE_STEP) for i, part in enumerate(parts, 1)],
                 )
         except sqlite3.IntegrityError:  # lost a race with another writer creating the same name
             raise _name_taken_error(name)
@@ -517,7 +529,7 @@ def append_entry_db(db_path: str, name: str, text: "str | List[str]", author: st
             author_id = _author_id(conn, author, _now_iso())
             conn.executemany(
                 "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id, chain_id, weight) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [(note["note_pk"], entry_no + i, part, now, author_id, entry_no if len(parts) > 1 else None, DEFAULT_WEIGHT if weight is None else weight) for i, part in enumerate(parts)],
+                [(note["note_pk"], entry_no + i, part, now, author_id, entry_no if len(parts) > 1 else None, DEFAULT_WEIGHT if weight is None else weight * SCORE_STEP) for i, part in enumerate(parts)],
             )
             # a backdated entry never moves the note's last-updated time backwards
             conn.execute(
@@ -582,7 +594,19 @@ def search_summaries_db(db_path: str, query: str, limit: int) -> "tuple[List[Any
         conn.close()
 
 
+def _note_extras(conn: sqlite3.Connection, note: sqlite3.Row) -> Dict[str, Any]:
+    """Who started a note, its tags and its summary - the parts of a read that don't depend on which entries are shown."""
+    starter = conn.execute("SELECT author_name FROM note_author WHERE author_id = ?", (note["author_id"],)).fetchone()
+    summary = conn.execute(
+        f"SELECT s.summary_text, s.last_summarized, a.author_name, {_STALE_SQL} AS stale "
+        "FROM note_summary s JOIN note_id n ON n.note_pk = s.note_pk LEFT JOIN note_author a ON a.author_id = s.author_id WHERE s.note_pk = ?",
+        (note["note_pk"],),
+    ).fetchone()
+    return {"note": note, "started_by": starter["author_name"] if starter else None, "tags": _note_tags(conn, note["note_pk"]), "summary": summary}
+
+
 def read_note_db(db_path: str, name: str, limit: int) -> Dict[str, Any]:
+    """The note and its `limit` most recent entries, oldest first (what notes_web.py shows)."""
     conn = notes_db_connect(db_path)
     try:
         note = _get_note(conn, name)
@@ -593,20 +617,58 @@ def read_note_db(db_path: str, name: str, limit: int) -> Dict[str, Any]:
             "ORDER BY d.created_at DESC, d.entry_no DESC LIMIT ?",
             (note["note_pk"], limit),
         ).fetchall()
-        starter = conn.execute("SELECT author_name FROM note_author WHERE author_id = ?", (note["author_id"],)).fetchone()
-        summary = conn.execute(
-            f"SELECT s.summary_text, s.last_summarized, a.author_name, {_STALE_SQL} AS stale "
-            "FROM note_summary s JOIN note_id n ON n.note_pk = s.note_pk LEFT JOIN note_author a ON a.author_id = s.author_id WHERE s.note_pk = ?",
-            (note["note_pk"],),
-        ).fetchone()
-        return {
-            "note": note,
-            "started_by": starter["author_name"] if starter else None,
-            "tags": _note_tags(conn, note["note_pk"]),
-            "summary": summary,
-            "total": total,
-            "entries": list(reversed(rows)),
-        }
+        return {**_note_extras(conn, note), "total": total, "entries": list(reversed(rows))}
+    finally:
+        conn.close()
+
+
+_ENTRY_COLUMNS = f"d.entry_no, d.note_text, d.created_at, d.edited_at, d.hits, d.weight, a.author_name, {_CHAIN_SQL}"
+_ENTRY_FROM = "FROM note_data d LEFT JOIN note_author a ON a.author_id = d.author_id"
+
+
+def read_view_db(
+    db_path: str, name: str, mode: str = "tiered", recent: int = 10, strong_each: int = 5, low: int = 3, high: int = 7,
+    before: Optional[int] = None, numbers: Optional[List[int]] = None, sample: int = 0,
+) -> Dict[str, Any]:
+    """One note, seen the way agent_notes_read shows it. mode:
+      tiered  the `recent` newest entries, plus up to `strong_each` strongest memories on each side (scores <= low, >= high) older than those
+      before  the `recent` entries just older than entry number `before`
+      entries the entries numbered `numbers` (anything, however old)
+      sample  `sample` random entries other than the `recent` newest
+    Entries come back oldest first; `positive`/`negative` (tiered only) strongest first."""
+    conn = notes_db_connect(db_path)
+    try:
+        note = _get_note(conn, name)
+        pk = note["note_pk"]
+        total = conn.execute("SELECT COUNT(*) FROM note_data WHERE note_pk = ?", (pk,)).fetchone()[0]
+
+        def fetch(where: str, params: list, order: str, limit: int) -> list:
+            return conn.execute(f"SELECT {_ENTRY_COLUMNS} {_ENTRY_FROM} WHERE d.note_pk = ? {where} ORDER BY {order} LIMIT ?", [pk] + params + [limit]).fetchall()
+
+        newest = lambda n: fetch("", [], "d.created_at DESC, d.entry_no DESC", n)  # noqa: E731
+        out: Dict[str, Any] = {**_note_extras(conn, note), "total": total, "positive": [], "negative": [], "not_found": [], "older_left": None}
+        if mode == "entries":
+            rows = fetch(f"AND d.entry_no IN ({','.join('?' * len(numbers))})", list(numbers), "d.entry_no", len(numbers))
+            out["not_found"] = sorted(set(numbers) - {r["entry_no"] for r in rows})
+            out["entries"] = rows
+        elif mode == "sample":
+            skip = [r["entry_no"] for r in newest(recent)]
+            rows = fetch(f"AND d.entry_no NOT IN ({','.join('?' * len(skip))})" if skip else "", skip, "RANDOM()", sample)
+            out["entries"] = sorted(rows, key=lambda r: r["entry_no"])
+        elif mode == "before":
+            rows = fetch("AND d.entry_no < ?", [before], "d.entry_no DESC", recent)
+            out["entries"] = list(reversed(rows))
+            if rows:
+                out["older_left"] = conn.execute("SELECT COUNT(*) FROM note_data WHERE note_pk = ? AND entry_no < ?", (pk, rows[-1]["entry_no"])).fetchone()[0]
+        else:
+            rows = newest(recent)
+            out["entries"] = list(reversed(rows))
+            skip = [r["entry_no"] for r in rows]
+            exclude = f"AND d.entry_no NOT IN ({','.join('?' * len(skip))})" if skip else ""
+            if strong_each > 0:
+                out["positive"] = fetch(f"{exclude} AND {_SCORE_SQL} >= ?", skip + [high], f"d.weight DESC, d.created_at DESC", strong_each)
+                out["negative"] = fetch(f"{exclude} AND {_SCORE_SQL} <= ?", skip + [low], f"d.weight ASC, d.created_at DESC", strong_each)
+        return out
     finally:
         conn.close()
 
@@ -699,51 +761,83 @@ def reset_hits_db(db_path: str, name: str, entry_no: Optional[int] = None) -> Di
 
 
 def set_weight_db(db_path: str, name: str, entry_no: int, weight: Optional[int], change: Optional[int]) -> Dict[str, Any]:
-    """Set an entry's weight outright, or move it by a signed amount (kept within WEIGHT_MIN..WEIGHT_MAX). Not a content
-    change: updated_at is left alone."""
+    """Set an entry's score (1-10) outright, or move it by a signed amount (kept within 1-10). Not a content change: updated_at
+    is left alone."""
     if (weight is None) == (change is None):
-        raise NoteError("Give exactly one of weight (the new value, 0-100) or change (an amount to add, such as 10 or -10).")
-    if weight is not None and not WEIGHT_MIN <= weight <= WEIGHT_MAX:
-        raise NoteError(f"weight must be between {WEIGHT_MIN} and {WEIGHT_MAX}, got {weight}.")
+        raise NoteError(f"Give exactly one of weight (the new score, {SCORE_MIN}-{SCORE_MAX}) or change (an amount to add, such as 2 or -2).")
+    if weight is not None and not SCORE_MIN <= weight <= SCORE_MAX:
+        raise NoteError(f"weight must be between {SCORE_MIN} and {SCORE_MAX} (5 is neutral), got {weight}.")
     conn = notes_db_connect(db_path)
     try:
         with _write_txn(conn):
             note = _get_note(conn, name)
             entry = _get_entry(conn, note, entry_no)
-            wanted = weight if weight is not None else entry["weight"] + change
-            new = max(WEIGHT_MIN, min(WEIGHT_MAX, wanted))
-            conn.execute("UPDATE note_data SET weight = ? WHERE note_pk = ? AND entry_no = ?", (new, note["note_pk"], entry_no))
-        out = {"note_name": note["note_name"], "entry_no": entry_no, "old_weight": entry["weight"], "weight": new}
+            old = weight_to_score(entry["weight"])
+            wanted = weight if weight is not None else old + change
+            new = max(SCORE_MIN, min(SCORE_MAX, wanted))
+            conn.execute("UPDATE note_data SET weight = ? WHERE note_pk = ? AND entry_no = ?", (new * SCORE_STEP, note["note_pk"], entry_no))
+        out = {"note_name": note["note_name"], "entry_no": entry_no, "old_weight": old, "weight": new}
         if new != wanted:
-            out["note"] = f"{wanted} is outside {WEIGHT_MIN}-{WEIGHT_MAX}, so the weight was set to {new}."
+            out["note"] = f"{wanted} is outside {SCORE_MIN}-{SCORE_MAX}, so the weight was set to {new}."
         return out
     finally:
         conn.close()
 
 
-# by -> (extra WHERE on the entry, ORDER BY); ties always put the newest entry first
-RANK_MODES = {
-    "most_popular": ("", "d.hits DESC"),
-    "least_popular": ("", "d.hits ASC"),
-    "above_weight": ("AND d.weight > ?", "d.weight DESC"),
-    "below_weight": ("AND d.weight < ?", "d.weight ASC"),
-}
+# An entry's 1-10 score in SQL, and how far it is from neutral. Strong = at or beyond a cutoff on either side.
+_SCORE_SQL = f"((d.weight + {SCORE_STEP // 2}) / {SCORE_STEP})"
+_STRENGTH_SQL = f"ABS(d.weight - {DEFAULT_WEIGHT})"
+RANK_MODES = ("most_popular", "least_popular", "above_weight", "below_weight", "strongest")
 
 
-def rank_entries_db(db_path: str, name: str, by: str, limit: int, weight: Optional[int] = None) -> Dict[str, Any]:
-    where, order = RANK_MODES[by]
-    extra = [weight] if where else []
+def rank_entries_db(db_path: str, name: str, by: str, limit: int, weight: Optional[int] = None, low: int = 3, high: int = 7) -> Dict[str, Any]:
+    """by: most_popular / least_popular (read count), above_weight / below_weight (strictly, against the 1-10 score `weight`),
+    strongest (scores at or below `low` or at or above `high`, furthest from neutral first). Ties go to the newest entry."""
+    where, params, order = "", [], "d.hits DESC"
+    if by == "least_popular":
+        order = "d.hits ASC"
+    elif by == "above_weight":
+        where, params, order = f"AND {_SCORE_SQL} > ?", [weight], "d.weight DESC"
+    elif by == "below_weight":
+        where, params, order = f"AND {_SCORE_SQL} < ?", [weight], "d.weight ASC"
+    elif by == "strongest":
+        where, params, order = f"AND ({_SCORE_SQL} <= ? OR {_SCORE_SQL} >= ?)", [low, high], f"{_STRENGTH_SQL} DESC"
     conn = notes_db_connect(db_path)
     try:
         note = _get_note(conn, name)
-        total = conn.execute(f"SELECT COUNT(*) FROM note_data d WHERE d.note_pk = ? {where}", [note["note_pk"]] + extra).fetchone()[0]
+        total = conn.execute(f"SELECT COUNT(*) FROM note_data d WHERE d.note_pk = ? {where}", [note["note_pk"]] + params).fetchone()[0]
         rows = conn.execute(
             f"SELECT d.entry_no, d.note_text, d.created_at, d.hits, d.weight, a.author_name, {_CHAIN_SQL} FROM note_data d "
             f"LEFT JOIN note_author a ON a.author_id = d.author_id WHERE d.note_pk = ? {where} "
             f"ORDER BY {order}, d.created_at DESC, d.entry_no DESC LIMIT ?",
-            [note["note_pk"]] + extra + [limit],
+            [note["note_pk"]] + params + [limit],
         ).fetchall()
         return {"note": note, "total": total, "entries": rows}
+    finally:
+        conn.close()
+
+
+def search_cards_db(db_path: str, query: str, limit: int, offset: int = 0, note: Optional[str] = None) -> "tuple[int, List[Any]]":
+    """Entries whose text contains every word of the query (optionally only in one note), strongest feeling first - the furthest
+    score from neutral, either way - then newest. Returns (how many match in all, the requested page)."""
+    words = list(dict.fromkeys(query.lower().split()))[:8]
+    if not words:
+        raise NoteError("query is required.")
+    where = " AND ".join("d.note_text LIKE ? ESCAPE '\\'" for _ in words)
+    params: List[Any] = [f"%{_like_escape(w)}%" for w in words]
+    conn = notes_db_connect(db_path)
+    try:
+        if note is not None:
+            where += " AND d.note_pk = ?"
+            params.append(_get_note(conn, note)["note_pk"])
+        total = conn.execute(f"SELECT COUNT(*) FROM note_data d WHERE {where}", params).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT n.note_name, d.entry_no, d.note_text, d.created_at, d.hits, d.weight, a.author_name FROM note_data d "
+            f"JOIN note_id n ON n.note_pk = d.note_pk LEFT JOIN note_author a ON a.author_id = d.author_id WHERE {where} "
+            f"ORDER BY {_STRENGTH_SQL} DESC, d.created_at DESC, d.entry_no DESC LIMIT ? OFFSET ?",
+            params + [limit, offset],
+        ).fetchall()
+        return total, rows
     finally:
         conn.close()
 
@@ -758,7 +852,7 @@ def edit_entry_db(db_path: str, name: str, entry_no: str, text: str, weight: Opt
             now = _now_iso()
             conn.execute("UPDATE note_data SET note_text = ?, edited_at = ? WHERE note_pk = ? AND entry_no = ?", (text, now, note["note_pk"], entry_no))
             if weight is not None:
-                conn.execute("UPDATE note_data SET weight = ? WHERE note_pk = ? AND entry_no = ?", (weight, note["note_pk"], entry_no))
+                conn.execute("UPDATE note_data SET weight = ? WHERE note_pk = ? AND entry_no = ?", (weight * SCORE_STEP, note["note_pk"], entry_no))
             conn.execute("UPDATE note_id SET updated_at = ? WHERE note_pk = ?", (now, note["note_pk"]))
         return {"note_name": note["note_name"], "entry_no": entry_no, "edited_at": now, **({"weight": weight} if weight is not None else {})}
     finally:
@@ -982,7 +1076,7 @@ def tagged_notes_db(db_path: str, tags: List[str], match_all: bool) -> "tuple[Li
             notes.append({
                 "note_name": r["note_name"], "tags": note_tags, "matched_tags": [t for t in note_tags if t in found],
                 "summary": summary["summary_text"] if summary else None,
-                "entries": [{"entry_no": e["entry_no"], "author": e["author_name"] or "unknown", "created_at": e["created_at"], "text": e["note_text"], "hits": e["hits"], "weight": e["weight"], **_chain_marks(e)} for e in entries],
+                "entries": [{"entry_no": e["entry_no"], "author": e["author_name"] or "unknown", "created_at": e["created_at"], "text": e["note_text"], "hits": e["hits"], "weight": weight_to_score(e["weight"]), **_chain_marks(e)} for e in entries],
                 "hits": r["hits"],
             })
         return notes, found, missing
@@ -1009,7 +1103,7 @@ def _shape_tagged(note: Dict[str, Any], verbose: bool) -> Dict[str, Any]:
     shaped["entries"] = []
     for e in note["entries"]:
         extras = {k: e[k] for k in ("continues_from", "continues_at") if k in e}
-        if e["weight"] != DEFAULT_WEIGHT:
+        if e["weight"] != SCORE_NEUTRAL:
             extras["weight"] = e["weight"]
         shaped["entries"].append({"text": e["text"], **extras} if extras else e["text"])
     return shaped
@@ -1092,7 +1186,10 @@ def _error(e: Exception) -> Dict[str, Any]:
 HELP_ORDER = ["overview", "find", "read", "write", "long_text", "organize", "summaries", "rating"]
 
 
-def help_topics(read_cap: int, tagged_chars: int, search_cap: int, continuation: int, min_summary: int) -> Dict[str, "tuple[str, str]"]:
+def help_topics(
+    read_cap: int, tagged_chars: int, search_cap: int, continuation: int, min_summary: int,
+    recent: int = 10, strong_each: int = 5, low: int = 3, high: int = 7, read_chars: int = 6000,
+) -> Dict[str, "tuple[str, str]"]:
     """topic -> (what it covers, the guide). Numbers come from the limits in force, so the guide can't drift from the code.
     Each guide is short on purpose: the models reading it have small context windows."""
     return {
@@ -1111,19 +1208,22 @@ def help_topics(read_cap: int, tagged_chars: int, search_cap: int, continuation:
         "find": (
             "locating notes and entries",
             "agent_notes_list: every note, most recently changed first (tag= narrows it; needs_summary=true is for a summarizing agent).\n"
-            "agent_notes_search query: notes whose name, comment or tags match, and entries whose text matches, newest entries first.\n"
+            "agent_notes_search query: cards (note, entry number, score, the start of the text) for entries containing all your words, the strongest feelings first and then the newest; "
+            "it also lists notes whose name, comment or tags match. note= searches inside one note, page= shows more cards, and agent_notes_read with entry=N then reads a card's whole entry.\n"
             "agent_notes_search_summary query: finds the right note from words in its name or summary; the cheapest way to locate a note.\n"
             f"agent_notes_list_tags, then agent_notes_read_tagged tags: gathers everything about a subject (say tags \"identity, speech\") in one reply of at most about {tagged_chars} characters; "
             "it says what it left out.\n"
-            f"agent_notes_rank_entries: within ONE note, picks entries by popularity or weight (see topic rating). Search lists hold at most {search_cap} results; limit= asks for fewer.",
+            f"agent_notes_rank_entries: within ONE note, picks entries by feeling or popularity (see topic rating). A page of search cards holds at most {search_cap}; limit= asks for fewer.",
         ),
         "read": (
             "agent_notes_read and how to interpret its reply",
-            f"agent_notes_read name returns the comment, tags, summary and the entries oldest to newest, each with its entry_no. "
-            f"You get at most the {read_cap} most recent entries (limit= asks for fewer); the reply says when some were left out.\n"
-            "continues_at N on an entry means its text carries on in entry N; continues_from M means it follows entry M. Read such entries together as one text.\n"
-            "weight appears on an entry only when it is not the neutral 50. summary.stale=true means the note changed after the summary was written.\n"
-            "Reading counts toward the note's and the entries' popularity (see topic rating).",
+            f"agent_notes_read name returns the comment, tags, summary and entries oldest to newest, each with its entry_no: the {recent} newest entries (limit= asks for a different number, at most {read_cap}) "
+            f"plus, under strong_memories, up to {strong_each} of the note's strongest older positive memories (score {high} or more) and {strong_each} negative ones (score {low} or less), "
+            f"so what mattered comes along without reading everything. The reply keeps to about {read_chars} characters and says how many entries it left out.\n"
+            "To go further: before=N pages back to entries older than #N; entry=N (or \"N, M\") reads those entries in full, for instance after a search card; sample=N brings back random older entries; "
+            "count=false keeps a routine sweep out of the popularity counts.\n"
+            "continues_at N on an entry means its text carries on in entry N; continues_from M means it follows entry M. Read such entries together as one text. "
+            "weight appears on an entry only when it is not the neutral 5. summary.stale=true means the note changed after the summary was written.",
         ),
         "write": (
             "creating notes and adding, fixing or removing entries",
@@ -1132,7 +1232,7 @@ def help_topics(read_cap: int, tagged_chars: int, search_cap: int, continuation:
             f"Limits: note name {NOTE_NAME_MAX} characters, comment {NOTE_COMMENT_MAX}, each entry {NOTE_TEXT_MAX}; a longer one is refused and nothing is saved. "
             "For longer text see topic long_text.\n"
             "author_name= records who wrote it (blank = your model name). created_at= is only for copying in an older note with its real date; leave it blank for anything new. "
-            "weight= (0-100) rates an entry as you write it (see topic rating).",
+            "weight= (1-10, 5 is neutral) rates an entry as you write it (see topic rating).",
         ),
         "long_text": (
             "saving text longer than one entry, word for word",
@@ -1158,11 +1258,12 @@ def help_topics(read_cap: int, tagged_chars: int, search_cap: int, continuation:
             f"(notes under {min_summary} characters of text are shown as short and left out: just read them). Describe the note, do not copy it.",
         ),
         "rating": (
-            "weight, popularity and ranking entries",
-            f"WEIGHT: every entry has a weight from {WEIGHT_MIN} to {WEIGHT_MAX}, starting at {DEFAULT_WEIGHT} (neutral). Lower it for entries you judge negative, unfavourable or unreliable; raise it for positive or reliable ones. "
-            'agent_notes_set_weight name, entry_no with weight= (new value) or change= (add or subtract, e.g. -10); you can also pass weight= when you create, append or edit.\n'
-            "POPULARITY: notes and entries count how often they are read (agent_notes_read, agent_notes_read_tagged, and search results). agent_notes_reset_hits name (Agent Notes Curation tool) clears a note's counts, or one entry's with entry_no=.\n"
-            'RANKING: agent_notes_rank_entries name, by= "most_popular", "least_popular", "above_weight" or "below_weight" (the last two need weight=; the comparison is strict, so above_weight 50 means rated positive), limit= how many. '
+            "feelings (weight), popularity and ranking entries",
+            f"WEIGHT: rate an entry from {SCORE_MIN} to {SCORE_MAX}; it starts at {SCORE_NEUTRAL} (nothing special). Go lower for a negative or painful memory ({SCORE_MIN} is the worst) and higher for a positive or joyful one ({SCORE_MAX} is the best): "
+            "the further from 5, the stronger the memory, and strong memories are the ones agent_notes_read always brings along. "
+            'agent_notes_set_weight name, entry_no with weight= (the new score) or change= (add or subtract, e.g. 2 or -2); you can also pass weight= when you create, append or edit.\n'
+            "POPULARITY: notes and entries count how often they are read (agent_notes_read and agent_notes_read_tagged; search cards do not count). agent_notes_reset_hits name (Agent Notes Curation tool) clears a note's counts, or one entry's with entry_no=.\n"
+            'RANKING: agent_notes_rank_entries name, by= "strongest" (both ends, furthest from 5 first), "above_weight" or "below_weight" (need weight=; strict, so above_weight 5 means rated positive), "most_popular" or "least_popular"; limit= how many. '
             "Looking entries up this way does not count as reading them.",
         ),
     }
@@ -1215,6 +1316,48 @@ def plan_entries(key: tuple, text: Any, continues: Any, max_parts: int, auto_aft
         _overlong[key] = (attempt, now)
     validate_text(text)  # raises the usual too-long refusal
     raise AssertionError("unreachable: validate_text refuses any text over the limit")
+
+
+def parse_entry_numbers(value: Any, cap: int = 10) -> Optional[List[int]]:
+    """Entry numbers from "12", "#12" or "12, 15 17" (at most `cap`), or None when nothing was given."""
+    if is_unset(value):
+        return None
+    numbers = [int(x) for x in re.findall(r"\d+", str(value))]
+    if not numbers:
+        raise NoteError(f'entry must be one or more entry numbers, such as 12 or "12, 15", got {value!r}.')
+    return list(dict.fromkeys(numbers))[:cap]
+
+
+def flag_default_true(value: Any) -> bool:
+    """An optional true/false that means true unless it clearly says no (models pass "" for 'default')."""
+    return not (value is False or (isinstance(value, str) and value.strip().lower() in {"false", "0", "no", "n", "off"}))
+
+
+def make_snippet(text: str, words: List[str], width: int) -> str:
+    """At most `width` characters of the entry, whitespace collapsed, starting a little before the first word that matched."""
+    flat = " ".join((text or "").split())
+    if len(flat) <= width:
+        return flat
+    hit = min((i for i in (flat.lower().find(w) for w in words) if i >= 0), default=0)
+    start = 0 if hit < width // 3 else flat.rfind(" ", 0, hit - width // 3) + 1
+    piece = flat[start:start + width].rstrip()
+    return ("\N{HORIZONTAL ELLIPSIS}" if start else "") + piece + ("\N{HORIZONTAL ELLIPSIS}" if start + width < len(flat) else "")
+
+
+def fit_entries(groups: List[List[Any]], budget: int) -> List[List[Any]]:
+    """Keep whole entries, in the order given (each group's list is already in preference order, groups interleave one entry at a
+    time), until the character budget is used; always at least the first entry. Returns the kept entries per group."""
+    kept: List[List[Any]] = [[] for _ in groups]
+    used = 0
+    for rank in range(max((len(g) for g in groups), default=0)):
+        for index, group in enumerate(groups):
+            if rank < len(group):
+                cost = len(group[rank]["note_text"]) + 60
+                if used + cost > budget and used > 0:
+                    return kept
+                used += cost
+                kept[index].append(group[rank])
+    return kept
 
 
 # --------------------------------------------------------------------------- #

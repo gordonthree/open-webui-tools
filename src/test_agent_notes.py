@@ -107,7 +107,7 @@ class AppendTests(NotesTestCase):
         read = self.run_async(self.tool.agent_notes_read("log", 2))
         self.assertEqual([e["text"] for e in read["entries"]], ["e4", "e5"])
         self.assertEqual(read["total_entries"], 5)
-        self.assertIn("most recent", read["note"])
+        self.assertIn("Showing 2 recent of 5", read["note"])
 
     def test_read_limit_is_capped_by_valve(self):
         self.tool.valves.MAX_READ_ENTRIES = 2
@@ -292,15 +292,19 @@ class ListAndSearchTests(NotesTestCase):
         res = self.run_async(self.tool.agent_notes_search("DRAGON"))
         self.assertEqual({n["note_name"] for n in res["matching_notes"]}, {"dragons", "misc"})
         res = self.run_async(self.tool.agent_notes_search("wyrmling"))
-        self.assertEqual([(e["note_name"], e["entry_no"]) for e in res["matching_entries"]], [("dragons", 1)])
+        self.assertEqual([(e["note_name"], e["entry_no"]) for e in res["cards"]], [("dragons", 1)])
 
-    def test_search_lists_newest_entries_first(self):
-        self.create("a", "needle one")
-        self.run_async(self.tool.agent_notes_append("a", "needle two"))
-        self.create("b", "needle three")
-        self.run_async(self.tool.agent_notes_append("a", "needle four", created_at="2020-01-01"))
-        out = self.run_async(self.tool.agent_notes_search("needle"))
-        self.assertEqual([e["text"] for e in out["matching_entries"]], ["needle three", "needle two", "needle one", "needle four"])
+    def test_search_cards_put_the_strongest_feelings_first_then_the_newest(self):
+        self.create("a", "gordon one")
+        for text in ("gordon two", "gordon three", "gordon four"):
+            self.run_async(self.tool.agent_notes_append("a", text))
+        for no, w in (("2", "9"), ("3", "1")):
+            self.run_async(self.tool.agent_notes_set_weight("a", no, weight=w))
+        out = self.run_async(self.tool.agent_notes_search("gordon"))
+        self.assertEqual([c["entry_no"] for c in out["cards"]], [3, 2, 4, 1])  # 1 and 9 are equally strong, the newer first; then neutral, newest first
+        self.assertEqual([c["weight"] for c in out["cards"]], [1, 9, 5, 5])
+        self.assertEqual(set(out["cards"][0]), {"note_name", "entry_no", "weight", "date", "snippet"})
+        self.assertEqual(out["total_matching_entries"], 4)
 
     def test_continues_splits_long_text_verbatim_into_a_linked_chain(self):
         text = " ".join(f"word{i}" for i in range(300))  # ~2000 characters
@@ -316,13 +320,13 @@ class ListAndSearchTests(NotesTestCase):
         self.assertEqual([e.get("continues_from") for e in entries], [None, 1, 2, 3, 4, None, 6])
         self.assertEqual(self.sql("SELECT DISTINCT chain_id FROM note_data WHERE entry_no > 5"), [(6,)])
 
-    def test_ordinary_entries_carry_no_chain_fields_and_search_shows_links(self):
+    def test_ordinary_entries_carry_no_chain_fields_and_entry_reads_show_links(self):
         self.create("n", "plain")
         self.run_async(self.tool.agent_notes_append("n", "needle " * 100, continues=True))
         read = self.run_async(self.tool.agent_notes_read("n"))["entries"]
         self.assertEqual(set(read[0]), {"entry_no", "text"})
-        hits = self.run_async(self.tool.agent_notes_search("needle"))["matching_entries"]
-        self.assertEqual({h["entry_no"]: (h.get("continues_from"), h.get("continues_at")) for h in hits}, {2: (None, 3), 3: (2, None)})
+        fetched = self.run_async(self.tool.agent_notes_read("n", entry="2, 3"))["entries"]  # a card's follow-up read shows the links
+        self.assertEqual({h["entry_no"]: (h.get("continues_from"), h.get("continues_at")) for h in fetched}, {2: (None, 3), 3: (2, None)})
 
     def test_read_tagged_plain_keeps_chain_links_on_pieces_only(self):
         self.create("n", "plain")
@@ -347,11 +351,13 @@ class ListAndSearchTests(NotesTestCase):
         self.run_async(self.tool.agent_notes_read("n", limit="1"))  # entry 3
         self.assertEqual(self.hits(), (2, [0, 1, 2]))
 
-    def test_search_counts_entries_not_notes_and_leaves_updated_at_alone(self):
+    def test_search_cards_are_not_reads_but_fetching_an_entry_is(self):
         self.create("n", "needle")
         before = self.sql("SELECT updated_at FROM note_id")
         self.run_async(self.tool.agent_notes_search("needle"))
-        self.assertEqual(self.hits(), (0, [1]))
+        self.assertEqual(self.hits(), (0, [0]))
+        self.run_async(self.tool.agent_notes_read("n", entry="1"))
+        self.assertEqual(self.hits(), (1, [1]))
         self.assertEqual(self.sql("SELECT updated_at FROM note_id"), before)
 
     def test_read_tagged_counts_what_it_delivered(self):
@@ -397,41 +403,53 @@ class ListAndSearchTests(NotesTestCase):
         self.assertFalse(self.run_async(self.tool.agent_notes_reset_hits("n", "9"))["success"])
         self.assertFalse(self.run_async(self.tool.agent_notes_reset_hits("missing"))["success"])
 
-    def test_weight_defaults_to_50_and_can_be_set_or_nudged_within_0_to_100(self):
+    def test_weight_is_a_1_to_10_score_stored_times_ten_and_can_be_set_or_nudged(self):
         self.create("n", "one")
-        self.assertEqual(self.sql("SELECT weight FROM note_data")[0][0], 50)
-        self.assertEqual(self.run_async(self.tool.agent_notes_set_weight("n", "1", weight="80"))["weight"], 80)
-        out = self.run_async(self.tool.agent_notes_set_weight("n", "#1", change="-30"))
-        self.assertEqual((out["old_weight"], out["weight"]), (80, 50))
-        out = self.run_async(self.tool.agent_notes_set_weight("n", "1", change="+70"))
-        self.assertEqual(out["weight"], 100)
+        self.assertEqual(self.sql("SELECT weight FROM note_data")[0][0], 50)  # neutral, as before the 1-10 scale
+        self.assertEqual(self.run_async(self.tool.agent_notes_set_weight("n", "1", weight="8"))["weight"], 8)
+        self.assertEqual(self.sql("SELECT weight FROM note_data")[0][0], 80)
+        out = self.run_async(self.tool.agent_notes_set_weight("n", "#1", change="-3"))
+        self.assertEqual((out["old_weight"], out["weight"]), (8, 5))
+        out = self.run_async(self.tool.agent_notes_set_weight("n", "1", change="+9"))
+        self.assertEqual(out["weight"], 10)
         self.assertIn("note", out)  # said it clamped
-        for bad in ({"weight": "101"}, {"weight": "-1"}, {}, {"weight": "5", "change": "5"}, {"weight": "high"}):
-            self.assertFalse(self.run_async(self.tool.agent_notes_set_weight("n", "1", **bad))["success"], bad)
+        out = self.run_async(self.tool.agent_notes_set_weight("n", "1", change="-9"))
+        self.assertEqual(out["weight"], 1)
+        out = self.run_async(self.tool.agent_notes_set_weight("n", "1", change="-3"))  # already at the bottom: stays there
+        self.assertEqual(out["weight"], 1)
+        for bad in ({"weight": "11"}, {"weight": "0"}, {"weight": "-1"}, {}, {"weight": "5", "change": "1"}, {"weight": "high"}, {"change": "-20"}):
+            self.assertFalse(self.run_async(self.tool.agent_notes_set_weight("n", "1", **bad))["success"], bad)  # -20 on a 1-10 scale is a misunderstanding, so it is refused
         self.assertFalse(self.run_async(self.tool.agent_notes_set_weight("n", "7", weight="5"))["success"])
+
+    def test_scores_in_between_old_values_are_shown_rounded(self):
+        self.create("n", "one")
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE note_data SET weight = 65")  # a 0-100 value from before the 1-10 scale
+        conn.commit(); conn.close()
+        self.assertEqual(self.run_async(self.tool.agent_notes_read("n"))["entries"][0]["weight"], 7)
 
     def test_weight_is_shown_plain_only_when_not_neutral_and_does_not_make_summaries_stale(self):
         self.create("n", "one")
         self.run_async(self.tool.agent_notes_append("n", "two"))
         self.run_async(self.tool.agent_notes_update_summary("n", "about stuff"))
-        self.run_async(self.tool.agent_notes_set_weight("n", "2", weight="20"))
+        self.run_async(self.tool.agent_notes_set_weight("n", "2", weight="2"))
         out = self.run_async(self.tool.agent_notes_read("n"))
-        self.assertEqual([e.get("weight") for e in out["entries"]], [None, 20])
+        self.assertEqual([e.get("weight") for e in out["entries"]], [None, 2])
         self.assertFalse(out["summary"]["stale"])
-        self.assertEqual(self.run_async(self.tool.agent_notes_read("n", verbose=True))["entries"][0]["weight"], 50)
+        self.assertEqual(self.run_async(self.tool.agent_notes_read("n", verbose=True))["entries"][0]["weight"], 5)
 
     def test_edit_keeps_weight_and_hits(self):
         self.create("n", "one")
-        self.run_async(self.tool.agent_notes_set_weight("n", "1", weight="10"))
+        self.run_async(self.tool.agent_notes_set_weight("n", "1", weight="2"))
         self.run_async(self.tool.agent_notes_read("n"))
         self.run_async(self.tool.agent_notes_edit_entry("n", "1", "changed"))
-        self.assertEqual(self.sql("SELECT weight, hits FROM note_data"), [(10, 1)])
+        self.assertEqual(self.sql("SELECT weight, hits FROM note_data"), [(20, 1)])
 
     def make_ranked(self):
         self.create("n", "e1")
         for t in ("e2", "e3", "e4"):
             self.run_async(self.tool.agent_notes_append("n", t))
-        for no, w in (("1", 90), ("2", 20), ("3", 60)):  # e4 stays 50
+        for no, w in (("1", 9), ("2", 2), ("3", 6)):  # e4 stays 5
             self.run_async(self.tool.agent_notes_set_weight("n", no, weight=str(w)))
         conn = sqlite3.connect(self.db)
         for no, count in ((1, 3), (3, 1), (4, 1)):  # e2 never read
@@ -450,23 +468,31 @@ class ListAndSearchTests(NotesTestCase):
 
     def test_rank_by_weight_is_strict_and_ordered(self):
         self.make_ranked()
-        self.assertEqual(self.rank(by="above_weight", weight="50")[0], [1, 3])
-        self.assertEqual(self.rank(by="below_weight", weight="50")[0], [2])
-        self.assertEqual(self.rank(by="above_weight", weight="50", limit="1")[0], [1])
-        ids, out = self.rank(by="above_weight", weight="50", limit="1")
+        self.assertEqual(self.rank(by="above_weight", weight="5")[0], [1, 3])
+        self.assertEqual(self.rank(by="below_weight", weight="5")[0], [2])
+        self.assertEqual(self.rank(by="above_weight", weight="5", limit="1")[0], [1])
+        ids, out = self.rank(by="above_weight", weight="5", limit="1")
         self.assertEqual(out["total_matching"], 2)
         self.assertIn("note", out)
-        self.assertEqual(self.rank(by="Below Weight", weight="100")[0], [2, 4, 3, 1])
-        self.assertEqual(self.rank(by="above_weight", weight="95")[0], [])
+        self.assertEqual(self.rank(by="Below Weight", weight="10")[0], [2, 4, 3, 1])
+        self.assertEqual(self.rank(by="above_weight", weight="9")[0], [])
         entry = self.run_async(self.tool.agent_notes_rank_entries("n", "most_popular", limit="1"))["entries"][0]
-        self.assertEqual((entry["weight"], entry["hits"]), (90, 3))
+        self.assertEqual((entry["weight"], entry["hits"]), (9, 3))
 
     def test_rank_arguments_are_checked(self):
         self.make_ranked()
-        for kw in ({"by": "newest"}, {"by": "above_weight"}, {"by": "below_weight", "weight": "101"}, {"by": "most_popular", "limit": "0"}):
+        for kw in ({"by": "newest"}, {"by": "above_weight"}, {"by": "below_weight", "weight": "11"}, {"by": "most_popular", "limit": "0"}):
             self.assertFalse(self.run_async(self.tool.agent_notes_rank_entries("n", **kw))["success"], kw)
         self.assertFalse(self.run_async(self.tool.agent_notes_rank_entries("nope", "most_popular"))["success"])
         self.assertTrue(self.run_async(self.tool.agent_notes_rank_entries("n", "most_popular", weight="999"))["success"])  # weight ignored
+
+    def test_rank_strongest_takes_both_ends_furthest_from_neutral_first(self):
+        self.make_ranked()  # scores: e1 9, e2 2, e3 6, e4 5
+        ids, out = self.rank(by="strongest")
+        self.assertEqual(ids, [1, 2])  # 9 is 4 away, 2 is 3 away; 6 and 5 are not strong
+        self.assertEqual(out["total_matching"], 2)
+        self.tool.valves.STRONG_HIGH = 6  # lowering the cutoff lets the 6 in
+        self.assertEqual(self.rank(by="strongest")[0], [1, 2, 3])
 
     def test_upgrade_adds_the_score_columns_and_old_rows_get_defaults(self):
         self.create("old", "plain")
@@ -478,7 +504,7 @@ class ListAndSearchTests(NotesTestCase):
         mod.notes_db_connect(self.db).close()  # connecting is what upgrades
         self.assertEqual(self.hits("old"), (0, [0]))
         self.assertEqual(self.sql("SELECT weight FROM note_data"), [(50,)])
-        self.assertTrue(self.run_async(self.tool.agent_notes_set_weight("old", "1", weight="70"))["success"])
+        self.assertTrue(self.run_async(self.tool.agent_notes_set_weight("old", "1", weight="7"))["success"])
 
     def test_database_rejects_out_of_range_weight(self):
         self.create("n", "one")
@@ -491,26 +517,26 @@ class ListAndSearchTests(NotesTestCase):
         self.assertIn("| Reads |", self.run_async(self.tool.agent_notes_list(verbose=True))["table"])
 
     def test_create_append_and_edit_can_set_the_weight(self):
-        made = self.run_async(self.tool.agent_notes_create("n", "one", weight="80"))
-        self.assertEqual(made["weight"], 80)
+        made = self.run_async(self.tool.agent_notes_create("n", "one", weight="8"))
+        self.assertEqual(made["weight"], 8)
         self.run_async(self.tool.agent_notes_append("n", "two"))  # no weight: neutral
-        self.assertEqual(self.run_async(self.tool.agent_notes_append("n", "three", weight=" 10 "))["weight"], 10)
-        self.run_async(self.tool.agent_notes_append("n", "word " * 300, continues=True, weight="30"))  # 3 pieces
+        self.assertEqual(self.run_async(self.tool.agent_notes_append("n", "three", weight=" 1 "))["weight"], 1)
+        self.run_async(self.tool.agent_notes_append("n", "word " * 300, continues=True, weight="3"))  # 3 pieces
         self.assertEqual([r[0] for r in self.sql("SELECT weight FROM note_data ORDER BY entry_no")], [80, 50, 10, 30, 30, 30])
-        out = self.run_async(self.tool.agent_notes_edit_entry("n", "2", "two, revised", weight="95"))
-        self.assertEqual(out["weight"], 95)
+        out = self.run_async(self.tool.agent_notes_edit_entry("n", "2", "two, revised", weight="9"))
+        self.assertEqual(out["weight"], 9)
         self.run_async(self.tool.agent_notes_edit_entry("n", "2", "two, again"))  # no weight: kept
         self.run_async(self.tool.agent_notes_edit_entry("n", "2", "two, again", weight=""))
-        self.assertEqual(self.sql("SELECT weight, note_text FROM note_data WHERE entry_no = 2"), [(95, "two, again")])
+        self.assertEqual(self.sql("SELECT weight, note_text FROM note_data WHERE entry_no = 2"), [(90, "two, again")])
 
     def test_bad_weight_on_write_saves_nothing(self):
         self.create("n", "one")
         for call in (
-            lambda: self.tool.agent_notes_append("n", "x", weight="101"),
+            lambda: self.tool.agent_notes_append("n", "x", weight="11"),
             lambda: self.tool.agent_notes_append("n", "x", weight="-5"),
             lambda: self.tool.agent_notes_append("n", "x", weight="heavy"),
             lambda: self.tool.agent_notes_create("m", "x", weight="500"),
-            lambda: self.tool.agent_notes_edit_entry("n", "1", "changed", weight="101"),
+            lambda: self.tool.agent_notes_edit_entry("n", "1", "changed", weight="11"),
         ):
             self.assertFalse(self.run_async(call())["success"])
         self.assertEqual(self.sql("SELECT note_text, weight FROM note_data"), [("one", 50)])
@@ -561,7 +587,11 @@ class ListAndSearchTests(NotesTestCase):
         self.tool.valves.MAX_CONTINUATION_ENTRIES = 3
         self.tool.valves.MAX_READ_ENTRIES = 17
         self.assertIn("At most 3 entries (about 1500 characters)", self.run_async(self.tool.agent_notes_help("long_text"))["guide"])
-        self.assertIn("17 most recent", self.run_async(self.tool.agent_notes_help("read"))["guide"])
+        self.tool.valves.READ_DEFAULT_RECENT, self.tool.valves.READ_STRONG_EACH = 8, 4
+        self.tool.valves.STRONG_LOW, self.tool.valves.STRONG_HIGH, self.tool.valves.READ_MAX_CHARS = 2, 8, 4000
+        guide = self.run_async(self.tool.agent_notes_help("read"))["guide"]
+        for fact in ("at most 17", "the 8 newest entries", "up to 4 of the note's strongest", "score 8 or more", "score 2 or less", "about 4000 characters"):
+            self.assertIn(fact, guide)
         self.assertIn(str(mod.NOTE_TEXT_MAX), self.run_async(self.tool.agent_notes_help("write"))["guide"])
 
     def test_help_does_not_touch_the_database(self):
@@ -667,6 +697,162 @@ class ListAndSearchTests(NotesTestCase):
             self.assertIn("the limit is 500", refused["error"])
         self.assertEqual(mod._overlong, {})
 
+    # ---- the tiered read, paging, entry fetch, sampling, the size budget and card search ----
+
+    def fill(self, count, name="n", text=lambda i: f"e{i}", scores=None):
+        """A note of `count` entries 'e1'..; scores maps entry number -> 1-10 score (stored times ten, as the tool does)."""
+        self.create(name, text(1))
+        for i in range(2, count + 1):
+            self.run_async(self.tool.agent_notes_append(name, text(i)))
+        if scores:
+            conn = sqlite3.connect(self.db)
+            for no, score in scores.items():
+                conn.execute("UPDATE note_data SET weight = ? WHERE entry_no = ?", (score * 10, no))
+            conn.commit(); conn.close()
+
+    def read(self, **kw):
+        out = self.run_async(self.tool.agent_notes_read("n", **kw))
+        self.assertTrue(out["success"], out)
+        return out
+
+    def test_read_gives_recent_entries_plus_the_strongest_older_memories_each_side(self):
+        self.fill(30, scores={3: 9, 5: 1, 7: 8, 9: 2, 11: 6, 29: 10})  # 11 is only mildly positive; 29 is strong but already recent
+        out = self.read()
+        self.assertEqual([e["text"] for e in out["entries"]], [f"e{i}" for i in range(21, 31)])
+        self.assertEqual([e["entry_no"] for e in out["strong_memories"]["positive"]], [3, 7])  # strongest first
+        self.assertEqual([e["entry_no"] for e in out["strong_memories"]["negative"]], [5, 9])
+        self.assertEqual([e["weight"] for e in out["strong_memories"]["positive"]], [9, 8])
+        self.assertEqual(out["total_entries"], 30)
+        self.assertIn("16 not shown", out["note"])
+        self.assertIn("before=21", out["note"])
+        self.assertEqual(out["entries"][8]["weight"], 10)  # entry 29: shown once, among the recent
+
+    def test_strong_memories_are_capped_per_side_and_can_be_switched_off(self):
+        self.fill(30, scores={3: 9, 7: 8, 5: 1, 9: 2})
+        self.tool.valves.READ_STRONG_EACH = 1
+        out = self.read()
+        self.assertEqual(([e["entry_no"] for e in out["strong_memories"]["positive"]], [e["entry_no"] for e in out["strong_memories"]["negative"]]), ([3], [5]))
+        self.tool.valves.READ_STRONG_EACH = 0
+        self.assertNotIn("strong_memories", self.read())
+
+    def test_strong_cutoffs_are_valves_and_a_small_note_is_shown_whole(self):
+        self.fill(30, scores={3: 6})
+        self.tool.valves.STRONG_HIGH = 6
+        self.assertEqual([e["entry_no"] for e in self.read()["strong_memories"]["positive"]], [3])
+        self.fill(4, name="small")
+        out = self.run_async(self.tool.agent_notes_read("small"))
+        self.assertEqual([e["text"] for e in out["entries"]], ["e1", "e2", "e3", "e4"])
+        self.assertNotIn("note", out)  # nothing left out, nothing to say
+
+    def test_read_limit_sets_the_recent_count_and_the_valve_caps_it(self):
+        self.fill(30)
+        self.assertEqual(len(self.read(limit="4")["entries"]), 4)
+        self.tool.valves.MAX_READ_ENTRIES = 6
+        self.assertEqual(len(self.read(limit="25")["entries"]), 6)
+        self.tool.valves.READ_DEFAULT_RECENT = 3
+        self.assertEqual(len(self.read()["entries"]), 3)
+
+    def test_read_size_budget_keeps_the_newest_whole_entries_and_says_what_it_dropped(self):
+        self.fill(12, text=lambda i: f"{i:02d} " + "x" * 120, scores={1: 9, 2: 1})
+        self.tool.valves.READ_MAX_CHARS = 700  # 500 is the floor; each entry costs its text plus a little
+        out = self.read()
+        shown = [e["entry_no"] for e in out["entries"]]
+        self.assertEqual(shown, list(range(12 - len(shown) + 1, 13)))  # a run ending at the newest
+        self.assertLess(len(shown), 10)
+        # the budget is shared out one entry at a time - newest, strongest positive, strongest negative, next newest... - so a tight
+        # budget still carries both strong memories instead of letting long recent entries starve them
+        self.assertEqual([e["entry_no"] for e in out["strong_memories"]["positive"]], [1])
+        self.assertEqual([e["entry_no"] for e in out["strong_memories"]["negative"]], [2])
+        self.assertIn("left out to stay within the size limit", out["note"])
+        every = out["entries"] + out["strong_memories"]["positive"] + out["strong_memories"]["negative"]
+        self.assertTrue(all(len(e["text"]) == 123 for e in every))  # whole entries, never cut
+
+    def test_read_before_pages_back_and_says_where_to_continue(self):
+        self.fill(30)
+        page = self.read(before="21", limit="5")
+        self.assertEqual([e["entry_no"] for e in page["entries"]], [16, 17, 18, 19, 20])
+        self.assertNotIn("strong_memories", page)
+        self.assertIn("15 older entries remain; continue with before=16", page["note"])
+        last = self.read(before="4")
+        self.assertEqual([e["entry_no"] for e in last["entries"]], [1, 2, 3])
+        self.assertNotIn("note", last)
+        self.assertIn("No entries are older than #1", self.read(before="1")["note"])
+
+    def test_read_entry_fetches_particular_entries_in_full_whatever_their_age(self):
+        self.fill(30)
+        out = self.read(entry="#3, 12 99")
+        self.assertEqual([e["entry_no"] for e in out["entries"]], [3, 12])
+        self.assertIn("#99", out["note"])
+        self.assertFalse(self.run_async(self.tool.agent_notes_read("n", entry="soon"))["success"])
+        self.assertEqual(len(self.read(entry=" ".join(str(i) for i in range(1, 25)))["entries"]), 10)  # at most ten at a time
+
+    def test_read_sample_brings_back_random_older_entries_not_the_recent_ones(self):
+        self.fill(40)
+        seen = set()
+        for _ in range(6):
+            out = self.read(sample="3")
+            numbers = [e["entry_no"] for e in out["entries"]]
+            self.assertEqual(len(numbers), 3)
+            self.assertEqual(numbers, sorted(set(numbers)))
+            self.assertTrue(all(n <= 30 for n in numbers))  # the newest 10 are left out
+            seen.update(numbers)
+        self.assertGreater(len(seen), 3)  # it really is random
+        self.assertEqual(len(self.read(sample="50")["entries"]), 10)  # capped
+
+    def test_count_false_keeps_a_sweep_out_of_the_popularity_counts(self):
+        self.fill(3)
+        self.read(count="false")
+        self.read(count=False)
+        self.assertEqual(self.hits(), (0, [0, 0, 0]))
+        self.read(count="")
+        self.read()
+        self.assertEqual(self.hits(), (2, [2, 2, 2]))
+
+    def test_read_counts_only_the_entries_it_delivered_including_strong_ones(self):
+        self.fill(30, scores={3: 9})
+        self.read()
+        counted = {r[0]: r[1] for r in self.sql("SELECT entry_no, hits FROM note_data")}
+        self.assertEqual(counted[3], 1)  # the strong memory
+        self.assertEqual(counted[30], 1)
+        self.assertEqual(counted[15], 0)  # neither recent nor strong
+
+    def test_search_cards_snippet_total_paging_and_all_words(self):
+        self.fill(1, name="a", text=lambda i: "Gordon likes tea " + "padding " * 50 + "and the lighthouse at dusk")
+        self.run_async(self.tool.agent_notes_append("a", "Gordon likes coffee"))
+        self.run_async(self.tool.agent_notes_append("a", "Gordon, tea, again"))
+        both = self.run_async(self.tool.agent_notes_search("gordon TEA"))
+        self.assertEqual(both["total_matching_entries"], 2)  # all words, any case
+        self.assertEqual(self.run_async(self.tool.agent_notes_search("gordon lighthouse"))["total_matching_entries"], 1)
+        card = self.run_async(self.tool.agent_notes_search("lighthouse"))["cards"][0]
+        self.assertIn("lighthouse", card["snippet"])  # the snippet is cut around the match, not just the start
+        self.assertLessEqual(len(card["snippet"]), self.tool.valves.SEARCH_SNIPPET_CHARS + 2)
+        self.assertTrue(card["snippet"].startswith("\N{HORIZONTAL ELLIPSIS}"))
+        first = self.run_async(self.tool.agent_notes_search("gordon", limit="2"))
+        self.assertEqual((first["showing"], first["total_matching_entries"], len(first["cards"])), ("1-2 of 3", 3, 2))
+        self.assertIn("page=2", first["note"])
+        second = self.run_async(self.tool.agent_notes_search("gordon", limit="2", page="2"))
+        self.assertEqual((second["showing"], len(second["cards"])), ("3-3 of 3", 1))
+        self.assertNotIn("page=3", second["note"])
+        past = self.run_async(self.tool.agent_notes_search("gordon", limit="2", page="9"))
+        self.assertEqual(past["cards"], [])
+        self.assertIn("past the last", past["note"])
+        self.assertIn("read a whole entry", first["note"])
+        none = self.run_async(self.tool.agent_notes_search("zebra"))
+        self.assertIn("No entry contains all of those words", none["note"])
+
+    def test_search_can_be_limited_to_one_note_and_does_not_list_notes_then(self):
+        self.create("a", "needle in a")
+        self.create("needle-box", "nothing")
+        self.run_async(self.tool.agent_notes_append("needle-box", "a needle here too"))
+        everywhere = self.run_async(self.tool.agent_notes_search("needle"))
+        self.assertEqual({c["note_name"] for c in everywhere["cards"]}, {"a", "needle-box"})
+        self.assertEqual([n["note_name"] for n in everywhere["matching_notes"]], ["needle-box"])
+        inside = self.run_async(self.tool.agent_notes_search("needle", note="NEEDLE-box"))
+        self.assertEqual([c["note_name"] for c in inside["cards"]], ["needle-box"])
+        self.assertNotIn("matching_notes", inside)
+        missing = self.run_async(self.tool.agent_notes_search("needle", note="nope"))
+        self.assertFalse(missing["success"])
+
     def test_deleting_or_editing_a_piece_keeps_the_chain_consistent(self):
         self.run_async(self.tool.agent_notes_create("n", "word " * 400, continues=True))  # entries 1-4
         self.run_async(self.tool.agent_notes_delete_entry("n", "2"))
@@ -718,7 +904,7 @@ class ListAndSearchTests(NotesTestCase):
         self.create("a", "100% done")
         self.create("b", "nothing here")
         res = self.run_async(self.tool.agent_notes_search("%"))
-        self.assertEqual([e["note_name"] for e in res["matching_entries"]], ["a"])
+        self.assertEqual([e["note_name"] for e in res["cards"]], ["a"])
 
     def test_search_requires_a_query(self):
         self.assertFalse(self.run_async(self.tool.agent_notes_search(""))["success"])
@@ -767,7 +953,7 @@ class AuthorTests(NotesTestCase):
     def test_list_and_search_show_authors(self):
         self.run_async(self.tool.agent_notes_create("n", "needle", author_name="Claude"))
         self.assertIn("| Claude |", self.run_async(self.tool.agent_notes_list(verbose=True))["table"])
-        self.assertEqual(self.run_async(self.tool.agent_notes_search("needle", verbose=True))["matching_entries"][0]["author"], "Claude")
+        self.assertEqual(self.run_async(self.tool.agent_notes_search("needle", verbose=True))["cards"][0]["author"], "Claude")
 
 
 class TimestampTests(NotesTestCase):
@@ -1206,9 +1392,9 @@ class VerboseTests(NotesTestCase):
         self.assertIn("started_by", res)
 
     def test_search_plain_and_verbose(self):
-        plain = self.run_async(self.tool.agent_notes_search("needle"))["matching_entries"][0]
-        self.assertEqual(set(plain), {"note_name", "entry_no", "text"})
-        self.assertIn("author", self.run_async(self.tool.agent_notes_search("needle", verbose=True))["matching_entries"][0])
+        plain = self.run_async(self.tool.agent_notes_search("needle"))["cards"][0]
+        self.assertEqual(set(plain), {"note_name", "entry_no", "weight", "date", "snippet"})
+        self.assertIn("author", self.run_async(self.tool.agent_notes_search("needle", verbose=True))["cards"][0])
 
     def test_search_summary_plain_keeps_staleness_only(self):
         plain = self.run_async(self.tool.agent_notes_search_summary("needle"))["results"][0]

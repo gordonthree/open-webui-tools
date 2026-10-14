@@ -8,8 +8,12 @@ lives there since the toolbox was split in two) - enable both on the summarizer'
 Setup notes:
 
 - Change the `author_name` below to whatever should appear on the summaries.
-- `agent_notes_read` returns at most `MAX_READ_ENTRIES` (default 50) entries per call. If any note will
-  have more entries than that, raise the valve so one call covers the whole note.
+- `agent_notes_read` returns the newest `READ_DEFAULT_RECENT` entries (default 10) plus the note's strongest
+  older memories, within `READ_MAX_CHARS` (default 6000 characters), and says how many entries it left out; the
+  prompt below pages back with `before=` to see more, and passes `count=false` so the summarizer's sweep doesn't
+  inflate the popularity counts. Very long notes are paged only a few times per night; the existing summary
+  carries what is older (step 2b keeps what is still true), so the summary stays current without
+  the summarizer ever holding a whole 300-entry note in its context.
 - Notes smaller than the `MIN_SUMMARY_CHARS` valve (default 1000 characters of entry text) are never
   offered to the summarizer: a summary of a note that small would just copy it, and the note is cheap
   to read directly. They show as `short` in `agent_notes_list`. Lower the valve to 0 to summarize everything.
@@ -30,10 +34,13 @@ Steps:
    summary is missing or stale. If it says no note needs a summary, reply
    "Nothing to do." and stop.
 2. For each note listed:
-   a. Call agent_notes_read with verbose=false and the note's name. If the result says it is showing only the most
-      recent entries, call agent_notes_read again with a larger limit until you have seen
-      everything. Summarize from the whole note, never from part of it.
-   b. If the note already has a summary, keep what is still true and update what changed.
+   a. Call agent_notes_read with verbose=false, count=false and the note's name. It shows the newest entries and
+      some strong older memories, and says how many entries it left out. If it did, call agent_notes_read
+      again with the same note, verbose=false, count=false and before=<the number the reply tells you> to
+      see the next older entries; repeat up to 4 times in all, or until nothing older remains. Summarize from
+      everything you saw.
+   b. If the note already has a summary, keep what is still true and update what changed. For a note you could
+      not read to the beginning, the existing summary is your source for the older material: keep it.
    c. Write the summary and save it with agent_notes_update_summary.
 3. When the list is empty, call agent_notes_list with needs_summary=true once more. Handle any
    notes that are still listed (they changed while you worked). Do this at most twice.

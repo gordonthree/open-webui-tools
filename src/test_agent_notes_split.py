@@ -88,14 +88,14 @@ class SharedDatabaseTests(unittest.TestCase):
         return asyncio.run(coro)
 
     def test_curation_changes_show_up_in_the_everyday_tool(self):
-        self.assertTrue(self.run_async(self.a.agent_notes_create("pets", "the cat is called Mo", weight="70"))["success"])
+        self.assertTrue(self.run_async(self.a.agent_notes_create("pets", "the cat is called Mo", weight="7"))["success"])
         self.assertTrue(self.run_async(self.a.agent_notes_append("pets", "word " * 200, continues=True))["success"])
         self.assertTrue(self.run_async(self.b.agent_notes_update_summary("pets", "about the pets"))["success"])
         self.assertTrue(self.run_async(self.b.agent_notes_add_tags("pets", "animals", create=True))["success"])
         read = self.run_async(self.a.agent_notes_read("pets"))
         self.assertEqual(read["summary"]["text"], "about the pets")
         self.assertEqual(read["tags"], ["animals"])
-        self.assertEqual(read["entries"][0]["weight"], 70)
+        self.assertEqual(read["entries"][0]["weight"], 7)
         self.assertEqual(read["entries"][1]["continues_at"], 3)
         found = self.run_async(self.a.agent_notes_search_summary("pets"))
         self.assertEqual(found["results"][0]["note_name"], "pets")

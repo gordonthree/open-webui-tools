@@ -193,7 +193,7 @@ def render_note(db: str, name: str) -> str:
     for r in reversed(entries):  # read_note_db returns oldest first; the page shows the newest on top
         edited = f" &middot; edited {e(when(r['edited_at']))}" if r["edited_at"] else ""
         body += (
-            f"<div class='entry' id='e{r['entry_no']}'><span class='muted'>#{r['entry_no']} &middot; {e(r['author_name'] or 'unknown')} &middot; {e(when(r['created_at']))}{edited}{links(r)} &middot; weight {r['weight']} &middot; read {r['hits']}x</span>"
+            f"<div class='entry' id='e{r['entry_no']}'><span class='muted'>#{r['entry_no']} &middot; {e(r['author_name'] or 'unknown')} &middot; {e(when(r['created_at']))}{edited}{links(r)} &middot; weight {notes.weight_to_score(r['weight'])} &middot; read {r['hits']}x</span>"
             f"<pre>{e(r['note_text'])}</pre>"
             f"<details><summary>edit / delete</summary>"
             f"<form method='post' action='/edit'>{hidden}<input type='hidden' name='entry_no' value='{r['entry_no']}'>"
