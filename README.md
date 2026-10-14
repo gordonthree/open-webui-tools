@@ -47,8 +47,8 @@ Current tools:
   conversational model carries only the descriptions it needs (about 2,300 tokens against 3,400 for all 21 methods).
   Both are generated from `src/agent_notes_full.py`. Together they are an easier-to-drive alternative to Open WebUI's built-in `note` tool. Unrelated to ComfyUI. A note
   is a name plus an append-only log of short numbered entries, in its **own** SQLite file
-  (`agent_notes.sqlite3`, `NOTES_DB_PATH` valve — not the job database, though it defaults to the
-  same folder). Notes are addressed by name (unique, case-insensitive) and entries by number; there
+  (`agent_notes.sqlite3`, `NOTES_DB_PATH` valve, default `/app/backend/data/agent_notes.sqlite3` —
+  OWUI's data folder, not the ComfyUI output folder). Notes are addressed by name (unique, case-insensitive) and entries by number; there
   are no UUIDs, since a model reproduces a plain-language name more reliably than an opaque id.
 
 - `voice_memo.py` → `record_voice_memo`, `list_voice_memos`, `show_last_memo` (original and spoken text of the newest memo), `record_conversation` (several named speakers as one clip, each in the voice the `SPEAKER_VOICES` valve maps to that name; limit `MAX_CONVERSATION_LINES`. With `FISH_API_KEY` set it is ONE request to Fish's own API: `<|speaker:N|>` tags in the text plus a `reference_id` list, which is Fish's documented multi-speaker form; without it, or with `NATIVE_MULTI_SPEAKER` off or more than 4 speakers, it makes one speech call per turn and joins the mp3 clips), `voice_memo_help` — lets a model record a spoken memo: the text goes to
@@ -85,7 +85,7 @@ Current tools:
   and a `.json` sidecar (prompt, options, cost, generation id) are kept in `OUTPUT_DIR`. No ComfyUI, no job
   database. Needs `OPENROUTER_API_KEY` and `OPEN_WEBUI_API_KEY` valves.
 
-- `agent_duo.py` — an Open WebUI **Pipe** (a Function, not a Tool) that shows up as one model, "Mara + Hannah",
+- `agent_duo.py` — an Open WebUI **Pipe** (a Function, not a Tool) that shows up as one model, "Agent + Agent2",
   and puts two agents living on **two different OWUI servers** into one chat with the human. See "Two-agent
   chat (agent_duo)" below. Unrelated to ComfyUI.
 
@@ -399,7 +399,7 @@ Every delete is a real `DELETE` (no soft-delete/undo); deleting a note relies on
 `created_at`, `edited_at`, `author_id`), entries ordered by `created_at`. Authors (v1.1.0):
 `note_author` (`author_id` autonumber, `author_name` unique ignoring case, `created_at`); both other
 tables carry an `author_id` (the note's starter, the entry's writer; editing doesn't change it).
-Author #1 is `Mara Voss`, seeded into every database and given every row that predates authors.
+Author #1 is the legacy author (`LEGACY_AUTHOR` in the source), seeded into every database and given every row that predates authors.
 `agent_notes_create`/`agent_notes_append` also take an optional `created_at` (v1.2.0) so old notes can be moved in
 with their real dates: ISO 8601 (a bare date, or with time/offset/`Z`; no offset = UTC) or a Unix
 epoch in s/ms/µs/ns (Open WebUI's own notes use ns), stored as UTC ISO; unparseable, future (>1 day)
@@ -426,9 +426,9 @@ to `--author` (default `Gordon`).
 
 ## Two-agent chat (agent_duo)
 
-`src/agent_duo.py` is a Pipe installed on one server (open-webui). Pick the "Mara + Hannah" model there and
-send a message: the pipe runs a bounded round of alternating turns, Mara on her own server and Hannah on hers,
-and streams both into the chat as `**Mara:** ...` / `**Hannah:** ...`. Each agent keeps her own persona,
+`src/agent_duo.py` is a Pipe installed on one server (open-webui). Pick the "Agent + Agent2" model there and
+send a message: the pipe runs a bounded round of alternating turns, Agent on its own server and Agent2 on its,
+and streams both into the chat as `**Agent:** ...` / `**Agent2:** ...`. Each agent keeps its own persona,
 tools (`agent_notes`, mail, ...) and knowledge because every turn really runs on her server. The speaker
 labels in the saved chat are how the pipe works out who said what on your next message, so don't edit them.
 
@@ -449,20 +449,23 @@ at the start of a real reply ended the round, so the other agent never spoke). T
 don't wake the agents (set a separate Task Model if you'd like real titles). A failure on either side is shown
 in the chat as an italic note and ends the round.
 
+Valve names are per agent: `<A>` and `<B>` stand for the two agents' names in capitals, as they appear in the
+Valves panel.
+
 | Valve | Meaning |
 |---|---|
-| `MARA_URL` / `HANNAH_URL` | That agent's OWUI base URL as the *pipe's server* reaches it (`http://localhost:8080` for the local one) |
-| `MARA_KEY` / `HANNAH_KEY` | An API key (Settings -> Account -> API Keys) on that server, able to use the agent's model. Keep these only in the Function's valves |
-| `MARA_MODEL_ID` / `HANNAH_MODEL_ID` | The agent's model preset id on her server (defaults `medium-mara`, `hannah-long`) |
-| `MARA_TOOL_IDS` / `HANNAH_TOOL_IDS` | Comma-separated override; blank reads the preset's own `toolIds` |
-| `MARA_NAME` / `HANNAH_NAME` / `USER_NAME` | Speaker labels (default Mara, Hannah, Gordon) |
+| `<A>_URL` / `<B>_URL` | That agent's OWUI base URL as the *pipe's server* reaches it (`http://localhost:8080` for the local one) |
+| `<A>_KEY` / `<B>_KEY` | An API key (Settings -> Account -> API Keys) on that server, able to use the agent's model. Keep these only in the Function's valves |
+| `<A>_MODEL_ID` / `<B>_MODEL_ID` | The agent's model preset id on her server (see the valve defaults in the source) |
+| `<A>_TOOL_IDS` / `<B>_TOOL_IDS` | Comma-separated override; blank reads the preset's own `toolIds` |
+| `<A>_NAME` / `<B>_NAME` / `USER_NAME` | Speaker labels |
 | `MAX_TURNS` (4), `FIRST_SPEAKER`, `END_MARKER`, `TURN_TIMEOUT_SECONDS` (300), `POLL_SECONDS` (2) | Round controls |
 | `CARRY_CONTEXT` (on), `CARRY_TOOLS` (`agent_notes_read_tagged`), `CARRY_MAX_CHARS` (80000), `CARRY_TTL_MINUTES` (240) | Carry-forward, below |
 | `KEEP_BACKING_CHATS` | Leave each turn's throwaway chat in place (to inspect tool calls) instead of deleting it |
 
 **Carry-forward (v1.1.0).** Every turn is a fresh call that sees only the *text* of earlier turns, so an agent's
 session-start reads (her persona and memories) would be lost after her first turn and reloaded every turn - far
-too heavy for a local model (a measured Mara startup read was ~20k tokens, ~157k processed over one reply's tool
+too heavy for a local model (a measured agent startup read was ~20k tokens, ~157k processed over one reply's tool
 round trips). So after an agent's first turn in a chat, the pipe takes the results of the tools in `CARRY_TOOLS`
 from that turn's saved `output` (pairing each result with its call by `call_id`) and puts them, unchanged, at the
 end of her system note on her later turns, headed "Already loaded earlier in this conversation". Her own "skip if
@@ -552,8 +555,8 @@ protection by design — trusted LAN only. Each row of the home page has two sma
 
 ### Host access to the databases (ACLs)
 
-Both SQLite databases (`agent_notes.sqlite3`, `comfy_jobs.sqlite3`) live in OWUI's data volume,
-`<install>/data/comfy_outputs/` (e.g. `~/docker/open-webui/...` or `~/nvme/open-webui/...`). The OWUI container
+The notes database (`agent_notes.sqlite3`) lives in OWUI's data volume, `<install>/data/`, and the ComfyUI job
+database (`comfy_jobs.sqlite3`) in `<install>/data/comfy_outputs/` (e.g. `~/docker/open-webui/...` or `~/nvme/open-webui/...`). The OWUI container
 runs as root, so that folder and anything it creates are `root:root`, and an unprivileged host user can't
 write there. `notes_web.py`, `init_job_db.py`, `import_server_history.py` and plain `sqlite3` need
 read/write access as the host user, and writing needs the *folder* too: the databases run in WAL mode, so
@@ -563,10 +566,10 @@ done once as root on the docker host:
 
 ```
 sudo apt install acl            # getfacl/setfacl; Ubuntu doesn't always ship it (ext4 and xfs need no mount options)
-D=~/docker/open-webui/data/comfy_outputs
+D=~/docker/open-webui/data/comfy_outputs   # for the notes database use ~/docker/open-webui/data (ACL the folder itself, not recursively)
 sudo setfacl -m  u:gordon:rwx "$D"    # the folder: lets gordon create/delete the -wal/-shm files
 sudo setfacl -d -m u:gordon:rwx "$D"  # default ACL: files the container creates later come with gordon's access too
-sudo chown gordon: "$D"/agent_notes.sqlite3 "$D"/comfy_jobs.sqlite3   # existing database files (skip any that don't exist yet)
+sudo chown gordon: "$D"/comfy_jobs.sqlite3 ~/docker/open-webui/data/agent_notes.sqlite3   # existing database files (skip any that don't exist yet)
 ```
 
 Check with `getfacl "$D"`: it should list `user:gordon:rwx` and `default:user:gordon:rwx`. The container (root)
@@ -604,10 +607,10 @@ re-importing through the OWUI web UI. It reads connection details and per-tool i
 `python scripts/push_tool.py <tool_name|all> [--dry-run]`.
 
 **Several servers.** The default target is the one in `OWUI_BASE_URL`/`OWUI_API_KEY` ("local"). Any other server
-`X` is configured with `OWUI_X_URL` and `OWUI_X_KEY` lines in `secrets.md` (e.g. `OWUI_HANNAH_URL`,
-`OWUI_HANNAH_KEY` for `--server hannah`); `--server` can be repeated and `--server all` means local plus every
+`X` is configured with `OWUI_X_URL` and `OWUI_X_KEY` lines in `secrets.md` (e.g. `OWUI_X_URL`,
+`OWUI_X_KEY` for `--server x`); `--server` can be repeated and `--server all` means local plus every
 configured one. On those servers a tool's id is looked up from the server (the tool whose id equals its file name,
-e.g. `agent_notes`), or set with an `X_<tool>: <id>` line (`HANNAH_agent_notes`) if the ids differ. One server
+e.g. `agent_notes`), or set with an `X_<tool>: <id>` line (`X_agent_notes`) if the ids differ. One server
 failing doesn't stop the others; the exit status reports it. Backups of a non-local server's tool are named
 `tmp/<tool>_<server>_<timestamp>.py`. Note that pushing a tool that migrates its database (like `agent_notes`)
 upgrades the notes database on *that* server the first time it runs there.
@@ -767,9 +770,9 @@ membership has to be asked for via `GET /api/v1/chats/folder/{id}` or the full `
 
 ### 2026-10-10
 Added `agent_duo.py` v1.0.0 (see "Two-agent chat (agent_duo)"): one chat, two agents on two OWUI servers, via a
-Pipe. Design agreed with the project owner: a Pipe (not a tool Mara calls), bounded auto-rounds per human message,
+Pipe. Design agreed with the project owner: a Pipe (not a tool an agent calls), bounded auto-rounds per human message,
 full tools/RAG on both sides. The bare completions API doesn't run tools, so each turn uses a throwaway chat on the
-agent's own server (spike-verified on `hannah-long`). 17 tests in `src/test_agent_duo.py`; a live two-turn run of the
+agent's own server (spike-verified on the live servers). 17 tests in `src/test_agent_duo.py`; a live two-turn run of the
 pipe against both real servers worked. `push_tool.py` now also pushes Functions (`agent_duo`), not part of `all`.
 **Not deployed:** the Function has to be created once in OWUI by hand and its valves (API keys) filled in.
 
@@ -782,7 +785,7 @@ behind across the two servers. 9 tests in `test_cleanup_duo_chats.py`.
 Later the same day: `agent_duo.py` v1.1.0 adds carry-forward (see the valve table above). Findings from testing with the
 project owner: the agents' session-start rules must name the tag tool outright (`agent_notes_read_tagged`; "search
 agent_notes" doesn't map to it), `agent_notes_read_tagged` has no paging and its `MAX_TAGGED_CHARS` cap (6000
-default) truncated Hannah's persona to summaries plus 4 entries until raised (41,000 characters then returned all
+default) truncated an agent's persona to summaries plus 4 entries until raised (41,000 characters then returned all
 73 entries), and `verbose=true` on that read adds timestamps/hits/weights. 26 tests in `test_agent_duo.py`.
 
 ### 2026-10-02
@@ -807,7 +810,7 @@ Added `agent_notes.py` (v1.0.0), a notebook tool for agents, because Open WebUI'
 tool is built for a human and model co-editing one text blob in chat, and an agent can't easily
 update it. Here a note is a name plus an append-only log of numbered entries; adding to a note
 inserts a row instead of editing text. Design decisions made with the project owner:
-- Its own database file (`agent_notes.sqlite3`), not the job DB, in the same folder.
+- Its own database file (`agent_notes.sqlite3`), not the job DB, in OWUI's data folder (`/app/backend/data`).
 - Single user, no per-user scoping.
 - Notes addressed by unique (case-insensitive) name, entries by per-note number — UUIDs were
   considered and dropped. Names are the identity, so `create_note` refuses a duplicate and points at

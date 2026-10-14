@@ -54,8 +54,7 @@ logger.setLevel(logging.INFO)
 
 
 # --------------------------------------------------------------------------- #
-# SQLite note store - its own database file (NOT the ComfyUI job database), living in the same
-# folder. A note is one row in note_id; its content is the rows of note_data that point at it,
+# SQLite note store - its own database file, in OWUI's data folder. A note is one row in note_id; its content is the rows of note_data that point at it,
 # kept in chronological order. Adding to a note inserts a row; nothing is rewritten.
 # --------------------------------------------------------------------------- #
 
@@ -1395,8 +1394,8 @@ class Tools:
     # str parameter, and _to_int() does the parsing, so 5, "5", "" and "#3" all work.
     class Valves(BaseModel):
         NOTES_DB_PATH: str = Field(
-            default="/app/backend/data/comfy_outputs/agent_notes.sqlite3",
-            description="SQLite database file for agent notes. Deliberately separate from the ComfyUI job database; keep it in the same folder.",
+            default="/app/backend/data/agent_notes.sqlite3",
+            description="SQLite database file for agent notes. Lives in OWUI's data folder; the curation tool's valve must match.",
         )
         MAX_READ_ENTRIES: int = Field(default=50, description="The most entries one agent_notes_read call may ask for with limit (the default is READ_DEFAULT_RECENT; READ_MAX_CHARS also applies).")
         READ_DEFAULT_RECENT: int = Field(default=10, description="How many of a note's newest entries agent_notes_read returns when the model gives no limit.")
