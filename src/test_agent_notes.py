@@ -1513,6 +1513,14 @@ class NoteSettingsTests(NotesTestCase):
         self.update(kind="persona", summary_max="800")
         self.assertEqual(self.run_async(self.tool.agent_notes_list(needs_summary=True))["count"], 0)
 
+    def test_resending_the_same_name_and_comment_does_not_make_the_summary_stale(self):
+        self.create("n", "x", "same")
+        self.summarize("a summary")
+        self.update(new_name="n", comment="same", kind="persona")
+        self.assertEqual(self.run_async(self.tool.agent_notes_list(needs_summary=True))["count"], 0)
+        self.update(comment="different")  # a real change still does
+        self.assertEqual(self.run_async(self.tool.agent_notes_list(needs_summary=True))["count"], 1)
+
     def test_summary_limit_is_per_note(self):
         self.create("n", "x")
         self.create("m", "x")

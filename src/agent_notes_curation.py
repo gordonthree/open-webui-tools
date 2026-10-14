@@ -940,7 +940,7 @@ def update_note_db(
                     ).fetchone()
                     if clash:
                         raise _name_taken_error(final_name)
-                if new_name is not None or comment is not None:
+                if final_name != note["note_name"] or final_comment != note["note_comment"]:  # a form that re-sends the same name and comment changes nothing
                     conn.execute(
                         "UPDATE note_id SET note_name = ?, note_comment = ?, updated_at = ? WHERE note_pk = ?",
                         (final_name, final_comment, _now_iso(), note["note_pk"]),
