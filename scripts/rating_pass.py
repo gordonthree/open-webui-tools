@@ -22,6 +22,7 @@ Usage:
     python scripts/rating_pass.py --model medium-mara --note internal-life --before 204 --delay 60
     python scripts/rating_pass.py --server hannah --model hannah-long --note some-note
     python scripts/rating_pass.py --model medium-mara --note "Mara Voss - Speech" --persona
+    python scripts/rating_pass.py --server hannah --model hannah-long --persona --max-ratings 10 --note hannah-psychology,hannah-identity,hannah-habits
 
 --model is the agent's model preset id on that server (agent_duo's defaults are medium-mara and hannah-long).
 """
@@ -208,38 +209,12 @@ def is_rate_limit(text: str) -> bool:
     return bool(re.search(r"429|rate.?limit", text, re.I))
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--model", required=True, help="the agent's model preset id on the server")
-    ap.add_argument("--note", required=True, help="the note to rate, e.g. internal-life")
-    ap.add_argument("--server", default="local", help="local (default) or a name configured as OWUI_<NAME>_URL/_KEY in secrets.md")
-    ap.add_argument("--before", type=int, help="resume: start with the page just older than this entry number (default: the newest page)")
-    ap.add_argument("--chunks", type=int, default=30, help="most chunks to run this time (default 30)")
-    ap.add_argument("--delay", type=float, default=45, help="seconds to wait between chunks (default 45)")
-    ap.add_argument("--max-ratings", type=int, default=MAX_RATINGS, help=f"most ratings per chunk (default {MAX_RATINGS})")
-    ap.add_argument("--persona", action="store_true", help="the note is a persona facet (kind persona): rate how strongly each trait is hers, not how it felt")
-    ap.add_argument("--keep-chats", action="store_true", help="leave each chunk's throwaway chat in place to inspect its tool calls")
-    ap.add_argument("--dry-run", action="store_true", help="print the prompt and the server details, call nothing that changes anything")
-    ap.add_argument("--secrets", type=Path, default=DEFAULT_SECRETS_FILE)
-    args = ap.parse_args()
-
-    values = parse_secrets(args.secrets)
-    if args.server != "local" and args.server.lower() not in configured_servers(values):
-        ap.error(f"Unknown server {args.server!r}; secrets.md configures: {['local'] + configured_servers(values)}.")
-    url, key = server_connection(values, args.server.lower())
-    tool_ids = fetch_tool_ids(url, key, args.model)
-    print(f"server {args.server} ({url}), model {args.model}, tools attached: {', '.join(tool_ids) or 'NONE'}")
-    if not any("agent_notes" in t for t in tool_ids):
-        print("warning: no agent_notes tool is attached to that model preset; the agent could not rate anything.")
-    if args.dry_run:
-        print("\n" + build_prompt(args.note, args.before, args.max_ratings, args.persona))
-        return 0
-
-    before = args.before
+def rate_note(url: str, key: str, args, tool_ids: list, note: str, before: Optional[int]) -> int:
+    """Run the chunks for one note; returns 0 when it finished or used up --chunks, 1 when it had to stop."""
     failures = 0
     total_rated = 0
     for n in range(1, args.chunks + 1):
-        prompt = build_prompt(args.note, before, args.max_ratings, args.persona)
+        prompt = build_prompt(note, before, args.max_ratings, args.persona)
         label = "newest page" if before is None else f"before={before}"
         try:
             reply, output = run_chunk(url, key, args.model, tool_ids, prompt, args.keep_chats)
@@ -248,7 +223,8 @@ def main() -> int:
             wait = RATE_LIMIT_WAIT_SECONDS if is_rate_limit(str(ex)) else args.delay * 2
             print(f"chunk {n} ({label}) failed [{failures}/{MAX_FAILURES_IN_A_ROW}]: {ex}; waiting {wait:.0f}s and retrying")
             if failures >= MAX_FAILURES_IN_A_ROW:
-                print(f"giving up. Resume with --before {before}" if before is not None else "giving up. Nothing was paged yet; run again.")
+                print(f"giving up on {note}. Resume with --note {note!r} --before {before}" if before is not None
+                      else f"giving up on {note}. Nothing was paged yet; run again.")
                 return 1
             time.sleep(wait)
             continue
@@ -263,7 +239,7 @@ def main() -> int:
         if not done["rated"]:
             print("  no ratings were saved in this chunk" + (" - the agent may have described rating without calling the tool" if reply.strip() else ""))
         if lowest is None or lowest <= 1:
-            print(f"reached the start of {args.note}. {total_rated} ratings saved this run.")
+            print(f"reached the start of {note}. {total_rated} ratings saved this run.")
             return 0
         if before is not None and lowest >= before:
             print(f"the page did not move back (lowest {lowest}, before {before}); stopping.")
@@ -271,7 +247,51 @@ def main() -> int:
         before = lowest
         if n < args.chunks:
             time.sleep(args.delay)
-    print(f"stopped after {args.chunks} chunks; {total_rated} ratings saved this run. Resume with --before {before}")
+    print(f"stopped after {args.chunks} chunks; {total_rated} ratings saved on {note}. Resume with --note {note!r} --before {before}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--model", required=True, help="the agent's model preset id on the server")
+    ap.add_argument("--note", required=True, help="the note to rate, e.g. internal-life; or a comma-separated list of notes, done one after another (all must be the same kind, since --persona applies to all)")
+    ap.add_argument("--server", default="local", help="local (default) or a name configured as OWUI_<NAME>_URL/_KEY in secrets.md")
+    ap.add_argument("--before", type=int, help="resume: start with the page just older than this entry number (default: the newest page)")
+    ap.add_argument("--chunks", type=int, default=30, help="most chunks to run this time (default 30)")
+    ap.add_argument("--delay", type=float, default=45, help="seconds to wait between chunks (default 45)")
+    ap.add_argument("--max-ratings", type=int, default=MAX_RATINGS, help=f"most ratings per chunk (default {MAX_RATINGS})")
+    ap.add_argument("--persona", action="store_true", help="the note is a persona facet (kind persona): rate how strongly each trait is hers, not how it felt")
+    ap.add_argument("--keep-chats", action="store_true", help="leave each chunk's throwaway chat in place to inspect its tool calls")
+    ap.add_argument("--dry-run", action="store_true", help="print the prompt and the server details, call nothing that changes anything")
+    ap.add_argument("--secrets", type=Path, default=DEFAULT_SECRETS_FILE)
+    args = ap.parse_args()
+
+    notes = [x.strip() for x in args.note.split(",") if x.strip()]
+    if not notes:
+        ap.error("--note needs at least one note name.")
+    if len(notes) > 1 and args.before is not None:
+        ap.error("--before resumes one note; pass a single --note with it.")
+    values = parse_secrets(args.secrets)
+    if args.server != "local" and args.server.lower() not in configured_servers(values):
+        ap.error(f"Unknown server {args.server!r}; secrets.md configures: {['local'] + configured_servers(values)}.")
+    url, key = server_connection(values, args.server.lower())
+    tool_ids = fetch_tool_ids(url, key, args.model)
+    print(f"server {args.server} ({url}), model {args.model}, tools attached: {', '.join(tool_ids) or 'NONE'}")
+    if not any("agent_notes" in t for t in tool_ids):
+        print("warning: no agent_notes tool is attached to that model preset; the agent could not rate anything.")
+    if args.dry_run:
+        for note in notes:
+            print("\n" + build_prompt(note, args.before, args.max_ratings, args.persona))
+        return 0
+
+    for i, note in enumerate(notes):
+        if len(notes) > 1:
+            print(f"\n=== note {i + 1} of {len(notes)}: {note} ===")
+        if rate_note(url, key, args, tool_ids, note, args.before) != 0:
+            rest = notes[i + 1:]
+            if rest:
+                print(f"stopped before the remaining notes: {', '.join(rest)}")
+            return 1
     return 0
 
 
