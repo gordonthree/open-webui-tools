@@ -574,6 +574,32 @@ read never ran. `--dry-run` prints the prompt and the tools attached to the pres
 It is still her rating her own memories on her own model; the script only does the "repeat, with before=NNN" part. Tests:
 `cd scripts && python3 -m unittest test_rating_pass`.
 
+### Database housekeeping queries
+
+Run these on the host with `sqlite3 <path to agent_notes.sqlite3>` (Mara: `~/docker/open-webui/data/`; Hannah: see `HANNAH_SQLITE_PATH` in
+`secrets.md`). Copy the file first (`cp agent_notes.sqlite3 agent_notes.bak`) and run the cull in a transaction so you can check the count before committing.
+
+```sql
+-- Remove every summary (the Nightly Summarizer rebuilds them)
+DELETE FROM note_summary;
+
+-- Reset all read counts (notes and entries)
+UPDATE note_id SET hits = 0;
+UPDATE note_data SET hits = 0;
+
+-- Cull entries older than 1 week from one note (here autonomy-log); change '-7 days' as needed
+BEGIN;
+DELETE FROM note_data
+ WHERE note_pk = (SELECT note_pk FROM note_id WHERE lower(note_name) = 'autonomy-log')
+   AND created_at < strftime('%Y-%m-%dT%H:%M:%f', 'now', '-7 days');
+SELECT changes();   -- how many were removed
+COMMIT;             -- or ROLLBACK;
+```
+
+Timestamps are stored as ISO text in UTC, so the comparison is a plain string compare. Entry numbers are never reused (`next_entry_no`
+keeps counting), so culling leaves gaps. Culling does not touch the note's `updated_at`; clear that note's summary afterwards
+(`DELETE FROM note_summary WHERE note_pk = (SELECT note_pk FROM note_id WHERE lower(note_name) = 'autonomy-log');`) if you want it re-summarized.
+
 ### Host access to the databases (ACLs)
 
 The notes database (`agent_notes.sqlite3`) lives in OWUI's data volume, `<install>/data/`, and the ComfyUI job
