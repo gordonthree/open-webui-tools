@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.13.0
+version: 1.14.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -319,10 +319,13 @@ def validate_author(name: Any) -> str:
     return cleaned
 
 
-def resolve_author(author_name: Any, model: Any) -> str:
-    """The author to record: what the caller said, else the model Open WebUI says is calling, else a placeholder."""
+def resolve_author(author_name: Any, model: Any, default: Any = None) -> str:
+    """The author to record: what the caller said, else the DEFAULT_AUTHOR valve, else the model Open WebUI says is calling,
+    else a placeholder. The valve is applied silently: it's there for agents that forget to give their name."""
     if not is_unset(author_name):
         return validate_author(author_name)
+    if not is_unset(default):
+        return validate_author(default)
     if isinstance(model, dict):
         label = model.get("name") or model.get("id")
         if not is_unset(label):
@@ -444,8 +447,49 @@ def validate_comment(comment: Any) -> str:
     return cleaned
 
 
+_MONTHS = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|Sept?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+_WEEKDAY = r"(?:(?:Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)[a-z]*\.?,?\s+)?"
+_ORDINAL = r"(?:st|nd|rd|th)?"
+_TIME = r"(?:\s*(?:,|@|at|-|\u2013|\u2014)?\s*\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp]\.?[Mm]\.?)?(?:\s*(?:Z|UTC|GMT|[A-Z]{2,4}T|[+-]\d{2}:?\d{2}))?)?"
+# A date written out in full (year, or a numeric form) can be followed by anything; one without a year ("Oct 14") only
+# counts as a stamp when punctuation or a closing bracket follows, so "May 5 people came" is left alone.
+_FULL_DATE = re.compile(
+    r"(?:\d{4}-\d{1,2}-\d{1,2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?"
+    r"|\d{1,2}/\d{1,2}/\d{2,4}" + _TIME + r"|\d{4}/\d{1,2}/\d{1,2}" + _TIME +
+    rf"|{_WEEKDAY}{_MONTHS}\.?\s+\d{{1,2}}{_ORDINAL},?\s+\d{{4}}" + _TIME +
+    rf"|{_WEEKDAY}\d{{1,2}}{_ORDINAL}\s+(?:of\s+)?{_MONTHS}\.?,?\s+\d{{4}}" + _TIME + r")",
+    re.IGNORECASE,
+)
+_SHORT_DATE = re.compile(rf"(?:{_WEEKDAY}{_MONTHS}\.?\s+\d{{1,2}}{_ORDINAL}|{_WEEKDAY}\d{{1,2}}{_ORDINAL}\s+{_MONTHS}\.?)" + _TIME, re.IGNORECASE)
+_STAMP_OPEN = r"(?:(?:on\s+|date\s*:\s*)?[\[(*_#>]*\s*)"
+_STAMP_CLOSE = r"[\])*_]*\s*[:\-\u2013\u2014|,.;]*\s*"
+_LEADING_STAMPS = (
+    re.compile(rf"^{_STAMP_OPEN}{_FULL_DATE.pattern}{_STAMP_CLOSE}", re.IGNORECASE),
+    re.compile(rf"^{_STAMP_OPEN}{_SHORT_DATE.pattern}(?:[\])*_]+\s*[:\-\u2013\u2014|,.;]*|\s*[:\-\u2013\u2014|;])\s*", re.IGNORECASE),
+)
+
+
+def strip_leading_date(text: str) -> str:
+    """Remove a datestamp an agent put at the very start of a text ("[2026-10-14] ...", "October 14, 2026 - ...",
+    "Oct 14: ..."), and a timestamp after it. Only the start is touched, and a text that is nothing but a date is left as is.
+    Entries already carry the real time they were saved, so a written-in date only adds a chance of a wrong one."""
+    current = text
+    for _ in range(3):
+        for pattern in _LEADING_STAMPS:
+            m = pattern.match(current)
+            if m:
+                rest = current[m.end():].lstrip()
+                if not rest:
+                    return current
+                current = rest
+                break
+        else:
+            break
+    return current
+
+
 def validate_text(text: Any) -> str:
-    cleaned = str(text or "").strip()
+    cleaned = strip_leading_date(str(text or "").strip())
     if not cleaned:
         raise NoteError("Entry text is required and can't be empty.")
     if len(cleaned) > NOTE_TEXT_MAX:
@@ -460,7 +504,7 @@ def split_text(text: Any, max_parts: int) -> List[str]:
     """Cut text into pieces of at most NOTE_TEXT_MAX characters for agent_notes_create/_append continues=true. The words are kept exactly as given: a cut
     falls on a paragraph break if one is near, else a line break, else a space (only that break itself is dropped),
     and only in a word longer than a whole piece does it fall mid-word."""
-    rest = str(text or "").strip()
+    rest = strip_leading_date(str(text or "").strip())
     if not rest:
         raise NoteError("Entry text is required and can't be empty.")
     parts: List[str] = []
@@ -1317,7 +1361,7 @@ def help_topics(
             f"agent_notes_append name, text: a new last entry. agent_notes_edit_entry name, entry_no, text: replaces one entry's text. agent_notes_delete_entry name, entry_no: removes one entry for good; other entries keep their numbers.\n"
             f"Limits: note name {NOTE_NAME_MAX} characters, comment {NOTE_COMMENT_MAX}, each entry {NOTE_TEXT_MAX}; a longer one is refused and nothing is saved. "
             "For longer text see topic long_text.\n"
-            "author_name= records who wrote it (blank = your model name). created_at= is only for copying in an older note with its real date; leave it blank for anything new. "
+            "author_name= records who wrote it (blank = the tool's default author, else your model name). A date written at the very start of an entry is dropped: entries are timestamped automatically. created_at= is only for copying in an older note with its real date; leave it blank for anything new. "
             "weight= (1-10, 5 is neutral) rates an entry as you write it (see topic rating).",
         ),
         "long_text": (
@@ -1384,7 +1428,7 @@ def plan_entries(key: tuple, text: Any, continues: Any, max_parts: int, auto_aft
     towards concise notes, and the fallback is only so one that really can't shorten a text isn't stuck."""
     if _to_bool(continues):
         return entry_parts(text, True, max_parts)
-    cleaned = str(text or "").strip()
+    cleaned = strip_leading_date(str(text or "").strip())
     if len(cleaned) <= NOTE_TEXT_MAX:
         return [validate_text(text)]
     try:
@@ -1461,6 +1505,7 @@ class Tools:
             default="/app/backend/data/agent_notes.sqlite3",
             description="SQLite database file for agent notes. Lives in OWUI's data folder; the curation tool's valve must match.",
         )
+        DEFAULT_AUTHOR: str = Field(default="", description="Author recorded when the caller gives no author_name (at most 60 characters). Blank = the calling model's name. Use it so an agent that forgets to name itself is still recorded under the right name.")
         MAX_READ_ENTRIES: int = Field(default=50, description="The most entries one agent_notes_read call may ask for with limit (the default is READ_DEFAULT_RECENT; READ_MAX_CHARS also applies).")
         READ_DEFAULT_RECENT: int = Field(default=10, description="How many of a note's newest entries agent_notes_read returns when the model gives no limit.")
         READ_STRONG_EACH: int = Field(default=5, description="Besides the recent entries, agent_notes_read adds up to this many of the note's strongest older memories on each side: the strong positive and the strong negative ones. 0 turns that off.")
@@ -1667,7 +1712,7 @@ class Tools:
         :param weight: Optional rating of the entry, 1 to 10: 5 is neutral, lower for a negative or painful memory, higher for a positive or joyful one; the further from 5, the stronger. Pass "" (or omit) for 5.
         """
         try:
-            title, author = validate_name(name), resolve_author(author_name, __model__)
+            title, author = validate_name(name), resolve_author(author_name, __model__, self.valves.DEFAULT_AUTHOR)
             key = (author, title.lower())
             parts = plan_entries(key, text, continues, self.valves.MAX_CONTINUATION_ENTRIES, self.valves.AUTO_CONTINUE_AFTER)
             result = await asyncio.to_thread(
@@ -1702,7 +1747,7 @@ class Tools:
         :param weight: Optional rating of the entry, 1 to 10: 5 is neutral, lower for a negative or painful memory, higher for a positive or joyful one; the further from 5, the stronger. Pass "" (or omit) for 5. With continues=true every piece gets it.
         """
         try:
-            title, author = validate_name(name), resolve_author(author_name, __model__)
+            title, author = validate_name(name), resolve_author(author_name, __model__, self.valves.DEFAULT_AUTHOR)
             key = (author, title.lower())
             parts = plan_entries(key, text, continues, self.valves.MAX_CONTINUATION_ENTRIES, self.valves.AUTO_CONTINUE_AFTER)
             result = await asyncio.to_thread(
@@ -2084,7 +2129,7 @@ class Tools:
                 self.valves.NOTES_DB_PATH,
                 validate_name(name),
                 summary,
-                resolve_author(author_name, __model__),
+                resolve_author(author_name, __model__, self.valves.DEFAULT_AUTHOR),
             )
         except (ValueError, sqlite3.Error) as e:
             return _error(e)

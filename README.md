@@ -284,7 +284,7 @@ siblings; `# GENERATED` marks them) by cutting the other tool's methods and valv
 | Tool (id) | Methods | Valves |
 |---|---|---|
 | **Agent Notes** (`agent_notes`) | `help`, `list`, `list_tags`, `search`, `search_summary`, `read`, `read_tagged`, `create`, `append`, `edit_entry`, `set_weight`, `rank_entries` | all of them |
-| **Agent Notes Curation** (`agent_notes_curation`) | `add_tags`, `remove_tag`, `rename_tag`, `update`, `update_summary`, `delete_summary`, `delete`, `delete_entry`, `reset_hits` | `NOTES_DB_PATH` only |
+| **Agent Notes Curation** (`agent_notes_curation`) | `add_tags`, `remove_tag`, `rename_tag`, `update`, `update_summary`, `delete_summary`, `delete`, `delete_entry`, `reset_hits` | `NOTES_DB_PATH`, `DEFAULT_AUTHOR` |
 
 A method must be assigned to exactly one of the two lists in the build script (it refuses to build otherwise). After editing
 `agent_notes_full.py` run `python3 scripts/build_agent_notes.py` (`--check` exits 1 if a generated file is stale, and
@@ -816,7 +816,7 @@ membership has to be asked for via `GET /api/v1/chats/folder/{id}` or the full `
 ## Status notes
 
 ### 2026-10-14
-`agent_notes` v1.13.0: per-note `kind` and `summary_max` (see "Note kind and summary limit"). The database moved to `/app/backend/data/agent_notes.sqlite3` (out of `comfy_outputs/`); the tool valves on each server must match.
+`agent_notes` v1.14.0: new `DEFAULT_AUTHOR` valve (used silently when the caller gives no `author_name`; order is caller, valve, model name) and a scrub that drops a datestamp written at the very start of entry text (`[2026-10-14]`, `October 14, 2026 -`, `Oct 14:` and a time after it; a bare month-day with no punctuation, such as "May 5 people came", is left alone; edits are scrubbed too). v1.13.0: per-note `kind` and `summary_max` (see "Note kind and summary limit"). The database moved to `/app/backend/data/agent_notes.sqlite3` (out of `comfy_outputs/`); the tool valves on each server must match.
 
 ### 2026-10-10
 Added `agent_duo.py` v1.0.0 (see "Two-agent chat (agent_duo)"): one chat, two agents on two OWUI servers, via a

@@ -938,6 +938,18 @@ class AuthorTests(NotesTestCase):
         self.run_async(self.tool.agent_notes_append("n", "two"))
         self.assertEqual([e["author"] for e in self.run_async(self.tool.agent_notes_read("n", verbose=True))["entries"]], ["Me", mod.FALLBACK_AUTHOR])
 
+    def test_default_author_valve_fills_in_a_missing_name_but_not_a_given_one(self):
+        self.tool.valves.DEFAULT_AUTHOR = "Agent"
+        self.run_async(self.tool.agent_notes_create("n", "one", __model__={"name": "Qwen 3"}))
+        self.run_async(self.tool.agent_notes_append("n", "two", author_name=""))
+        self.run_async(self.tool.agent_notes_append("n", "three", author_name="Other"))
+        self.assertEqual([e["author"] for e in self.run_async(self.tool.agent_notes_read("n", verbose=True))["entries"]], ["Agent", "Agent", "Other"])
+
+    def test_blank_default_author_valve_keeps_the_model_name(self):
+        self.tool.valves.DEFAULT_AUTHOR = "  "
+        self.run_async(self.tool.agent_notes_create("n", "one", __model__={"name": "Qwen 3"}))
+        self.assertEqual(self.run_async(self.tool.agent_notes_read("n", verbose=True))["started_by"], "Qwen 3")
+
     def test_authors_are_reused_ignoring_case_and_whitespace(self):
         self.run_async(self.tool.agent_notes_create("n", "one", author_name="Claude"))
         self.run_async(self.tool.agent_notes_append("n", "two", "  claude "))
@@ -954,6 +966,40 @@ class AuthorTests(NotesTestCase):
         self.run_async(self.tool.agent_notes_create("n", "needle", author_name="Claude"))
         self.assertIn("| Claude |", self.run_async(self.tool.agent_notes_list(verbose=True))["table"])
         self.assertEqual(self.run_async(self.tool.agent_notes_search("needle", verbose=True))["cards"][0]["author"], "Claude")
+
+
+class LeadingDateTests(NotesTestCase):
+    def test_strip_leading_date(self):
+        for text, want in [
+            ("[2026-10-14] Gordon said hi", "Gordon said hi"),
+            ("2026-10-14 14:30: Gordon said hi", "Gordon said hi"),
+            ("October 14, 2026 - Gordon", "Gordon"),
+            ("**Thursday, October 14, 2026** Gordon", "Gordon"),
+            ("(10/14/2026 3:05 PM) hi", "hi"),
+            ("Date: 2026-10-14 - hi", "hi"),
+            ("14 October 2026, Gordon", "Gordon"),
+            ("Oct 14: we talked", "we talked"),
+            ("[Oct 14] hi", "hi"),
+            ("May 5 people came", "May 5 people came"),
+            ("March 3 deadlines loom", "March 3 deadlines loom"),
+            ("In 2026 we met", "In 2026 we met"),
+            ("We met on 2026-10-14 and talked", "We met on 2026-10-14 and talked"),
+            ("2026-10-14", "2026-10-14"),
+        ]:
+            self.assertEqual(mod.strip_leading_date(text), want, text)
+
+    def test_create_append_and_edit_scrub_the_start(self):
+        self.run_async(self.tool.agent_notes_create("n", "[2026-10-14] one"))
+        self.run_async(self.tool.agent_notes_append("n", "October 15, 2026 - two"))
+        self.run_async(self.tool.agent_notes_edit_entry("n", "1", "2026-10-16: uno"))
+        self.assertEqual([e["text"] for e in self.run_async(self.tool.agent_notes_read("n"))["entries"]], ["uno", "two"])
+
+    def test_continues_scrubs_only_the_start(self):
+        text = "[2026-10-14] " + "word " * 150 + "2026-10-15 end"
+        self.run_async(self.tool.agent_notes_create("n", text, continues=True))
+        entries = [e["text"] for e in self.run_async(self.tool.agent_notes_read("n", limit="10"))["entries"]]
+        self.assertTrue(entries[0].startswith("word"))
+        self.assertIn("2026-10-15 end", " ".join(entries))
 
 
 class TimestampTests(NotesTestCase):

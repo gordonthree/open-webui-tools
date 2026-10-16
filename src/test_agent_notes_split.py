@@ -55,7 +55,7 @@ class SplitTests(unittest.TestCase):
                 self.assertNotIn(other, doc, f"{name}'s description mentions {other}")
 
     def test_valves_headers_and_versions(self):
-        self.assertEqual(set(curation.Tools().valves.model_dump()), {"NOTES_DB_PATH"})
+        self.assertEqual(set(curation.Tools().valves.model_dump()), {"NOTES_DB_PATH", "DEFAULT_AUTHOR"})
         self.assertEqual(set(core.Tools().valves.model_dump()), set(full.Tools().valves.model_dump()))
         self.assertEqual(core.Tools().valves.NOTES_DB_PATH, curation.Tools().valves.NOTES_DB_PATH)  # both default to the same file
         version = re.search(r"^version: (.+)$", Path(full.__file__).read_text(), re.M).group(1)

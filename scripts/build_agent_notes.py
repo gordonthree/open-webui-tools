@@ -57,7 +57,7 @@ VARIANTS = {
     "agent_notes": {"title": "Agent Notes", "description": CORE_DESCRIPTION, "methods": CORE_METHODS, "valves": None, "drop_private": []},
     "agent_notes_curation": {
         "title": "Agent Notes Curation", "description": CURATION_DESCRIPTION, "methods": CURATION_METHODS,
-        "valves": ["NOTES_DB_PATH"], "drop_private": PRIVATE_CORE_ONLY,
+        "valves": ["NOTES_DB_PATH", "DEFAULT_AUTHOR"], "drop_private": PRIVATE_CORE_ONLY,
     },
 }
 
