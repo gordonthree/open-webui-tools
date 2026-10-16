@@ -600,6 +600,13 @@ Timestamps are stored as ISO text in UTC, so the comparison is a plain string co
 keeps counting), so culling leaves gaps. Culling does not touch the note's `updated_at`; clear that note's summary afterwards
 (`DELETE FROM note_summary WHERE note_pk = (SELECT note_pk FROM note_id WHERE lower(note_name) = 'autonomy-log');`) if you want it re-summarized.
 
+**Culling by age: `scripts/cull_notes.py`.** The cull query above, as a script with a backup and a preview. It keeps only entries created
+in the last `--days` days from the named note(s) (`--note a,b`), keeps a linked `continues=true` chain whole if any piece is inside the
+window, never deletes the note itself, and leaves `updated_at` and entry numbers alone. `--dry-run` reports counts only; otherwise it asks
+(or `--yes`), copies the database to `tmp/agent_notes_before_cull_*.sqlite3` (`--no-backup` skips), and culls all notes in one transaction.
+`--clear-summary` also drops the summary of any note that lost entries. `--db` points it at another file (Hannah's). Example:
+`python3 scripts/cull_notes.py --note autonomy-log --days 7 --clear-summary`. Tests: `cd scripts && python3 -m unittest test_cull_notes`.
+
 ### Host access to the databases (ACLs)
 
 The notes database (`agent_notes.sqlite3`) lives in OWUI's data volume, `<install>/data/`, and the ComfyUI job
