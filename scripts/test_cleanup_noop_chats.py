@@ -132,6 +132,56 @@ class FindTests(unittest.TestCase):
             mod.find_folder_id(FakeSession([], folders=dup), "http://x", "Companion ticks")
 
 
+class OlderThanTests(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.secrets = Path(d) / "secrets.md"
+        self.secrets.write_text("OWUI_BASE_URL: http://owui\nOWUI_API_KEY: k\n")
+
+    def session(self):
+        now = time.time()
+        day = 86400
+        old_busy = make_chat("old-busy", "did a thing")
+        new_busy = make_chat("new-busy", "did a thing")
+        old_replied = make_chat("old-replied", "ok")
+        old_replied["chat"]["history"]["messages"]["m3"] = {"id": "m3", "role": "user", "content": "thanks"}
+        old_noop = make_chat("old-noop", "NOOP")
+        for c, age in ((old_busy, 10), (new_busy, 2), (old_replied, 10), (old_noop, 10)):
+            c["updated_at"] = now - age * day
+        other = make_chat("other-folder", "x", folder_id="elsewhere")
+        other["updated_at"] = now - 30 * day
+        return FakeSession([old_busy, new_busy, old_replied, old_noop, other])
+
+    def run_main(self, session, *extra):
+        return mod.main(["--secrets", str(self.secrets), *extra], session=session)
+
+    def test_has_reply(self):
+        self.assertFalse(mod.has_reply(make_chat("a", "x")))
+        c = make_chat("b", "x")
+        c["chat"]["history"]["messages"]["m3"] = {"id": "m3", "role": "user", "content": "hi"}
+        self.assertTrue(mod.has_reply(c))
+
+    def test_without_the_flag_only_noop_goes(self):
+        s = self.session()
+        self.run_main(s, "--yes")
+        self.assertEqual(sorted(s.deleted), ["old-noop"])
+
+    def test_old_chats_go_but_not_new_replied_or_other_folder(self):
+        s = self.session()
+        self.run_main(s, "--yes", "--older-than-days", "7")
+        self.assertEqual(sorted(s.deleted), ["old-busy", "old-noop"])
+
+    def test_include_replied(self):
+        s = self.session()
+        self.run_main(s, "--yes", "--older-than-days", "7", "--include-replied")
+        self.assertEqual(sorted(s.deleted), ["old-busy", "old-noop", "old-replied"])
+
+    def test_dry_run_deletes_nothing(self):
+        s = self.session()
+        self.run_main(s, "--dry-run", "--older-than-days", "7")
+        self.assertEqual(s.deleted, [])
+
+
 class MainTests(unittest.TestCase):
     def setUp(self):
         d = tempfile.mkdtemp()

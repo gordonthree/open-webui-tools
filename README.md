@@ -807,6 +807,7 @@ is a finished assistant message that is exactly `NOOP`. `--dry-run` previews, `-
 cron, `--log FILE` appends each run's output with UTC timestamps. Suggested crontab (every 6 hours) is in
 the script's header. `--also-empty` additionally deletes finished ticks that ended with no text (stopped by hand);
 opt-in, since an empty ending can also be a real failure - check `tick_report.py` first.
+`--older-than-days N` adds a second rule: any chat in the folder last updated more than N days ago is deleted whatever it ended with, except chats you replied in (more than one user message) unless `--include-replied`. Combine with `--dry-run` first.
 Tests: `cd scripts && python3 -m unittest test_cleanup_noop_chats -v`.
 
 `scripts/tick_report.py` is a read-only review of the tick folder: outcome counts (NOOP / message /

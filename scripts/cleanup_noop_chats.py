@@ -10,6 +10,10 @@ runs into and deletes them. A chat is deleted only if ALL of these hold:
   - its current (last) message is a finished assistant message whose text is exactly NOOP.
 If Gordon replied in the chat, or the tick did anything else, the last message differs and it is kept.
 
+--older-than-days N adds a second rule: a chat in the folder that was last updated more than N days ago
+is deleted whatever it ended with (so ticks that did something don't pile up forever). A chat Gordon
+replied in (more than one user message) is still kept, unless --include-replied is given.
+
 With --also-empty, finished ticks whose final assistant message is empty are deleted too: ticks that
 were stopped by hand (or died mid-run) leave a finished chat with no text. Opt-in, because an empty
 ending can also be a real failure worth reading first - run tick_report.py to see which is which.
@@ -22,6 +26,7 @@ Usage:
     python scripts/cleanup_noop_chats.py --dry-run --also-empty   # preview stopped ticks as well
     python scripts/cleanup_noop_chats.py --folder "Ticks" --min-age-minutes 120 --yes
     python scripts/cleanup_noop_chats.py --yes --log ~/logs/cleanup_noop_chats.log
+    python scripts/cleanup_noop_chats.py --older-than-days 7 --dry-run   # also preview ticks older than a week
 
 Suggested crontab entry (every 6 hours, on the hour; adjust the repo path and log directory):
     0 */6 * * * /usr/bin/python3 /home/gordon/dev/open-webui-tools/scripts/cleanup_noop_chats.py --yes --log /home/gordon/logs/cleanup_noop_chats.log
@@ -101,6 +106,28 @@ def find_noop_chats(session, base_url, folder_id, min_age_seconds, now, include_
     return found
 
 
+def has_reply(chat):
+    """True if there is more than one user message: the tick's own prompt, plus something Gordon wrote."""
+    messages = ((chat.get("chat") or {}).get("history") or {}).get("messages") or {}
+    return sum(1 for m in messages.values() if m.get("role") == "user") > 1
+
+
+def find_old_chats(session, base_url, folder_id, older_than_seconds, now, include_replied=False):
+    """Return the full chat records in the folder last updated more than older_than_seconds ago, except
+    (unless include_replied) chats Gordon replied in."""
+    found = []
+    for summary in list_folder_chats(session, base_url, folder_id):
+        updated = summary.get("updated_at")
+        if not updated or now - updated < older_than_seconds:
+            continue  # too new (or no timestamp: err on the side of keeping it)
+        chat = get_chat(session, base_url, summary["id"])
+        if chat.get("folder_id") != folder_id:
+            continue
+        if include_replied or not has_reply(chat):
+            found.append(chat)
+    return found
+
+
 def make_reporter(log_path):
     """Return say(msg): prints to stdout and, if log_path is given, appends a UTC-timestamped line."""
     log_file = None
@@ -125,6 +152,10 @@ def main(argv=None, session=None):
     ap.add_argument("--min-age-minutes", type=float, default=60)
     ap.add_argument("--also-empty", action="store_true",
                     help="also delete finished ticks that ended with an empty message (stopped by hand)")
+    ap.add_argument("--older-than-days", type=float, metavar="N",
+                    help="also delete any chat in the folder last updated more than N days ago, whatever it ended with")
+    ap.add_argument("--include-replied", action="store_true",
+                    help="with --older-than-days, delete old chats Gordon replied in too")
     ap.add_argument("--dry-run", action="store_true", help="list what would be deleted, delete nothing")
     ap.add_argument("--yes", action="store_true", help="don't ask for confirmation (for cron)")
     ap.add_argument("--secrets", type=Path, default=DEFAULT_SECRETS_FILE)
@@ -141,11 +172,21 @@ def main(argv=None, session=None):
     folder_id = find_folder_id(session, base_url, args.folder)
     doomed = find_noop_chats(session, base_url, folder_id, args.min_age_minutes * 60, time.time(),
                              include_empty=args.also_empty)
+    kinds = {c["id"]: ("NOOP" if is_noop(c) else "empty") for c in doomed}
+    if args.older_than_days is not None:
+        if args.older_than_days <= 0:
+            ap.error("--older-than-days must be greater than 0")
+        for chat in find_old_chats(session, base_url, folder_id, args.older_than_days * 86400, time.time(),
+                                   include_replied=args.include_replied):
+            if chat["id"] not in kinds:
+                doomed.append(chat)
+                kinds[chat["id"]] = "old"
     what = "NOOP/empty" if args.also_empty else "NOOP"
+    if args.older_than_days is not None:
+        what += f"/older than {args.older_than_days:g} days"
     say(f'{len(doomed)} {what} chat(s) in "{args.folder}"' + (" (dry run)." if args.dry_run else "."))
     for chat in doomed:
-        kind = "NOOP" if is_noop(chat) else "empty"
-        say(f"  - {chat['id'][:8]}  {kind:5}  {(chat.get('title') or '')[:60]}")
+        say(f"  - {chat['id'][:8]}  {kinds[chat['id']]:5}  {(chat.get('title') or '')[:60]}")
     if args.dry_run or not doomed:
         return 0
     if not args.yes:
