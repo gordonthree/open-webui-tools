@@ -1,7 +1,7 @@
 """
 title: Agent Notes Curation
 author: Gordon
-version: 1.15.0
+version: 1.16.0
 description: The upkeep half of Agent Notes (it needs the Agent Notes tool too, and the same NOTES_DB_PATH valve):
     tags (agent_notes_add_tags/agent_notes_remove_tag/agent_notes_rename_tag), summaries
     (agent_notes_update_summary/agent_notes_delete_summary), renaming a note or changing its comment
@@ -716,7 +716,24 @@ _ENTRY_COLUMNS = f"d.entry_no, d.note_text, d.created_at, d.edited_at, d.hits, d
 _ENTRY_FROM = "FROM note_data d LEFT JOIN note_author a ON a.author_id = d.author_id"
 
 
-RAMP_FLOOR = 0.25  # how much of its strength a brand-new memory counts for when STRONG_RAMP_DAYS is on
+RAMP_FLOOR = 0.25  # how much of its strength a brand-new memory counts for when the age bias is on
+RAMP_STEP_DAYS = 7  # the ramp grows in whole weeks, so it doesn't change from one day to the next
+
+
+def auto_ramp_days(first_created: Any, max_days: float, now: "Optional[datetime.datetime]" = None) -> float:
+    """The ramp length for a note: its age (days since its oldest entry) rounded up to whole weeks, at least one week and at
+    most max_days. 0 when max_days is 0 (age bias off) or the note's first time can't be read."""
+    if not max_days or max_days <= 0:
+        return 0
+    try:
+        first = datetime.datetime.fromisoformat(str(first_created))
+    except ValueError:
+        return 0
+    if first.tzinfo is None:
+        first = first.replace(tzinfo=datetime.timezone.utc)
+    age = ((now or datetime.datetime.now(datetime.timezone.utc)) - first).total_seconds() / 86400
+    weeks = max(1, -(-int(age * 1000) // (RAMP_STEP_DAYS * 1000)))  # ceil(age / 7), kept in integers
+    return min(float(max_days), float(weeks * RAMP_STEP_DAYS))
 
 
 def age_factor(created_at: Any, ramp_days: float, now: "Optional[datetime.datetime]" = None) -> float:
@@ -736,15 +753,15 @@ def age_factor(created_at: Any, ramp_days: float, now: "Optional[datetime.dateti
 
 def read_view_db(
     db_path: str, name: str, mode: str = "tiered", recent: int = 10, strong_each: int = 5, low: int = 3, high: int = 7,
-    before: Optional[int] = None, numbers: Optional[List[int]] = None, sample: int = 0, ramp_days: float = 0,
+    before: Optional[int] = None, numbers: Optional[List[int]] = None, sample: int = 0, ramp_max_days: float = 0,
 ) -> Dict[str, Any]:
     """One note, seen the way agent_notes_read shows it. mode:
       tiered  the `recent` newest entries, plus up to `strong_each` strongest memories on each side (scores <= low, >= high) older than those
       before  the `recent` entries just older than entry number `before`
       entries the entries numbered `numbers` (anything, however old)
       sample  `sample` random entries other than the `recent` newest
-    Entries come back oldest first; `positive`/`negative` (tiered only) strongest first. With ramp_days > 0 a memory note's
-    strong entries are ranked by strength x age_factor, so a run of very recent peaks doesn't crowd out older ones (which
+    Entries come back oldest first; `positive`/`negative` (tiered only) strongest first. With ramp_max_days > 0 a memory
+    note's strong entries are ranked by strength x age_factor, the ramp being the note's own age in whole weeks (auto_ramp_days, at most ramp_max_days), so a run of very recent peaks doesn't crowd out older ones (which
     entries qualify is still decided by the raw score; persona notes are not affected)."""
     conn = notes_db_connect(db_path)
     try:
@@ -777,7 +794,10 @@ def read_view_db(
             exclude = f"AND d.entry_no NOT IN ({','.join('?' * len(skip))})" if skip else ""
             if strong_each > 0:
                 persona = note["kind"] == "persona"
-                ramp = 0 if persona else ramp_days
+                ramp = 0
+                if ramp_max_days and not persona:
+                    first = conn.execute("SELECT MIN(created_at) FROM note_data WHERE note_pk = ?", (pk,)).fetchone()[0]
+                    ramp = auto_ramp_days(first, ramp_max_days)
 
                 def strongest(cutoff_sql: str, cutoff: int, order: str) -> list:
                     if not ramp:

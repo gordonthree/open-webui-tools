@@ -748,15 +748,15 @@ class ListAndSearchTests(NotesTestCase):
     def test_age_bias_lets_an_older_strong_memory_outrank_a_fresh_peak(self):
         self.fill(30, scores={3: 7, 7: 10, 9: 10})
         self.set_ages({3: 40, 7: 1, 9: 0.1})  # a 7 from 40 days ago; a 10 from yesterday; a 10 from hours ago
-        self.tool.valves.STRONG_RAMP_DAYS = 0
+        self.tool.valves.STRONG_RAMP_MAX_DAYS = 0
         self.assertEqual([e["entry_no"] for e in self.read()["strong_memories"]["positive"]], [9, 7, 3])  # raw: strongest, newest first on ties
-        self.tool.valves.STRONG_RAMP_DAYS = 21
+        self.tool.valves.STRONG_RAMP_MAX_DAYS = 90
         self.assertEqual([e["entry_no"] for e in self.read()["strong_memories"]["positive"]], [3, 7, 9])  # 3: 20 x 1.0; 7: 50 x 0.29; 9: 50 x 0.26
 
     def test_age_bias_applies_to_negative_memories_and_not_to_who_qualifies(self):
         self.fill(30, scores={3: 3, 7: 1, 9: 4})
         self.set_ages({3: 40, 7: 0.1})
-        self.tool.valves.STRONG_RAMP_DAYS = 21
+        self.tool.valves.STRONG_RAMP_MAX_DAYS = 90
         out = self.read()["strong_memories"]["negative"]
         self.assertEqual([e["entry_no"] for e in out], [3, 7])  # 9 (a 4) never qualified
 
@@ -766,8 +766,22 @@ class ListAndSearchTests(NotesTestCase):
         conn = sqlite3.connect(self.db)
         conn.execute("UPDATE note_id SET kind = 'persona'")
         conn.commit(); conn.close()
-        self.tool.valves.STRONG_RAMP_DAYS = 21
+        self.tool.valves.STRONG_RAMP_MAX_DAYS = 90
         self.assertEqual([e["entry_no"] for e in self.read()["strong_memories"]["positive"]], [7, 3])
+
+    def test_auto_ramp_days_is_the_notes_age_in_whole_weeks_within_a_cap(self):
+        import datetime
+        now = datetime.datetime(2026, 10, 18, tzinfo=datetime.timezone.utc)
+        ago = lambda d: (now - datetime.timedelta(days=d)).isoformat()  # noqa: E731
+        self.assertEqual(mod.auto_ramp_days(ago(0.2), 90, now), 7)
+        self.assertEqual(mod.auto_ramp_days(ago(7), 90, now), 7)
+        self.assertEqual(mod.auto_ramp_days(ago(12), 90, now), 14)
+        self.assertEqual(mod.auto_ramp_days(ago(21), 90, now), 21)
+        self.assertEqual(mod.auto_ramp_days(ago(22), 90, now), 28)
+        self.assertEqual(mod.auto_ramp_days(ago(400), 90, now), 90)
+        self.assertEqual(mod.auto_ramp_days(ago(400), 60, now), 60)
+        self.assertEqual(mod.auto_ramp_days(ago(12), 0, now), 0)
+        self.assertEqual(mod.auto_ramp_days("garbage", 90, now), 0)
 
     def test_age_factor(self):
         import datetime
