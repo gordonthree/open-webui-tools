@@ -51,6 +51,17 @@ Current tools:
   OWUI's data folder, not the ComfyUI output folder). Notes are addressed by name (unique, case-insensitive) and entries by number; there
   are no UUIDs, since a model reproduces a plain-language name more reliably than an opaque id.
 
+- `drum_machine.py` → `make_beat`, `list_beats` — a step-sequencer drum machine for agents (v0.1.0). The model writes one line per drum
+  (`kick: x...x...x...x...`; `x` hit, `X` accent, `g` ghost, `.` rest; 16 steps = one 4/4 bar; drums: kick, snare, rim, clap, hat,
+  open_hat, low_tom, mid_tom, high_tom, crash, ride, cowbell, plus common spellings like `bd`/`hh`/`oh`; a JSON object is accepted too; a
+  shorter lane that divides the longest repeats), with `bpm` (40-240, default 100), `repeats` (default 2), `swing` (0-60) and `title`. The
+  tool renders it with drum sounds synthesized in pure Python (no numpy, soundfont, GPU or other package; MP3 via ffmpeg if present,
+  else WAV) and writes a General MIDI file (drums on channel 10) the user can open in any music program; both are uploaded to OWUI's file
+  storage like `voice_memo` (valves `OPEN_WEBUI_API_KEY`, `OPEN_WEBUI_BASE_URL`, `PUBLIC_BASE_URL`, `ATTACH_TO_CHAT`), kept in `BEAT_DIR`
+  (default `/app/backend/data/drum_beats`) with a `.json` sidecar of the pattern, and the model gets back Markdown links. Limits:
+  `MAX_SECONDS` (30), `MAX_STEPS` (128). Not built yet: bass/melody tracks (ABC or note lists), a soundfont renderer. Tests:
+  `cd src && python3 -m unittest test_drum_machine`. Created on the server with `push_tool.py drum_machine --create`; set its
+  `OPEN_WEBUI_API_KEY` valve and attach it to the agent's model in the web UI.
 - `voice_memo.py` → `record_voice_memo`, `list_voice_memos`, `show_last_memo` (original and spoken text of the newest memo), `record_conversation` (several named speakers as one clip, each in the voice the `SPEAKER_VOICES` valve maps to that name; limit `MAX_CONVERSATION_LINES`. With `FISH_API_KEY` set it is ONE request to Fish's own API: `<|speaker:N|>` tags in the text plus a `reference_id` list, which is Fish's documented multi-speaker form; without it, or with `NATIVE_MULTI_SPEAKER` off or more than 4 speakers, it makes one speech call per turn and joins the mp3 clips), `voice_memo_help` — lets a model record a spoken memo: the text goes to
   a TTS model on OpenRouter (valve `TTS_MODEL`, default `fish-audio/s2.1-pro-free:free`, OpenRouter's own id
   with no OWUI connection prefix like `or.`), the MP3 is kept in `MEMO_DIR` (default
