@@ -1,7 +1,7 @@
 """
 title: ComfyUI SDXL Direct
 author: Gordon
-version: 2.2.0
+version: 2.3.0
 description: Sends prompt text and sampler settings straight to a local ComfyUI server's SDXL graph (txt2img, multi-pass img2img from earlier outputs, optional LoRAs), bypassing any paraphrasing step.
 """
 
@@ -752,6 +752,17 @@ def progress_message(
     return None
 
 
+def pick_available_server(default: str, candidates: List[str], timeout: float) -> "tuple[Optional[str], List[str]]":
+    """The first of default, then the other candidates in order, that answers; and the ones that didn't (tried before it).
+    (None, all tried) when none does. Blocking: call it in a thread."""
+    down: List[str] = []
+    for server in [default] + [c for c in candidates if c.rstrip("/") != default.rstrip("/")]:
+        if ComfyClient(server, int(timeout)).is_reachable(timeout):
+            return server, down
+        down.append(server)
+    return None, down
+
+
 class ComfyClient:
     def __init__(self, base_url: str, timeout: int):
         self.base_url = base_url.rstrip("/")
@@ -798,6 +809,14 @@ class ComfyClient:
             )
         except (RequestException, ValueError, AttributeError, TypeError):
             return None
+
+    def is_reachable(self, timeout: float) -> bool:
+        """True if the server answers HTTP at all within `timeout` seconds (any status below 500: ComfyUI's /system_stats, or whatever
+        a proxy in front of it says). A refused connection, a timeout or a 5xx from a gateway means it can't take a job right now."""
+        try:
+            return requests.get(f"{self.base_url}/system_stats", timeout=timeout).status_code < 500
+        except RequestException:
+            return False
 
     def list_checkpoints(self) -> List[str]:
         """
@@ -1100,6 +1119,11 @@ class Tools:
             default=True,
             description="Let the model target any well-formed ComfyUI address, not just the ones in GPU_SERVERS. Turn off to restrict the tool to the list (stops a model from making the Open WebUI backend send render jobs to arbitrary hosts).",
         )
+        FALLBACK_TO_OTHER_SERVERS: bool = Field(
+            default=True,
+            description="When the model doesn't choose a server, check that DEFAULT_GPU_SERVER answers first; if it doesn't, use the next server in GPU_SERVERS that does. Fails only if none answers. A server the model names itself is always used as asked. Not used for img2img without source_server (the source image is on the default server).",
+        )
+        HEALTH_CHECK_TIMEOUT_SECONDS: int = Field(default=3, description="How long to wait for a server to answer the availability check before trying the next one.")
         SHOW_PROGRESS: bool = Field(
             default=True,
             description="Show live progress (stage names and sampler step/percent) in Open WebUI's status line, via ComfyUI's websocket. Falls back silently to plain polling if the websocket can't connect.",
@@ -1266,6 +1290,18 @@ class Tools:
             width = max(64, int(round(width / 8)) * 8)
             height = max(64, int(round(height / 8)) * 8)
             resolved_seed = seed if seed >= 0 else random.randint(0, 2**50)
+
+            if is_unset(gpu_server) and v.FALLBACK_TO_OTHER_SERVERS and len(allowed) > 1 and not (is_img2img and is_unset(source_server)):
+                chosen, down = await asyncio.to_thread(pick_available_server, server, v.GPU_SERVERS, max(1, v.HEALTH_CHECK_TIMEOUT_SECONDS))
+                if chosen is None:
+                    msg = f"No ComfyUI server answered ({', '.join(down)}). Try again in a moment."
+                    logger.error("SDXL render not started: %s", msg)
+                    await status("No GPU server is available", done=True)
+                    return {"success": False, "error": msg, "server": server}
+                if chosen != server:
+                    logger.warning("Default ComfyUI server %s is not answering; using %s", server, chosen)
+                    await status(f"Default GPU server not answering; using {chosen}")
+                    server = chosen
 
             wanted_ckpt = checkpoint_name or v.DEFAULT_CHECKPOINT
             client = ComfyClient(server, v.REQUEST_TIMEOUT_SECONDS)

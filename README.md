@@ -125,10 +125,12 @@ status note below for how this was found.
 | `height` | Pixels, txt2img only, default `824` |
 | `checkpoint_name` | Omit for the default checkpoint; otherwise an exact filename on the server |
 | `loras` | Omit (or `""`, `"{}"`, `"[]"`) for none; otherwise a list like `[{"lora": "name.safetensors", "strength": 0.8}]` |
-| `gpu_server` | Omit for the default server; otherwise a configured server or address |
+| `gpu_server` | Omit for the default server (if it isn't answering, the next configured server that does is used; the result's `server` says which); otherwise a configured server or address, used as given |
 | `return_img_url` | Boolean, default `false` |
 | `queue_only` | Boolean, default `false` — submit without waiting for the render |
 | `verbose` | Boolean, default `false` — also return the full submitted workflow and server history |
+
+**Server fallback (v2.3.0).** When the model omits `gpu_server`, `generate_image` first asks `DEFAULT_GPU_SERVER` (`GET /system_stats`, `HEALTH_CHECK_TIMEOUT_SECONDS`, default 3) and, if it doesn't answer (connection refused, timeout, or a 5xx from a gateway), tries the other `GPU_SERVERS` in order; it fails only if none answers, listing the ones tried. The model is not told: the result's `server` is simply the one used (so a follow-up pass naturally targets it), and the user sees a status line plus a log warning. A server the model names is never swapped. img2img with no `source_server` stays on the default (its source image lives there). `FALLBACK_TO_OTHER_SERVERS=false` turns it off. The default checkpoint and LoRAs must exist on the fallback server too, else the usual checkpoint-not-found error names what is available.
 
 ### `run_workflow` (comfy_sdxl_graph.py)
 

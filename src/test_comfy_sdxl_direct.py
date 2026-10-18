@@ -166,6 +166,107 @@ class FakeMultiServerComfy:
         return FakeResponse(404)
 
 
+class FlakyMultiServerComfy(FakeMultiServerComfy):
+    """FakeMultiServerComfy where chosen servers refuse every connection."""
+
+    def __init__(self, down=()):
+        super().__init__()
+        self.down = set(down)
+        self.asked = []
+
+    def _check(self, url):
+        base, _ = self._state(url)
+        self.asked.append(urllib.parse.urlparse(url).path)
+        if base in self.down:
+            raise mod.RequestException("connection refused")
+
+    def get(self, url, timeout=None):
+        self._check(url)
+        if urllib.parse.urlparse(url).path == "/system_stats":
+            return FakeResponse(200, {"system": {}})
+        return super().get(url, timeout)
+
+    def post(self, url, json=None, timeout=None, headers=None, files=None, data=None, params=None):
+        self._check(url)
+        return super().post(url, json=json, timeout=timeout, headers=headers, files=files, data=data, params=params)
+
+
+class ServerFallbackTests(unittest.IsolatedAsyncioTestCase):
+    A, B, C = "http://gpu-a:8188", "http://gpu-b:8188", "http://gpu-c:8188"
+
+    def setUp(self):
+        mod.POLL_INTERVAL_SECONDS = 0
+        self.tool = mod.Tools()
+        self.tool.valves.SHOW_PROGRESS = False
+        self.tool.valves.UPLOAD_TO_OPEN_WEBUI = False
+        self.tool.valves.LOG_JOBS = False
+        self.tool.valves.LOG_TO_SQLITE = False
+        self.tool.valves.GPU_SERVERS = [self.A, self.B, self.C]
+        self.tool.valves.DEFAULT_GPU_SERVER = self.A
+
+    async def render(self, fake, **kw):
+        with patch.object(mod, "requests", fake):
+            return await self.tool.generate_image("cat", "dog", checkpoint_name="ckpt.safetensors", **kw)
+
+    async def test_default_is_used_when_it_answers(self):
+        fake = FlakyMultiServerComfy()
+        res = await self.render(fake)
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["server"], self.A)
+
+    async def test_next_server_is_used_when_default_is_down_without_telling_the_model(self):
+        fake = FlakyMultiServerComfy(down=[self.A])
+        res = await self.render(fake)
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["server"], self.B)  # the result still names the server used, for later passes
+        self.assertNotIn("fallback", json.dumps(res).lower())
+        self.assertNotIn("not answering", json.dumps(res))
+
+    async def test_skips_every_dead_server_in_order(self):
+        res = await self.render(FlakyMultiServerComfy(down=[self.A, self.B]))
+        self.assertEqual(res["server"], self.C)
+
+    async def test_fails_only_when_no_server_answers(self):
+        res = await self.render(FlakyMultiServerComfy(down=[self.A, self.B, self.C]))
+        self.assertFalse(res["success"])
+        for server in (self.A, self.B, self.C):
+            self.assertIn(server, res["error"])
+
+    async def test_a_server_the_model_names_is_never_swapped(self):
+        res = await self.render(FlakyMultiServerComfy(down=[self.B]), gpu_server=self.B)
+        self.assertFalse(res["success"])
+        self.assertEqual(res["server"], self.B)
+
+    async def test_valve_off_keeps_the_old_behaviour(self):
+        self.tool.valves.FALLBACK_TO_OTHER_SERVERS = False
+        res = await self.render(FlakyMultiServerComfy(down=[self.A]))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["server"], self.A)
+
+    async def test_img2img_without_source_server_stays_on_the_default(self):
+        fake = FlakyMultiServerComfy(down=[self.A])
+        res = await self.render(fake, source_image="old_00001_.png")
+        self.assertFalse(res["success"])
+        self.assertEqual(res["server"], self.A)
+
+    async def test_img2img_with_a_source_server_can_fall_back(self):
+        fake = FlakyMultiServerComfy(down=[self.A])
+        fake.seed_file(self.C, "", "old_00001_.png")
+        res = await self.render(fake, source_image="old_00001_.png", source_server=self.C)
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["server"], self.B)
+
+    async def test_a_gateway_error_counts_as_down_but_a_404_does_not(self):
+        class Gateway(FlakyMultiServerComfy):
+            def get(self, url, timeout=None):
+                if urllib.parse.urlparse(url).path == "/system_stats" and self._state(url)[0] == ServerFallbackTests.A:
+                    return FakeResponse(502)
+                return super().get(url, timeout)
+
+        res = await self.render(Gateway())
+        self.assertEqual(res["server"], self.B)
+
+
 class JobLoggingTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         mod.POLL_INTERVAL_SECONDS = 0
