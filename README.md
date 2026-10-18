@@ -51,6 +51,23 @@ Current tools:
   OWUI's data folder, not the ComfyUI output folder). Notes are addressed by name (unique, case-insensitive) and entries by number; there
   are no UUIDs, since a model reproduces a plain-language name more reliably than an opaque id.
 
+- `vision_describe.py` (an Open WebUI **Filter**, pushed like `agent_duo` via `/api/v1/functions/`) and `describe_image.py` (a tool →
+  `describe_image`) — let a text-only model "see" by handing images to a small vision model on an Ollama server (valves `OLLAMA_URL`,
+  default `http://100.92.139.77:11434`, i.e. `ubu-gpu`; `VISION_MODEL`, default `hf.co/unsloth/Qwen3.5-4B-GGUF:Q4_K_M`; both send
+  `think:false`, `num_ctx` 4096, `keep_alive` 10m). **The filter** runs on each request (attach it to the model in the web UI; it
+  runs before the model sees the messages): every `image_url` part of a user message - a data URL, or an Open WebUI file path read
+  through Open WebUI's own helper so ownership checks apply - is shrunk to `MAX_IMAGE_SIDE` (1024 px; an image costs about one token per
+  28x28 pixels), described, and replaced by `[Image: ...]` text (`IMAGE_TEMPLATE`); the message becomes a plain string again. At most
+  `MAX_IMAGES` (4) newest images per request are described, older ones become `SKIPPED_TEMPLATE`; descriptions are cached (`CACHE_SIZE`
+  64, keyed on image + model + prompt) because an image reappears in every later request of its chat; if the vision server is down the
+  image becomes `ERROR_TEMPLATE` ("could not be viewed... say so rather than guessing") and the chat carries on. **The tool**
+  `describe_image(image, question)` is for images the model only has a reference to: a link (markdown image, `/api/v1/files/...`
+  path, web link, data URL), a ComfyUI result file name (fetched from `COMFY_SERVERS`), or blank for the newest image in the
+  conversation; `question` asks something specific instead of the general description. Measured on `ubu-gpu` (5 GB GPU, 2026-10-18):
+  Qwen3.5-4B Q4_K_M uses 3.24 GB and takes about 13 s per image warm (about 20 s with a cold load); `huihui_ai/qwen2.5-vl-abliterated:3b`
+  2.81 GB, about 16 s. The 7B caption model is 5.3 GB and would spill to the CPU. Create/update with
+  `push_tool.py vision_describe describe_image --create` (a new Function is switched on but not global). Tests:
+  `cd src && python3 -m unittest test_vision_describe`.
 - `drum_machine.py` → `make_beat`, `list_beats` — a step-sequencer for agents: drums, bass and melody (v0.2.0). The model writes one line per drum
   (`kick: x...x...x...x...`; `x` hit, `X` accent, `g` ghost, `.` rest; 16 steps = one 4/4 bar; drums: kick, snare, rim, clap, hat,
   open_hat, low_tom, mid_tom, high_tom, crash, ride, cowbell, plus common spellings like `bd`/`hh`/`oh`; a JSON object is accepted too; a
@@ -666,7 +683,7 @@ Each tool has a matching `test_*.py` file that simulates ComfyUI's HTTP API with
 module — no live ComfyUI or Open WebUI server needed. Run all of them from `src/`:
 
 ```
-python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes test_agent_notes_split test_agent_duo test_voice_memo test_openrouter_image -v
+python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes test_agent_notes_split test_agent_duo test_voice_memo test_openrouter_image test_drum_machine test_vision_describe -v
 ```
 
 `scripts/import_server_history.py` has its own test file the same way — run from `scripts/`:
