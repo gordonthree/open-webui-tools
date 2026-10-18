@@ -1,10 +1,11 @@
 """
 title: Drum Machine
 author: Gordon
-version: 0.1.0
-description: A step-sequencer drum machine for agents. The model writes a pattern as lanes of steps (kick: x...x...), the tool
-    plays it on synthesized drums and returns a short audio preview plus a standard MIDI file (drums on General MIDI channel 10)
-    that opens in any music program. Pure Python: no GPU, no soundfont, no extra packages (MP3 conversion uses ffmpeg when present).
+version: 0.2.0
+description: A step-sequencer for agents: drums, a bass line and a melody. The model writes a pattern as lanes of steps (kick: x...x...,
+    bass: C2 . . . G1 . . .), the tool plays it on synthesized instruments and returns a short audio preview plus a standard MIDI file
+    (drums on General MIDI channel 10) that opens in any music program. Pure Python: no GPU, no soundfont, no extra packages (MP3
+    conversion uses ffmpeg when present).
 requirements: requests
 """
 
@@ -79,6 +80,65 @@ STEPS_PER_BEAT = 4  # sixteenth notes; a 16-step lane is one 4/4 bar
 MIDI_TICKS_PER_BEAT = 480
 MIDI_TICKS_PER_STEP = MIDI_TICKS_PER_BEAT // STEPS_PER_BEAT
 MIDI_CHANNEL = 9  # channel 10 in musicians' numbering: General MIDI's drum channel
+
+
+# Bass and melody: one token per step, separated by spaces: a note name (C2, F#3, Bb4; C4 is middle C), a chord of notes joined by +
+# (C4+E4+G4), . for a rest, - to keep holding the previous note.
+SEMITONES = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
+NOTE_RE = re.compile(r"^([A-Ga-g])([#b]?)(-?\d)?$")
+TONAL_DEFAULT_OCTAVE = {"bass": 2, "melody": 4}
+BASS_PROGRAM = 38  # General MIDI "Synth Bass 1"
+MELODY_SOUNDS = {"square": 80, "saw": 81, "sine": 11, "pluck": 24, "pad": 89}  # name -> General MIDI program
+MIDI_LOW, MIDI_HIGH = 12, 108  # C0 to C8
+TONAL_LEVEL = {"bass": 0.55, "melody": 0.3}
+TONAL_CHANNEL = {"bass": 0, "melody": 1}
+RELEASE_SECONDS = 0.06
+
+
+def note_number(token: str, default_octave: int) -> int:
+    m = NOTE_RE.match(token)
+    if not m:
+        raise BeatError(f"{token!r} is not a note. Write notes like C2, F#3 or Bb4, a chord as C4+E4+G4, . for a rest and - to hold the last note.")
+    letter, accidental, octave = m.groups()
+    midi = 12 * ((int(octave) if octave is not None else default_octave) + 1) + SEMITONES[letter.lower()] + (1 if accidental == "#" else -1 if accidental == "b" else 0)
+    if not MIDI_LOW <= midi <= MIDI_HIGH:
+        raise BeatError(f"{token!r} is outside the range C0 to C8.")
+    return midi
+
+
+def parse_tonal(kind: str, text: Any) -> List[Any]:
+    """One step per entry: None (rest), "-" (hold the previous note) or a list of MIDI note numbers."""
+    cleaned = re.sub(rf"^\s*(?:{kind}|lead)\s*[:=]\s*", "", str(text or ""), flags=re.I)
+    tokens = [t for t in re.split(r"[\s|,]+", cleaned) if t]
+    if not tokens:
+        raise BeatError(f"{kind}: no steps. Write one token per step, e.g.  C2 . . . G1 . . .")
+    cells: List[Any] = []
+    for token in tokens:
+        if set(token) <= set(".~_"):
+            cells.extend([None] * len(token) if len(token) > 1 and token[0] == "." else [None])
+        elif token == "-":
+            cells.append("-")
+        else:
+            cells.append(sorted({note_number(part, TONAL_DEFAULT_OCTAVE[kind]) for part in token.split("+") if part}))
+    return cells
+
+
+def tonal_notes(cells: List[Any], steps: int, kind: str) -> List[Tuple[int, int, List[int]]]:
+    """The lane (looped to fill `steps`) as notes: (first step, length in steps, [MIDI notes]). A hold with nothing to hold is a rest."""
+    if steps % len(cells):
+        raise BeatError(f"The {kind} line has {len(cells)} steps, which does not divide the other lanes' {steps}. Make it {steps} steps, or a length that divides {steps}.")
+    full = cells * (steps // len(cells))
+    notes: List[Tuple[int, int, List[int]]] = []
+    current: Optional[List[Any]] = None
+    for step, cell in enumerate(full):
+        if isinstance(cell, list):
+            current = [step, 1, cell]
+            notes.append(current)  # type: ignore[arg-type]
+        elif cell == "-" and current is not None:
+            current[1] += 1
+        else:
+            current = None
+    return [(a, b, c) for a, b, c in notes]
 
 
 def lane_name(raw: str) -> str:
@@ -165,8 +225,9 @@ def _vlq(value: int) -> bytes:
     return bytes(reversed(out))
 
 
-def build_midi(lanes: Dict[str, List[float]], steps: int, repeats: int, bpm: float, swing: float, title: str) -> bytes:
-    """A format-0 standard MIDI file: one track, drums on channel 10."""
+def build_midi(lanes: Dict[str, List[float]], steps: int, repeats: int, bpm: float, swing: float, title: str,
+               tonal: Optional[Dict[str, List[Tuple[int, int, List[int]]]]] = None, melody_sound: str = "square") -> bytes:
+    """A format-0 standard MIDI file: one track, drums on channel 10, bass on channel 1 and melody on channel 2 when given."""
     events: List[Tuple[int, int, bytes]] = []  # (tick, sort order, bytes); note-offs sort before note-ons at the same tick
     swing_ticks = int(round(MIDI_TICKS_PER_STEP * swing / 100))
     for name, hits in lanes.items():
@@ -179,6 +240,17 @@ def build_midi(lanes: Dict[str, List[float]], steps: int, repeats: int, bpm: flo
             velocity = max(1, min(127, int(round(strength * 127))))
             events.append((tick, 1, bytes([0x90 | MIDI_CHANNEL, note, velocity])))
             events.append((tick + MIDI_TICKS_PER_STEP // 2, 0, bytes([0x80 | MIDI_CHANNEL, note, 0])))
+    for kind, notes in (tonal or {}).items():
+        channel = TONAL_CHANNEL[kind]
+        events.append((0, -1, bytes([0xC0 | channel, BASS_PROGRAM if kind == "bass" else MELODY_SOUNDS.get(melody_sound, 80)])))
+        for repeat in range(repeats):
+            for start, length, midis in notes:
+                step = repeat * steps + start
+                tick = step * MIDI_TICKS_PER_STEP + (swing_ticks if step % 2 else 0)
+                off = (step + length) * MIDI_TICKS_PER_STEP - 10
+                for midi in midis:
+                    events.append((tick, 1, bytes([0x90 | channel, midi, 96])))
+                    events.append((max(tick + 1, off), 0, bytes([0x80 | channel, midi, 0])))
     events.sort(key=lambda e: (e[0], e[1]))
     body = bytearray()
     label = (title or "drum beat").encode("ascii", "replace")[:60]
@@ -278,12 +350,63 @@ def synth(name: str, sr: int, rng: random.Random) -> List[float]:
     raise BeatError(f"No sound for {name!r}.")
 
 
-def render_wav(lanes: Dict[str, List[float]], steps: int, repeats: int, bpm: float, swing: float, sample_rate: int) -> bytes:
+def _lowpass(x: List[float], alpha: float) -> List[float]:
+    out, acc = [], 0.0
+    for v in x:
+        acc += alpha * (v - acc)
+        out.append(acc)
+    return out
+
+
+def synth_note(sound: str, midi: int, seconds: float, sr: int, rng: random.Random) -> List[float]:
+    """One pitched note held for `seconds`, then a short release. `sound` is bass, square, saw, sine, pluck or pad."""
+    freq = 440.0 * 2 ** ((midi - 69) / 12)
+    held = max(1, int(sr * seconds))
+    total = held + int(sr * RELEASE_SECONDS)
+    two_pi = 2 * math.pi
+    if sound == "pluck":  # Karplus-Strong: a burst of noise circulating in a tiny, slightly damped delay line
+        period = max(2, int(sr / freq))
+        line = [rng.uniform(-1, 1) for _ in range(period)]
+        raw = []
+        for i in range(total):
+            k = i % period
+            nxt = line[(k + 1) % period]
+            raw.append(line[k])
+            line[k] = 0.4985 * (line[k] + nxt)
+    elif sound == "bass":
+        raw = [0.7 * math.sin(two_pi * freq * i / sr) + 0.25 * math.sin(two_pi * 2 * freq * i / sr) + 0.12 * math.sin(two_pi * 3 * freq * i / sr) for i in range(total)]
+    elif sound == "sine":
+        raw = [math.sin(two_pi * freq * i / sr) for i in range(total)]
+    elif sound == "square":
+        raw = _lowpass([1.0 if (freq * i / sr) % 1.0 < 0.5 else -1.0 for i in range(total)], 0.3)
+    elif sound == "saw":
+        raw = _lowpass([2.0 * ((freq * i / sr) % 1.0) - 1.0 for i in range(total)], 0.25)
+    elif sound == "pad":
+        raw = _lowpass([sum(2.0 * ((freq * d * i / sr) % 1.0) - 1.0 for d in (0.996, 1.0, 1.004)) / 3 for i in range(total)], 0.12)
+    else:
+        raise BeatError(f"No sound called {sound!r}. Use: {', '.join(MELODY_SOUNDS)}.")
+    attack = max(1, int(sr * (0.08 if sound == "pad" else 0.006)))
+    release = total - held
+    out = []
+    for i, v in enumerate(raw):
+        if sound == "pluck":
+            shape = 1.0
+        else:
+            shape = 0.65 + 0.35 * math.exp(-i / sr * 8)  # a small bite at the start that settles into the sustain
+        gain = min(1.0, (i + 1) / attack) * shape
+        if i >= held:
+            gain *= max(0.0, 1.0 - (i - held) / release)
+        out.append(v * gain)
+    return out
+
+
+def render_wav(lanes: Dict[str, List[float]], steps: int, repeats: int, bpm: float, swing: float, sample_rate: int,
+               tonal: Optional[Dict[str, List[Tuple[int, int, List[int]]]]] = None, melody_sound: str = "square") -> bytes:
     """The pattern as 16-bit mono WAV bytes."""
     rng = random.Random(1)  # the same pattern always sounds the same
     step_seconds = 60.0 / bpm / STEPS_PER_BEAT
     sounds = {name: synth(name, sample_rate, rng) for name in lanes}
-    tail = max(len(s) for s in sounds.values())
+    tail = max([len(x) for x in sounds.values()] + [int(sample_rate * RELEASE_SECONDS)])
     total = int(sample_rate * step_seconds * steps * repeats) + tail
     buf = [0.0] * total
     swing_seconds = step_seconds * swing / 100
@@ -298,6 +421,21 @@ def render_wav(lanes: Dict[str, List[float]], steps: int, repeats: int, bpm: flo
             end = min(total, at + len(sound))
             for i in range(at, end):
                 buf[i] += sound[i - at] * gain
+    cache: Dict[tuple, List[float]] = {}
+    for kind, notes in (tonal or {}).items():
+        voice = "bass" if kind == "bass" else melody_sound
+        level = TONAL_LEVEL[kind]
+        for repeat in range(repeats):
+            for start, length, midis in notes:
+                step = repeat * steps + start
+                at = int(sample_rate * (step * step_seconds + (swing_seconds if step % 2 else 0)))
+                for midi in midis:
+                    key = (voice, midi, length)
+                    if key not in cache:
+                        cache[key] = synth_note(voice, midi, length * step_seconds, sample_rate, rng)
+                    wave_ = cache[key]
+                    for i in range(at, min(total, at + len(wave_))):
+                        buf[i] += wave_[i - at] * level / math.sqrt(len(midis))
     peak = max((abs(v) for v in buf), default=0.0) or 1.0
     scale = 0.9 / peak if peak > 0.9 else 1.0
     pcm = array("h", (int(max(-1.0, min(1.0, v * scale)) * 32767) for v in buf))
@@ -396,28 +534,49 @@ class Tools:
         return path
 
     async def make_beat(
-        self, pattern: str, bpm: Optional[str] = None, repeats: Optional[str] = None, swing: Optional[str] = None,
-        title: Optional[str] = None, __event_emitter__: Optional[Callable[[dict], Any]] = None,
+        self, pattern: Optional[str] = None, bpm: Optional[str] = None, repeats: Optional[str] = None, swing: Optional[str] = None,
+        title: Optional[str] = None, bass: Optional[str] = None, melody: Optional[str] = None, melody_sound: Optional[str] = None,
+        __event_emitter__: Optional[Callable[[dict], Any]] = None,
     ) -> str:
         """
-        Play a drum pattern on a step sequencer and give the user a link to listen to it, plus a MIDI file for their music software.
-        Write one line per drum: its name, a colon, then the steps. Each step is a sixteenth note, so 16 steps are one bar of 4/4.
-        x = hit, X = accent (loud), g = ghost note (soft), . = rest. Spaces and | are ignored, so  x... x... x... x...  is fine.
-        Drums: kick, snare, rim, clap, hat, open_hat, low_tom, mid_tom, high_tom, crash, ride, cowbell. All lines must be the same
-        length (a shorter one that divides it evenly, like 4 steps in a 16-step bar, repeats). Example:
-        kick: x...x...x...x...
-        snare: ....x.......x...
-        hat: x.x.x.x.x.x.x.x.
+        Play drums, a bass line and a melody on a step sequencer and give the user a link to listen to it, plus a MIDI file for their music software.
+        Everything is steps: each step is a sixteenth note, so 16 steps are one bar of 4/4. Every line must have the same number of steps (a shorter one that divides it evenly repeats).
+        DRUMS (pattern): one line per drum, its name, a colon, then x = hit, X = accent, g = ghost note, . = rest. Drums: kick, snare, rim, clap, hat, open_hat, low_tom, mid_tom, high_tom, crash, ride, cowbell.
+        BASS and MELODY: one token per step, separated by spaces. A note name (C2, F#3, Bb4; C4 is middle C), a chord joined with + (C4+E4+G4), . = rest, - = keep holding the last note. Bass is usually octaves 1-3, melody 4-5.
+        Example (one bar):
+        pattern = "kick: x...x...x...x...\nsnare: ....x.......x...\nhat: x.x.x.x.x.x.x.x."
+        bass = "C2 . . C2 . . G1 . A1 . . . G1 - - ."
+        melody = "E4 - . G4 - - A4 - G4 . . . E4 - - ."
 
-        :param pattern: The drum lines described above, separated by new lines.
+        :param pattern: The drum lines described above, separated by new lines. Pass "" (or omit) for no drums if you give a bass or melody.
         :param bpm: Tempo in beats per minute, 40 to 240. Pass "" (or omit) for 100.
         :param repeats: How many times the pattern plays, default 2. A short sample is the point; the tool limits the total length.
         :param swing: 0 to 60. Delays every second step for a shuffled feel. Pass "" (or omit) for none.
         :param title: A short name for the beat. Pass "" (or omit) to leave it unnamed.
+        :param bass: A bass line, one token per step as described above. Pass "" (or omit) for none.
+        :param melody: A melody, one token per step as described above. Pass "" (or omit) for none.
+        :param melody_sound: square (default, chiptune), saw, sine, pluck or pad. Pass "" (or omit) for square.
         """
         v = self.valves
         try:
-            lanes, steps = parse_pattern(pattern)
+            lanes: Dict[str, List[float]] = {}
+            steps = 0
+            if not is_unset(pattern):
+                lanes, steps = parse_pattern(pattern)
+            cells = {kind: parse_tonal(kind, text) for kind, text in (("bass", bass), ("melody", melody)) if not is_unset(text)}
+            if not lanes and not cells:
+                raise BeatError("Give at least one of pattern (drums), bass or melody. Example drums:\nkick: x...x...x...x...\nsnare: ....x.......x...")
+            if cells:
+                longest = max([steps] + [len(c) for c in cells.values()])
+                if lanes and steps != longest:  # a drum pattern shorter than a tonal line loops to fill it
+                    if longest % steps:
+                        raise BeatError(f"The drum pattern has {steps} steps and the longest line {longest}; make the lengths match, or make the shorter divide the longer.")
+                    lanes = {n: h * (longest // steps) for n, h in lanes.items()}
+                steps = longest
+            sound = "square" if is_unset(melody_sound) else str(melody_sound).strip().lower()
+            if sound not in MELODY_SOUNDS:
+                raise BeatError(f"melody_sound {melody_sound!r} is not one of: {', '.join(MELODY_SOUNDS)}.")
+            tonal = {kind: tonal_notes(c, steps, kind) for kind, c in cells.items()}
             if steps > v.MAX_STEPS:
                 raise BeatError(f"The pattern is {steps} steps; the limit is {v.MAX_STEPS}. Shorten it (16 steps is one bar).")
             tempo = _number(bpm, 100, 40, 240, "bpm")
@@ -430,10 +589,10 @@ class Tools:
         except BeatError as e:
             return f"Could not make the beat: {e}"
 
-        await _emit(__event_emitter__, {"type": "status", "data": {"description": "Programming the drum machine...", "done": False}})
+        await _emit(__event_emitter__, {"type": "status", "data": {"description": "Programming the sequencer...", "done": False}})
         label = (title or "").strip() if not is_unset(title) else ""
-        wav = await asyncio.to_thread(render_wav, lanes, steps, times, tempo, swung, max(8000, v.SAMPLE_RATE))
-        midi = build_midi(lanes, steps, times, tempo, swung, label)
+        wav = await asyncio.to_thread(render_wav, lanes, steps, times, tempo, swung, max(8000, v.SAMPLE_RATE), tonal, sound)
+        midi = build_midi(lanes, steps, times, tempo, swung, label, tonal, sound)
         audio, ext = wav, "wav"
         if v.OUTPUT_FORMAT.strip().lower() == "mp3":
             mp3 = await asyncio.to_thread(wav_to_mp3, wav)
@@ -441,7 +600,7 @@ class Tools:
                 audio, ext = mp3, "mp3"
 
         stamp = datetime.now().astimezone()
-        base = f"{stamp:%Y%m%d-%H%M%S}-{slugify(label or next(iter(lanes)) + '-beat')}"
+        base = f"{stamp:%Y%m%d-%H%M%S}-{slugify(label or (next(iter(lanes)) if lanes else next(iter(cells))) + '-beat')}"
         saved = ""
         try:
             folder = self._beat_dir()
@@ -450,6 +609,7 @@ class Tools:
             (folder / f"{base}.json").write_text(json.dumps({
                 "title": label, "created": stamp.isoformat(timespec="seconds"), "bpm": tempo, "swing": swung, "repeats": times, "steps": steps,
                 "pattern": {n: "".join("X" if h >= 1 else "x" if h >= 0.8 else "g" if h else "." for h in hits) for n, hits in lanes.items()},
+                **({"bass": str(bass).strip()} if "bass" in cells else {}), **({"melody": str(melody).strip(), "melody_sound": sound} if "melody" in cells else {}),
             }, indent=1))
             saved = str(folder / f"{base}.{ext}")
         except OSError as e:
@@ -500,6 +660,8 @@ class Tools:
                 meta = json.loads(path.read_text())
             except (OSError, ValueError):
                 continue
-            lanes = "\n".join(f"  {n}: {p}" for n, p in meta.get("pattern", {}).items())
-            lines.append(f"{path.stem} - {meta.get('title') or 'untitled'} ({meta.get('bpm'):g} BPM, swing {meta.get('swing', 0):g}, repeats {meta.get('repeats')})\n{lanes}")
+            shown = [f"  {n}: {p}" for n, p in meta.get("pattern", {}).items()]
+            shown += [f"  bass: {meta['bass']}"] if meta.get("bass") else []
+            shown += [f"  melody ({meta.get('melody_sound', 'square')}): {meta['melody']}"] if meta.get("melody") else []
+            lines.append(f"{path.stem} - {meta.get('title') or 'untitled'} ({meta.get('bpm'):g} BPM, swing {meta.get('swing', 0):g}, repeats {meta.get('repeats')})\n" + "\n".join(shown))
         return "\n\n".join(lines) or "No beats could be read."

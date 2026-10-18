@@ -13,7 +13,7 @@ import drum_machine as dm
 BASIC = "kick: x...x...x...x...\nsnare: ....x.......x...\nhat: x.x.x.x.x.x.x.x."
 
 
-def read_midi(data):
+def read_midi(data, any_channel=False):
     """(ticks per beat, tempo us/beat, [(tick, kind, note, velocity)]) from a format-0 file."""
     assert data[:4] == b"MThd"
     division = struct.unpack(">H", data[12:14])[0]
@@ -37,9 +37,15 @@ def read_midi(data):
             if kind == 0x51:
                 tempo = int.from_bytes(track[pos:pos + 3], "big")
             pos += size
+        elif status & 0xF0 == 0xC0:  # program change: one data byte
+            notes.append((tick, "program", track[pos], 0, status & 0x0F))
+            pos += 1
         else:
-            notes.append((tick, "on" if status & 0xF0 == 0x90 else "off", track[pos], track[pos + 1]))
-            assert status & 0x0F == 9
+            if any_channel:
+                notes.append((tick, "on" if status & 0xF0 == 0x90 else "off", track[pos], track[pos + 1], status & 0x0F))
+            else:
+                notes.append((tick, "on" if status & 0xF0 == 0x90 else "off", track[pos], track[pos + 1]))
+                assert status & 0x0F == 9
             pos += 2
     return division, tempo, notes
 
@@ -86,7 +92,61 @@ class ParseTests(unittest.TestCase):
         self.assertEqual([i for i, h in enumerate(lanes["kick"]) if h], [0, 2])
 
 
+class TonalParseTests(unittest.TestCase):
+    def test_note_numbers(self):
+        n = dm.note_number
+        self.assertEqual([n("C4", 4), n("A4", 4), n("C2", 4), n("F#3", 4), n("Bb2", 4), n("bb2", 4), n("b3", 4), n("C0", 4)], [60, 69, 36, 54, 46, 46, 59, 12])
+        self.assertEqual(dm.note_number("E", 2), 40)  # no octave: the line's default
+        self.assertEqual(dm.note_number("Db4", 4), dm.note_number("C#4", 4))
+
+    def test_bad_notes_are_explained(self):
+        for bad in ("H2", "C99", "xyz", "C9"):
+            with self.assertRaises(dm.BeatError):
+                dm.note_number(bad, 4)
+        with self.assertRaisesRegex(dm.BeatError, "not a note"):
+            dm.parse_tonal("bass", "C2 banana")
+
+    def test_cells_rests_holds_chords_and_label(self):
+        cells = dm.parse_tonal("melody", "melody: C4 - . E4+G4+C4 | .. -")
+        self.assertEqual(cells, [[60], "-", None, [60, 64, 67], None, None, "-"])
+
+    def test_notes_with_holds_and_loop(self):
+        cells = dm.parse_tonal("bass", "C2 - . D2")
+        self.assertEqual(dm.tonal_notes(cells, 8, "bass"), [(0, 2, [36]), (3, 1, [38]), (4, 2, [36]), (7, 1, [38])])
+        self.assertEqual(dm.tonal_notes(dm.parse_tonal("bass", "- C2 - ."), 4, "bass"), [(1, 2, [36])])  # a hold with nothing to hold is a rest
+        with self.assertRaisesRegex(dm.BeatError, "does not divide"):
+            dm.tonal_notes(dm.parse_tonal("bass", "C2 . ."), 16, "bass")
+
+    def test_empty_line(self):
+        with self.assertRaises(dm.BeatError):
+            dm.parse_tonal("bass", "   ")
+
+
 class MidiTests(unittest.TestCase):
+    def test_bass_and_melody_get_their_own_channels_and_programs(self):
+        tonal = {"bass": dm.tonal_notes(dm.parse_tonal("bass", "C2 - . ."), 4, "bass"), "melody": dm.tonal_notes(dm.parse_tonal("melody", "E4+G4 . . ."), 4, "melody")}
+        events = read_midi(dm.build_midi({}, 4, 1, 120, 0, "t", tonal, "pluck"), any_channel=True)[2]
+        self.assertIn((0, "program", 38, 0, 0), events)
+        self.assertIn((0, "program", 24, 0, 1), events)
+        ons = sorted((t, n, c) for t, k, n, _v, c in events if k == "on")
+        self.assertEqual(ons, [(0, 36, 0), (0, 64, 1), (0, 67, 1)])
+        offs = {n: t for t, k, n, _v, _c in events if k == "off"}
+        self.assertEqual(offs[36], 2 * 120 - 10)  # held for two steps, a hair short of the next
+        self.assertEqual(offs[64], 120 - 10)
+
+    def test_notes_repeat_with_the_pattern_and_swing_moves_odd_steps(self):
+        tonal = {"melody": [(1, 1, [60])]}
+        events = read_midi(dm.build_midi({}, 4, 2, 100, 50, ""), any_channel=True)[2]
+        self.assertEqual([e for e in events if e[1] == "on"], [])
+        events = read_midi(dm.build_midi({}, 4, 2, 100, 50, "", tonal), any_channel=True)[2]
+        self.assertEqual([t for t, k, *_ in events if k == "on"], [120 + 60, 4 * 120 + 120 + 60])
+
+    def test_notes_survive_a_clean_parse_of_drums_only(self):
+        lanes, steps = dm.parse_pattern("kick: x...")
+        self.assertTrue(all(len(e) == 5 for e in read_midi(dm.build_midi(lanes, steps, 1, 100, 0, ""), any_channel=True)[2]))
+
+
+class MidiFormatTests(unittest.TestCase):
     def test_notes_ticks_tempo_and_channel(self):
         lanes, steps = dm.parse_pattern("kick: X...\nsnare: ..x.")
         division, tempo, notes = read_midi(dm.build_midi(lanes, steps, 2, 120, 0, "t"))
@@ -126,6 +186,43 @@ class RenderTests(unittest.TestCase):
             _rate, _frames, samples = self.wav_info(dm.render_wav(lanes, 4, 1, 100, 0, 8000))
             self.assertGreater(max(abs(v) for v in samples), 500, name)
             self.assertLessEqual(max(abs(v) for v in samples), 32767, name)
+
+
+class TonalRenderTests(unittest.TestCase):
+    def samples(self, data):
+        with wave.open(BytesIO(data)) as w:
+            frames = w.readframes(w.getnframes())
+            return w.getframerate(), [struct.unpack_from("<h", frames, i * 2)[0] for i in range(w.getnframes())]
+
+    def pitch(self, rate, samples, start, end):
+        window = samples[int(rate * start):int(rate * end)]
+        crossings = sum(1 for a, b in zip(window, window[1:]) if a < 0 <= b)
+        return crossings / (end - start)
+
+    def test_every_sound_plays_at_the_right_pitch(self):
+        notes = [(0, 8, [69])]  # A4 = 440 Hz held for 8 steps at 60 BPM = 2 s
+        for sound in ("square", "saw", "sine", "bass"):
+            tonal = {"melody" if sound != "bass" else "bass": notes}
+            rate, samples = self.samples(dm.render_wav({}, 8, 1, 60, 0, 16000, tonal, sound if sound != "bass" else "square"))
+            self.assertGreater(max(abs(v) for v in samples), 2000, sound)
+            self.assertAlmostEqual(self.pitch(rate, samples, 0.3, 1.3), 440, delta=25, msg=sound)
+
+    def test_pluck_and_pad_make_sound_and_fade(self):
+        for sound in ("pluck", "pad"):
+            rate, samples = self.samples(dm.render_wav({}, 4, 1, 60, 0, 16000, {"melody": [(0, 4, [57])]}, sound))
+            self.assertGreater(max(abs(v) for v in samples[:int(rate * 0.5)]), 1500, sound)
+
+    def test_a_rest_is_silent_and_a_hold_keeps_sounding(self):
+        tonal = {"melody": [(0, 4, [60])]}  # one second at 60 BPM, then three silent steps
+        rate, samples = self.samples(dm.render_wav({}, 8, 1, 60, 0, 8000, tonal, "sine"))
+        loud = lambda a, b: max(abs(v) for v in samples[int(rate * a):int(rate * b)])  # noqa: E731
+        self.assertGreater(loud(0.8, 0.95), 1500)
+        self.assertLess(loud(1.3, 1.9), 200)
+
+    def test_drums_alone_and_tonal_alone_both_render(self):
+        lanes, steps = dm.parse_pattern("kick: x...")
+        self.assertTrue(dm.render_wav(lanes, steps, 1, 100, 0, 8000))
+        self.assertTrue(dm.render_wav({}, 4, 1, 100, 0, 8000, {"bass": [(0, 1, [36])]}))
 
 
 class ToolTests(unittest.TestCase):
@@ -193,6 +290,37 @@ class ToolTests(unittest.TestCase):
         with patch.object(dm.shutil, "which", return_value=None):
             self.run_tool(self.tool.make_beat(BASIC))
         self.assertEqual(sorted(p.suffix for p in Path(self.dir).iterdir()), [".json", ".mid", ".wav"])
+
+    def test_bass_and_melody_with_drums(self):
+        out = self.run_tool(self.tool.make_beat(BASIC, bass="C2 . . C2 . . G1 . A1 . . . G1 - - .", melody="E4 - . G4 - - A4 - G4 . . . E4 - - .", melody_sound="pluck", title="Full"))
+        self.assertIn("Made the beat: 16 steps x 2", out)
+        meta = json.loads(next(Path(self.dir).glob("*.json")).read_text())
+        self.assertEqual((meta["melody_sound"], meta["bass"][:5]), ("pluck", "C2 . "))
+        events = read_midi(next(Path(self.dir).glob("*.mid")).read_bytes(), any_channel=True)[2]
+        self.assertEqual({c for *_x, c in events}, {0, 1, 9})
+
+    def test_bass_only_needs_no_drums_and_a_short_drum_pattern_loops_to_fit(self):
+        out = self.run_tool(self.tool.make_beat(bass="C2 . . . G1 . . . C2 . . . G1 . . ."))
+        self.assertIn("Made the beat: 16 steps", out)
+        out = self.run_tool(self.tool.make_beat("kick: x...", bass="C2 . . . G1 . . . C2 . . . G1 . . ."))
+        self.assertIn("Made the beat: 16 steps", out)
+
+    def test_tonal_mistakes_are_explained(self):
+        for kwargs, expect in (
+            ({"melody": "C4 . H4 ."}, "not a note"),
+            ({"pattern": BASIC, "bass": "C2 . ."}, "does not divide"),
+            ({"pattern": BASIC, "melody": "C4 .", "melody_sound": "kazoo"}, "not one of"),
+            ({}, "at least one of"),
+        ):
+            out = self.run_tool(self.tool.make_beat(**kwargs))
+            self.assertTrue(out.startswith("Could not make the beat"), out)
+            self.assertIn(expect, out)
+
+    def test_list_beats_shows_bass_and_melody(self):
+        self.run_tool(self.tool.make_beat(BASIC, bass="C2 . . .", melody="E4 . . .", melody_sound="saw", title="x"))
+        out = self.run_tool(self.tool.list_beats())
+        self.assertIn("bass: C2 . . .", out)
+        self.assertIn("melody (saw): E4 . . .", out)
 
     def test_list_beats(self):
         self.assertEqual(self.run_tool(self.tool.list_beats()), "No beats have been made yet.")
