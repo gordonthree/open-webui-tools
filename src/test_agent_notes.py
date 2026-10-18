@@ -735,6 +735,49 @@ class ListAndSearchTests(NotesTestCase):
         self.tool.valves.READ_STRONG_EACH = 0
         self.assertNotIn("strong_memories", self.read())
 
+    def age(self, days_ago):
+        import datetime
+        return (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days_ago)).isoformat()
+
+    def set_ages(self, ages):
+        conn = sqlite3.connect(self.db)
+        for no, days in ages.items():
+            conn.execute("UPDATE note_data SET created_at = ? WHERE entry_no = ?", (self.age(days), no))
+        conn.commit(); conn.close()
+
+    def test_age_bias_lets_an_older_strong_memory_outrank_a_fresh_peak(self):
+        self.fill(30, scores={3: 7, 7: 10, 9: 10})
+        self.set_ages({3: 40, 7: 1, 9: 0.1})  # a 7 from 40 days ago; a 10 from yesterday; a 10 from hours ago
+        self.tool.valves.STRONG_RAMP_DAYS = 0
+        self.assertEqual([e["entry_no"] for e in self.read()["strong_memories"]["positive"]], [9, 7, 3])  # raw: strongest, newest first on ties
+        self.tool.valves.STRONG_RAMP_DAYS = 21
+        self.assertEqual([e["entry_no"] for e in self.read()["strong_memories"]["positive"]], [3, 7, 9])  # 3: 20 x 1.0; 7: 50 x 0.29; 9: 50 x 0.26
+
+    def test_age_bias_applies_to_negative_memories_and_not_to_who_qualifies(self):
+        self.fill(30, scores={3: 3, 7: 1, 9: 4})
+        self.set_ages({3: 40, 7: 0.1})
+        self.tool.valves.STRONG_RAMP_DAYS = 21
+        out = self.read()["strong_memories"]["negative"]
+        self.assertEqual([e["entry_no"] for e in out], [3, 7])  # 9 (a 4) never qualified
+
+    def test_age_bias_is_off_for_persona_notes(self):
+        self.fill(30, scores={3: 7, 7: 10})
+        self.set_ages({3: 40, 7: 0.1})
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE note_id SET kind = 'persona'")
+        conn.commit(); conn.close()
+        self.tool.valves.STRONG_RAMP_DAYS = 21
+        self.assertEqual([e["entry_no"] for e in self.read()["strong_memories"]["positive"]], [7, 3])
+
+    def test_age_factor(self):
+        import datetime
+        now = datetime.datetime(2026, 1, 31, tzinfo=datetime.timezone.utc)
+        self.assertAlmostEqual(mod.age_factor("2026-01-31T00:00:00+00:00", 30, now), mod.RAMP_FLOOR)
+        self.assertAlmostEqual(mod.age_factor("2026-01-16T00:00:00+00:00", 30, now), mod.RAMP_FLOOR + (1 - mod.RAMP_FLOOR) / 2)
+        self.assertEqual(mod.age_factor("2025-01-01T00:00:00+00:00", 30, now), 1.0)
+        self.assertEqual(mod.age_factor("2026-01-31T00:00:00+00:00", 0, now), 1.0)
+        self.assertEqual(mod.age_factor("garbage", 30, now), 1.0)
+
     def test_strong_cutoffs_are_valves_and_a_small_note_is_shown_whole(self):
         self.fill(30, scores={3: 6})
         self.tool.valves.STRONG_HIGH = 6

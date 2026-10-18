@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.14.0
+version: 1.15.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -721,16 +721,36 @@ _ENTRY_COLUMNS = f"d.entry_no, d.note_text, d.created_at, d.edited_at, d.hits, d
 _ENTRY_FROM = "FROM note_data d LEFT JOIN note_author a ON a.author_id = d.author_id"
 
 
+RAMP_FLOOR = 0.25  # how much of its strength a brand-new memory counts for when STRONG_RAMP_DAYS is on
+
+
+def age_factor(created_at: Any, ramp_days: float, now: "Optional[datetime.datetime]" = None) -> float:
+    """How much of a memory's strength counts when choosing which older memories to show: RAMP_FLOOR for one made just now, rising in
+    a straight line to 1 at ramp_days old (and staying there). 1 for everything when ramp_days is 0, or when the time can't be read."""
+    if not ramp_days or ramp_days <= 0:
+        return 1.0
+    try:
+        made = datetime.datetime.fromisoformat(str(created_at))
+    except ValueError:
+        return 1.0
+    if made.tzinfo is None:
+        made = made.replace(tzinfo=datetime.timezone.utc)
+    age = ((now or datetime.datetime.now(datetime.timezone.utc)) - made).total_seconds() / 86400
+    return RAMP_FLOOR + (1 - RAMP_FLOOR) * max(0.0, min(1.0, age / ramp_days))
+
+
 def read_view_db(
     db_path: str, name: str, mode: str = "tiered", recent: int = 10, strong_each: int = 5, low: int = 3, high: int = 7,
-    before: Optional[int] = None, numbers: Optional[List[int]] = None, sample: int = 0,
+    before: Optional[int] = None, numbers: Optional[List[int]] = None, sample: int = 0, ramp_days: float = 0,
 ) -> Dict[str, Any]:
     """One note, seen the way agent_notes_read shows it. mode:
       tiered  the `recent` newest entries, plus up to `strong_each` strongest memories on each side (scores <= low, >= high) older than those
       before  the `recent` entries just older than entry number `before`
       entries the entries numbered `numbers` (anything, however old)
       sample  `sample` random entries other than the `recent` newest
-    Entries come back oldest first; `positive`/`negative` (tiered only) strongest first."""
+    Entries come back oldest first; `positive`/`negative` (tiered only) strongest first. With ramp_days > 0 a memory note's
+    strong entries are ranked by strength x age_factor, so a run of very recent peaks doesn't crowd out older ones (which
+    entries qualify is still decided by the raw score; persona notes are not affected)."""
     conn = notes_db_connect(db_path)
     try:
         note = _get_note(conn, name)
@@ -761,9 +781,20 @@ def read_view_db(
             skip = [r["entry_no"] for r in rows]
             exclude = f"AND d.entry_no NOT IN ({','.join('?' * len(skip))})" if skip else ""
             if strong_each > 0:
-                out["positive"] = fetch(f"{exclude} AND {_SCORE_SQL} >= ?", skip + [high], f"d.weight DESC, d.created_at DESC", strong_each)
-                if note["kind"] != "persona":  # in a persona note a low weight is a weak trait, not a painful memory
-                    out["negative"] = fetch(f"{exclude} AND {_SCORE_SQL} <= ?", skip + [low], f"d.weight ASC, d.created_at DESC", strong_each)
+                persona = note["kind"] == "persona"
+                ramp = 0 if persona else ramp_days
+
+                def strongest(cutoff_sql: str, cutoff: int, order: str) -> list:
+                    if not ramp:
+                        return fetch(f"{exclude} AND {cutoff_sql} ?", skip + [cutoff], f"{order}, d.created_at DESC", strong_each)
+                    rows = fetch(f"{exclude} AND {cutoff_sql} ?", skip + [cutoff], f"{order}, d.created_at DESC", 100000)
+                    now = datetime.datetime.now(datetime.timezone.utc)
+                    rows.sort(key=lambda r: -abs(r["weight"] - DEFAULT_WEIGHT) * age_factor(r["created_at"], ramp, now))  # stable: ties keep newest first
+                    return rows[:strong_each]
+
+                out["positive"] = strongest(f"{_SCORE_SQL} >=", high, "d.weight DESC")
+                if not persona:  # in a persona note a low weight is a weak trait, not a painful memory
+                    out["negative"] = strongest(f"{_SCORE_SQL} <=", low, "d.weight ASC")
         return out
     finally:
         conn.close()
@@ -1493,6 +1524,7 @@ class Tools:
         READ_MAX_CHARS: int = Field(default=6000, description="Character budget for one agent_notes_read reply (about a quarter as many tokens): whole entries only, shared out one at a time between the newest entries and the strongest positive and negative memories; the rest is left out and the reply says so.")
         STRONG_LOW: int = Field(default=3, description="An entry rated at or below this (1-10, 5 is neutral) counts as a strong negative memory.")
         STRONG_HIGH: int = Field(default=7, description="An entry rated at or above this (1-10, 5 is neutral) counts as a strong positive memory.")
+        STRONG_RAMP_DAYS: float = Field(default=21, description="Age bias for the strong older memories agent_notes_read adds (memory notes only): a memory counts for 25% of its strength when brand new, rising evenly to 100% at this many days old, so a run of very recent peaks doesn't crowd out older ones. 0 turns it off (the strongest are then simply the most extreme scores, newest first on ties).")
         SEARCH_SNIPPET_CHARS: int = Field(default=120, description="How much of each entry agent_notes_search shows on its result cards.")
         MAX_LIST_RESULTS: int = Field(default=50, description="Caps agent_notes_list results.")
         MIN_SUMMARY_CHARS: int = Field(default=1000, description="A note whose entries total fewer characters than this isn't offered for summarizing (agent_notes_list needs_summary=true skips it, and shows 'short'): a summary of a note that small would just copy it. 0 summarizes everything.")
@@ -1604,7 +1636,7 @@ class Tools:
             mode = "entries" if numbers else "sample" if sample_n else "before" if before_no else "tiered"
             result = await asyncio.to_thread(
                 read_view_db, v.NOTES_DB_PATH, title, mode, recent, max(0, v.READ_STRONG_EACH), v.STRONG_LOW, v.STRONG_HIGH,
-                before_no, numbers, min(sample_n or 0, 10),
+                before_no, numbers, min(sample_n or 0, 10), v.STRONG_RAMP_DAYS,
             )
         except (ValueError, sqlite3.Error) as e:
             return _error(e)

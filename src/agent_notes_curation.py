@@ -1,7 +1,7 @@
 """
 title: Agent Notes Curation
 author: Gordon
-version: 1.14.0
+version: 1.15.0
 description: The upkeep half of Agent Notes (it needs the Agent Notes tool too, and the same NOTES_DB_PATH valve):
     tags (agent_notes_add_tags/agent_notes_remove_tag/agent_notes_rename_tag), summaries
     (agent_notes_update_summary/agent_notes_delete_summary), renaming a note or changing its comment
@@ -716,16 +716,36 @@ _ENTRY_COLUMNS = f"d.entry_no, d.note_text, d.created_at, d.edited_at, d.hits, d
 _ENTRY_FROM = "FROM note_data d LEFT JOIN note_author a ON a.author_id = d.author_id"
 
 
+RAMP_FLOOR = 0.25  # how much of its strength a brand-new memory counts for when STRONG_RAMP_DAYS is on
+
+
+def age_factor(created_at: Any, ramp_days: float, now: "Optional[datetime.datetime]" = None) -> float:
+    """How much of a memory's strength counts when choosing which older memories to show: RAMP_FLOOR for one made just now, rising in
+    a straight line to 1 at ramp_days old (and staying there). 1 for everything when ramp_days is 0, or when the time can't be read."""
+    if not ramp_days or ramp_days <= 0:
+        return 1.0
+    try:
+        made = datetime.datetime.fromisoformat(str(created_at))
+    except ValueError:
+        return 1.0
+    if made.tzinfo is None:
+        made = made.replace(tzinfo=datetime.timezone.utc)
+    age = ((now or datetime.datetime.now(datetime.timezone.utc)) - made).total_seconds() / 86400
+    return RAMP_FLOOR + (1 - RAMP_FLOOR) * max(0.0, min(1.0, age / ramp_days))
+
+
 def read_view_db(
     db_path: str, name: str, mode: str = "tiered", recent: int = 10, strong_each: int = 5, low: int = 3, high: int = 7,
-    before: Optional[int] = None, numbers: Optional[List[int]] = None, sample: int = 0,
+    before: Optional[int] = None, numbers: Optional[List[int]] = None, sample: int = 0, ramp_days: float = 0,
 ) -> Dict[str, Any]:
     """One note, seen the way agent_notes_read shows it. mode:
       tiered  the `recent` newest entries, plus up to `strong_each` strongest memories on each side (scores <= low, >= high) older than those
       before  the `recent` entries just older than entry number `before`
       entries the entries numbered `numbers` (anything, however old)
       sample  `sample` random entries other than the `recent` newest
-    Entries come back oldest first; `positive`/`negative` (tiered only) strongest first."""
+    Entries come back oldest first; `positive`/`negative` (tiered only) strongest first. With ramp_days > 0 a memory note's
+    strong entries are ranked by strength x age_factor, so a run of very recent peaks doesn't crowd out older ones (which
+    entries qualify is still decided by the raw score; persona notes are not affected)."""
     conn = notes_db_connect(db_path)
     try:
         note = _get_note(conn, name)
@@ -756,9 +776,20 @@ def read_view_db(
             skip = [r["entry_no"] for r in rows]
             exclude = f"AND d.entry_no NOT IN ({','.join('?' * len(skip))})" if skip else ""
             if strong_each > 0:
-                out["positive"] = fetch(f"{exclude} AND {_SCORE_SQL} >= ?", skip + [high], f"d.weight DESC, d.created_at DESC", strong_each)
-                if note["kind"] != "persona":  # in a persona note a low weight is a weak trait, not a painful memory
-                    out["negative"] = fetch(f"{exclude} AND {_SCORE_SQL} <= ?", skip + [low], f"d.weight ASC, d.created_at DESC", strong_each)
+                persona = note["kind"] == "persona"
+                ramp = 0 if persona else ramp_days
+
+                def strongest(cutoff_sql: str, cutoff: int, order: str) -> list:
+                    if not ramp:
+                        return fetch(f"{exclude} AND {cutoff_sql} ?", skip + [cutoff], f"{order}, d.created_at DESC", strong_each)
+                    rows = fetch(f"{exclude} AND {cutoff_sql} ?", skip + [cutoff], f"{order}, d.created_at DESC", 100000)
+                    now = datetime.datetime.now(datetime.timezone.utc)
+                    rows.sort(key=lambda r: -abs(r["weight"] - DEFAULT_WEIGHT) * age_factor(r["created_at"], ramp, now))  # stable: ties keep newest first
+                    return rows[:strong_each]
+
+                out["positive"] = strongest(f"{_SCORE_SQL} >=", high, "d.weight DESC")
+                if not persona:  # in a persona note a low weight is a weak trait, not a painful memory
+                    out["negative"] = strongest(f"{_SCORE_SQL} <=", low, "d.weight ASC")
         return out
     finally:
         conn.close()
