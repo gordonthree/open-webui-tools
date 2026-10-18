@@ -65,7 +65,17 @@ Current tools:
   the drums or a length that divides it (a shorter drum pattern loops to fill the longer tonal line; a bass-only or melody-only call
   needs no drums). Sounds are synthesized too (bass: sine plus two harmonics; square/saw softened by a low-pass; pluck: Karplus-Strong;
   pad: three detuned saws). The MIDI file puts bass on channel 1 (General MIDI program 38) and the melody on channel 2 (program 80 square,
-  81 saw, 11 sine, 24 pluck, 89 pad). Not built yet: a soundfont renderer, chord names, per-note velocity. Tests:
+  81 saw, 11 sine, 24 pluck, 89 pad). Not built yet (the MP3 from the built-in synth is good enough to
+  get an agent's intent across; these are for later):
+  - **Soundfont renderer** - render the same MIDI with FluidSynth (or `pyfluidsynth`) and a General MIDI soundfont (SF2, e.g. a free GM
+    bank) for realistic drum kits and instruments. Needs `fluidsynth` and a soundfont file inside the Open WebUI container, which a
+    container rebuild wipes unless they live on the mounted data volume or in the image, so it would be an optional `RENDERER` valve
+    (`builtin` | `fluidsynth`) falling back to the built-in synth when the binary is missing.
+  - **Better built-in sounds** - velocity-sensitive layers, a proper bass with a filter envelope, stereo panning/reverb, band-limited
+    (anti-aliased) square/saw for high notes.
+  - **Chord names** (`Am7`, `Cmaj`) expanded to notes, **per-note velocity/accents** in the tonal lines, **more than one melody line**, and
+    **sample playback** (the agent uploads a WAV and uses it as a drum) .
+  - **Longer arrangements** - named sections (`A`, `B`) and an order (`A A B A`) rather than one repeating pattern. Tests:
   `cd src && python3 -m unittest test_drum_machine`. Created on the server with `push_tool.py drum_machine --create`; set its
   `OPEN_WEBUI_API_KEY` valve and attach it to the agent's model in the web UI.
 - `voice_memo.py` → `record_voice_memo`, `list_voice_memos`, `show_last_memo` (original and spoken text of the newest memo), `record_conversation` (several named speakers as one clip, each in the voice the `SPEAKER_VOICES` valve maps to that name; limit `MAX_CONVERSATION_LINES`. With `FISH_API_KEY` set it is ONE request to Fish's own API: `<|speaker:N|>` tags in the text plus a `reference_id` list, which is Fish's documented multi-speaker form; without it, or with `NATIVE_MULTI_SPEAKER` off or more than 4 speakers, it makes one speech call per turn and joins the mp3 clips), `voice_memo_help` — lets a model record a spoken memo: the text goes to
