@@ -1,7 +1,7 @@
 """
 title: Drum Machine
 author: Gordon
-version: 0.2.0
+version: 0.3.0
 description: A step-sequencer for agents: drums, a bass line and a melody. The model writes a pattern as lanes of steps (kick: x...x...,
     bass: C2 . . . G1 . . .), the tool plays it on synthesized instruments and returns a short audio preview plus a standard MIDI file
     (drums on General MIDI channel 10) that opens in any music program. Pure Python: no GPU, no soundfont, no extra packages (MP3
@@ -166,11 +166,11 @@ def parse_lane(name: str, steps: str) -> List[float]:
     return out
 
 
-def parse_pattern(pattern: Any) -> Tuple[Dict[str, List[float]], int]:
-    """The lanes (name -> strengths, each stretched to the same length) and that length in steps.
+def parse_lanes(pattern: Any) -> Dict[str, List[float]]:
+    """The drum lanes (name -> hit strengths, each as long as it was written; fit_lengths makes them match).
 
     Accepts lines like `kick: x...x...` (also `kick x...` or `kick=x...`), or a JSON object {"kick": "x...x..."}. Two lines for the
-    same drum are merged. A lane that is shorter than the longest repeats to fill it when the lengths divide evenly."""
+    same drum are merged."""
     if isinstance(pattern, dict):
         pairs = [(str(k), str(v)) for k, v in pattern.items()]
     else:
@@ -201,14 +201,49 @@ def parse_pattern(pattern: Any) -> Tuple[Dict[str, List[float]], int]:
             old, size = lanes[name], max(len(lanes[name]), len(parsed))
             parsed = [max(a, b) for a, b in zip(old + [0.0] * (size - len(old)), parsed + [0.0] * (size - len(parsed)))]
         lanes[name] = parsed
-    length = max(len(v) for v in lanes.values())
-    for name, hits in lanes.items():
-        if len(hits) != length:
-            if length % len(hits):
-                lengths = ", ".join(f"{n} {len(h)}" for n, h in lanes.items())
-                raise BeatError(f"The lanes are different lengths ({lengths}). Make them all the same length, or a length that divides the longest (a 4-step lane repeats across 16).")
-            lanes[name] = hits * (length // len(hits))
-    return lanes, length
+    return lanes
+
+
+def fit_lengths(lanes: Dict[str, List[float]], cells: Dict[str, List[Any]]) -> Tuple[Dict[str, List[float]], Dict[str, List[Any]], int, List[str]]:
+    """Make every drum lane and every bass/melody line the same number of steps, and say what had to change.
+
+    Lines whose length divides the pattern length simply repeat (a 4-step kick across 16). The pattern length is the one the
+    most lines fit (preferring the one most lines have, then a multiple of 4, then the longer). A line that does not fit is padded
+    with rests, or cut, and the returned notes say so: models are poor at counting characters, and a one-step slip should not
+    cost them the whole beat."""
+    sizes = [len(h) for h in lanes.values()] + [len(c) for c in cells.values()]
+    if not sizes:
+        return lanes, cells, 0, []
+    counts = {n: sizes.count(n) for n in set(sizes)}
+    target = max(counts, key=lambda t: (sum(1 for n in sizes if t % n == 0), counts[t], t % 4 == 0, t))
+    notes: List[str] = []
+
+    def fit(label: str, line: List[Any], rest: Any) -> List[Any]:
+        n = len(line)
+        if n == target:
+            return line
+        if target % n == 0:
+            return line * (target // n)
+        if n < target:
+            notes.append(f"{label} had {n} steps, so {target - n} rest{'s' if target - n > 1 else ''} {'were' if target - n > 1 else 'was'} added at the end")
+            return line + [rest] * (target - n)
+        dropped = line[target:]
+        lost = any(x not in (0.0, None, "-") for x in dropped)
+        notes.append(f"{label} had {n} steps, so the last {n - target} {'(which held notes) ' if lost else ''}{'were' if n - target > 1 else 'was'} cut")
+        return line[:target]
+
+    return (
+        {name: fit(name, hits, 0.0) for name, hits in lanes.items()},
+        {kind: fit(kind, c, None) for kind, c in cells.items()},
+        target,
+        notes,
+    )
+
+
+def parse_pattern(pattern: Any) -> Tuple[Dict[str, List[float]], int]:
+    """The drum lanes of a pattern, all fitted to the same length, and that length in steps."""
+    lanes, _cells, steps, _notes = fit_lengths(parse_lanes(pattern), {})
+    return lanes, steps
 
 
 # --------------------------------------------------------------------------- #
@@ -408,7 +443,7 @@ def render_wav(lanes: Dict[str, List[float]], steps: int, repeats: int, bpm: flo
     sounds = {name: synth(name, sample_rate, rng) for name in lanes}
     tail = max([len(x) for x in sounds.values()] + [int(sample_rate * RELEASE_SECONDS)])
     total = int(sample_rate * step_seconds * steps * repeats) + tail
-    buf = [0.0] * total
+    buf = array("d", bytes(8 * total))  # zeros; a plain list of floats would take four times the memory on a long track
     swing_seconds = step_seconds * swing / 100
     for name, hits in lanes.items():
         level, sound = LANES[name][1], sounds[name]
@@ -513,7 +548,7 @@ async def _emit(emitter: Optional[Callable], payload: Dict[str, Any]) -> None:
 class Tools:
     class Valves(BaseModel):
         BEAT_DIR: str = Field(default="/app/backend/data/drum_beats", description="Folder (inside the Open WebUI container) where each beat's audio, MIDI file and a small .json sidecar are kept.")
-        MAX_SECONDS: int = Field(default=30, description="Longest beat accepted, in seconds of pattern (before the final cymbal tail).")
+        MAX_SECONDS: int = Field(default=300, description="Longest beat accepted, in seconds of pattern (before the final cymbal tail). A 150-second track renders in about 5 seconds and needs about 140 MB while it does.")
         MAX_STEPS: int = Field(default=128, description="Longest single pattern accepted, in steps (16 steps = one 4/4 bar).")
         SAMPLE_RATE: int = Field(default=44100, description="Audio sample rate. Lower (e.g. 22050) renders faster and smaller but dulls the hats.")
         OUTPUT_FORMAT: str = Field(default="mp3", description="'mp3' (needs ffmpeg in the container; falls back to wav if it is missing) or 'wav'.")
@@ -540,13 +575,13 @@ class Tools:
     ) -> str:
         """
         Play drums, a bass line and a melody on a step sequencer and give the user a link to listen to it, plus a MIDI file for their music software.
-        Everything is steps: each step is a sixteenth note, so 16 steps are one bar of 4/4. Every line must have the same number of steps (a shorter one that divides it evenly repeats).
-        DRUMS (pattern): one line per drum, its name, a colon, then x = hit, X = accent, g = ghost note, . = rest. Drums: kick, snare, rim, clap, hat, open_hat, low_tom, mid_tom, high_tom, crash, ride, cowbell.
-        BASS and MELODY: one token per step, separated by spaces. A note name (C2, F#3, Bb4; C4 is middle C), a chord joined with + (C4+E4+G4), . = rest, - = keep holding the last note. Bass is usually octaves 1-3, melody 4-5.
+        Everything is steps: each step is a sixteenth note, so 16 steps are one bar of 4/4. Give every line the same number of steps (16 per bar; a shorter one that divides it evenly repeats, and a line that is a step or two off is padded or trimmed for you).
+        DRUMS (pattern): one line per drum, its name, a colon, then x = hit, X = accent, g = ghost note, . = rest. Write the steps in groups of four so they are easy to count. Drums: kick, snare, rim, clap, hat, open_hat, low_tom, mid_tom, high_tom, crash, ride, cowbell.
+        BASS and MELODY: one token per step, separated by spaces (use | between bars if you like). A note name (C2, F#3, Bb4; C4 is middle C), a chord joined with + (C4+E4+G4), . = rest, - = keep holding the last note. Bass is usually octaves 1-3, melody 4-5.
         Example (one bar):
-        pattern = "kick: x...x...x...x...\nsnare: ....x.......x...\nhat: x.x.x.x.x.x.x.x."
-        bass = "C2 . . C2 . . G1 . A1 . . . G1 - - ."
-        melody = "E4 - . G4 - - A4 - G4 . . . E4 - - ."
+        pattern = "kick: x... x... x... x...\nsnare: .... x... .... x...\nhat: x.x. x.x. x.x. x.x."
+        bass = "C2 . . . | C2 . . . | G1 . . . | A1 . . ."
+        melody = "E4 - . G4 | - - A4 - | G4 . . . | E4 - - ."
 
         :param pattern: The drum lines described above, separated by new lines. Pass "" (or omit) for no drums if you give a bass or melody.
         :param bpm: Tempo in beats per minute, 40 to 240. Pass "" (or omit) for 100.
@@ -559,20 +594,11 @@ class Tools:
         """
         v = self.valves
         try:
-            lanes: Dict[str, List[float]] = {}
-            steps = 0
-            if not is_unset(pattern):
-                lanes, steps = parse_pattern(pattern)
+            lanes: Dict[str, List[float]] = parse_lanes(pattern) if not is_unset(pattern) else {}
             cells = {kind: parse_tonal(kind, text) for kind, text in (("bass", bass), ("melody", melody)) if not is_unset(text)}
             if not lanes and not cells:
-                raise BeatError("Give at least one of pattern (drums), bass or melody. Example drums:\nkick: x...x...x...x...\nsnare: ....x.......x...")
-            if cells:
-                longest = max([steps] + [len(c) for c in cells.values()])
-                if lanes and steps != longest:  # a drum pattern shorter than a tonal line loops to fill it
-                    if longest % steps:
-                        raise BeatError(f"The drum pattern has {steps} steps and the longest line {longest}; make the lengths match, or make the shorter divide the longer.")
-                    lanes = {n: h * (longest // steps) for n, h in lanes.items()}
-                steps = longest
+                raise BeatError("Give at least one of pattern (drums), bass or melody. Example drums:\nkick: x... x... x... x...\nsnare: .... x... .... x...")
+            lanes, cells, steps, fixes = fit_lengths(lanes, cells)
             sound = "square" if is_unset(melody_sound) else str(melody_sound).strip().lower()
             if sound not in MELODY_SOUNDS:
                 raise BeatError(f"melody_sound {melody_sound!r} is not one of: {', '.join(MELODY_SOUNDS)}.")
@@ -581,7 +607,7 @@ class Tools:
                 raise BeatError(f"The pattern is {steps} steps; the limit is {v.MAX_STEPS}. Shorten it (16 steps is one bar).")
             tempo = _number(bpm, 100, 40, 240, "bpm")
             swung = _number(swing, 0, 0, 60, "swing")
-            times = int(_number(repeats, 2, 1, 64, "repeats"))
+            times = int(_number(repeats, 2, 1, 128, "repeats"))
             seconds = steps * times * 60.0 / tempo / STEPS_PER_BEAT
             if seconds > v.MAX_SECONDS:
                 fit = max(1, int(v.MAX_SECONDS // (steps * 60.0 / tempo / STEPS_PER_BEAT)))
@@ -630,6 +656,8 @@ class Tools:
         await _emit(__event_emitter__, {"type": "status", "data": {"description": "Beat ready", "done": True}})
 
         played = f"{steps} steps x {times} at {tempo:g} BPM" + (f", swing {swung:g}" if swung else "") + f" ({seconds:.1f} s)"
+        if fixes:  # the beat was made anyway; say what was fixed so the next one is written right
+            played += ". Note: your lines were not all the same length, so I fixed them: " + "; ".join(fixes) + f". Next time give every line exactly {steps} steps (write drum steps in groups of four, like x... x... x... x...)"
         if f"{base}.{ext}" in links:
             audio_url = links[f"{base}.{ext}"][0]
             reply = f"Made the beat: {played}. Put this link in your reply so the user can play it:\n[Play {label or 'beat'}]({audio_url})"

@@ -75,9 +75,31 @@ class ParseTests(unittest.TestCase):
         lanes, steps = dm.parse_pattern("hat: x.x.x.x.x.x.x.x.\nkick: x...")
         self.assertEqual((steps, [i for i, h in enumerate(lanes["kick"]) if h]), (16, [0, 4, 8, 12]))
 
-    def test_uneven_lanes_are_refused_with_the_lengths(self):
-        with self.assertRaisesRegex(dm.BeatError, "kick 5"):
-            dm.parse_pattern("hat: x.x.x.x.x.x.x.x.\nkick: x....")
+    def test_a_lane_that_is_a_step_off_is_padded_or_cut(self):
+        lanes, steps = dm.parse_pattern("hat: x.x.x.x.x.x.x.x.\nkick: x....\nsnare: ....x.......x...")
+        self.assertEqual((steps, len(lanes["kick"]), len(lanes["hat"]), len(lanes["snare"])), (16, 16, 16, 16))
+        lanes, steps = dm.parse_pattern("kick: x...x...x...x...\nsnare: ....x.......x....")  # 17 steps: the stray one is cut
+        self.assertEqual((steps, len(lanes["snare"])), (16, 16))
+
+    def test_fit_lengths_picks_the_length_most_lines_fit_and_explains(self):
+        lanes = {"kick": [1.0] + [0.0] * 15, "hat": [0.8] * 15, "rim": [0.4] * 18}
+        cells = {"bass": [[36]] + [None] * 15}
+        fixed, cells, steps, notes = dm.fit_lengths(lanes, cells)
+        self.assertEqual(steps, 16)
+        self.assertEqual([len(v) for v in fixed.values()], [16, 16, 16])
+        self.assertEqual(len(cells["bass"]), 16)
+        self.assertEqual(len(notes), 2)
+        self.assertIn("hat had 15 steps", notes[0])
+        self.assertIn("rim had 18 steps, so the last 2 (which held notes) were cut", notes[1])
+
+    def test_fit_lengths_keeps_a_longer_line_that_others_divide_and_marks_lost_notes(self):
+        lanes = {"kick": [1.0] * 16, "snare": [1.0] * 16, "hat": [0.8] * 32}
+        fixed, _c, steps, notes = dm.fit_lengths(lanes, {})
+        self.assertEqual((steps, len(fixed["kick"])), (32, 32))
+        self.assertEqual(notes, [])
+        quiet = {"kick": [1.0] + [0.0] * 15, "snare": [0.0] * 12 + [1.0] + [0.0] * 3, "hat": [0.8, 0.0] * 8 + [0.0, 0.0]}
+        _l, _c, steps, notes = dm.fit_lengths(quiet, {})
+        self.assertEqual((steps, notes), (16, ["hat had 18 steps, so the last 2 were cut"]))  # only rests were cut: no warning about lost notes
 
     def test_unknown_drum_and_unknown_step(self):
         with self.assertRaisesRegex(dm.BeatError, "Unknown drum"):
@@ -299,6 +321,15 @@ class ToolTests(unittest.TestCase):
         events = read_midi(next(Path(self.dir).glob("*.mid")).read_bytes(), any_channel=True)[2]
         self.assertEqual({c for *_x, c in events}, {0, 1, 9})
 
+    def test_off_by_one_lines_still_make_a_beat_and_the_reply_says_what_was_fixed(self):
+        out = self.run_tool(self.tool.make_beat("kick: x... x... x... x...\nsnare: .... x... .... x...\nhat: x.x. x.x. x.x. x.x", bass="C2 . . . C2 . . . G1 . . . A1 . .", melody="E4 - . G4 | - - A4 - | G4 . . . | E4 - - . ."))
+        self.assertIn("Made the beat: 16 steps x 2", out)
+        self.assertIn("hat had 15 steps", out)
+        self.assertIn("bass had 15 steps", out)
+        self.assertIn("melody had 17 steps", out)
+        self.assertIn("exactly 16 steps", out)
+        self.assertEqual(len(list(Path(self.dir).glob("*.mid"))), 1)
+
     def test_bass_only_needs_no_drums_and_a_short_drum_pattern_loops_to_fit(self):
         out = self.run_tool(self.tool.make_beat(bass="C2 . . . G1 . . . C2 . . . G1 . . ."))
         self.assertIn("Made the beat: 16 steps", out)
@@ -308,7 +339,6 @@ class ToolTests(unittest.TestCase):
     def test_tonal_mistakes_are_explained(self):
         for kwargs, expect in (
             ({"melody": "C4 . H4 ."}, "not a note"),
-            ({"pattern": BASIC, "bass": "C2 . ."}, "does not divide"),
             ({"pattern": BASIC, "melody": "C4 .", "melody_sound": "kazoo"}, "not one of"),
             ({}, "at least one of"),
         ):

@@ -76,7 +76,7 @@ Current tools:
   else WAV) and writes a General MIDI file (drums on channel 10) the user can open in any music program; both are uploaded to OWUI's file
   storage like `voice_memo` (valves `OPEN_WEBUI_API_KEY`, `OPEN_WEBUI_BASE_URL`, `PUBLIC_BASE_URL`, `ATTACH_TO_CHAT`), kept in `BEAT_DIR`
   (default `/app/backend/data/drum_beats`) with a `.json` sidecar of the pattern, and the model gets back Markdown links. Limits:
-  `MAX_SECONDS` (30), `MAX_STEPS` (128). v0.2.0 adds `bass` and `melody` (and `melody_sound`: square, saw, sine, pluck, pad): one
+  `MAX_SECONDS` (300; a 150 s track renders in about 5 s and peaks near 140 MB), `MAX_STEPS` (128), `repeats` up to 128. v0.3.0: lines that are not all the same length no longer fail - the pattern length is the one most lines fit (a lane whose length divides it still repeats), a line one or two steps off is padded with rests or cut, and the reply says exactly what was changed (models are poor at counting characters; the 2026-10-18 Hannah chat made 14 failed calls in a row on 15- and 17-step lines). The docstring now shows drum lanes in groups of four (`x... x... x... x...`) and `|` bar lines in bass/melody. v0.2.0 adds `bass` and `melody` (and `melody_sound`: square, saw, sine, pluck, pad): one
   token per step, separated by spaces - a note name (`C2`, `F#3`, `Bb4`; C4 is middle C; no octave = the line's default, 2 for bass and 4
   for melody), a chord joined with `+` (`C4+E4+G4`), `.` rest, `-` hold the previous note. The pitched lines must be the same length as
   the drums or a length that divides it (a shorter drum pattern loops to fill the longer tonal line; a bass-only or melody-only call
