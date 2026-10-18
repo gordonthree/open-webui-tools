@@ -247,6 +247,106 @@ class TonalRenderTests(unittest.TestCase):
         self.assertTrue(dm.render_wav({}, 4, 1, 100, 0, 8000, {"bass": [(0, 1, [36])]}))
 
 
+SONG = """[intro]
+kick: x... .... x... ....
+hat: x.x. x.x. x.x. x.x.
+bass: C1 . . . | . . . . | C1 . . . | . . . .
+repeats: 2
+
+[drop]
+kick: x... x... x... x...
+snare: .... x... .... x...
+bass: C1 - - - | G1 - - - | Ab1 - - - | F1 - - -
+melody: C3 . . . | Eb3 . . . | G3 . . . | C4 . . .
+sound: saw
+bpm: 70
+repeats: 4
+"""
+
+
+class SongParseTests(unittest.TestCase):
+    def test_sections_settings_and_lines(self):
+        sections = dm.parse_song(SONG)
+        self.assertEqual(list(sections), ["intro", "drop"])
+        self.assertEqual(sections["intro"]["drums"], ["kick: x... .... x... ....", "hat: x.x. x.x. x.x. x.x."])
+        self.assertEqual(sections["drop"]["settings"], {"sound": "saw", "bpm": "70", "repeats": "4"})
+        self.assertTrue(sections["drop"]["melody"].startswith("C3"))
+
+    def test_header_spellings_and_no_header(self):
+        self.assertEqual(list(dm.parse_song("# Build Up\nkick: x...\n\n## drop:\nkick: x...\n\nTease:\nkick: x...")), ["build_up", "drop", "tease"])
+        self.assertEqual(list(dm.parse_song("kick: x...\nbass: C2 . . .")), ["main"])
+        self.assertEqual(dm.parse_song("[A]\nkick: x...\n---\n")["a"]["drums"], ["kick: x..."])
+        with self.assertRaises(dm.BeatError):
+            dm.parse_song("   \n\n")
+        with self.assertRaisesRegex(dm.BeatError, "defined twice"):
+            dm.parse_song("[a]\nkick: x...\n[A]\nkick: x...")
+
+    def test_order_parsing(self):
+        sections = dm.parse_song("[intro]\nkick: x...\n[build up]\nkick: x...\n[drop]\nkick: x...")
+        self.assertEqual(dm.parse_order("intro, build up x2, drop", sections), ["intro", "build_up", "build_up", "drop"])
+        self.assertEqual(dm.parse_order("intro > drop*3", sections), ["intro", "drop", "drop", "drop"])
+        self.assertEqual(dm.parse_order("intro drop x2", sections), ["intro", "drop", "drop"])
+        self.assertEqual(dm.parse_order("", sections), ["intro", "build_up", "drop"])
+        self.assertEqual(dm.parse_order(None, sections), ["intro", "build_up", "drop"])
+        with self.assertRaisesRegex(dm.BeatError, "'chorus', which is not a section"):
+            dm.parse_order("intro, chorus", sections)
+
+    def test_section_segment_uses_defaults_and_its_own_settings(self):
+        sections = dm.parse_song(SONG)
+        notes = []
+        intro = dm.section_segment(sections["intro"], 100, 0, "square", notes)
+        drop = dm.section_segment(sections["drop"], 100, 0, "square", notes)
+        self.assertEqual((intro["steps"], intro["repeats"], intro["bpm"], intro["sound"]), (16, 2, 100, "square"))
+        self.assertEqual((drop["steps"], drop["repeats"], drop["bpm"], drop["sound"]), (16, 4, 70, "saw"))
+        self.assertEqual(notes, [])
+
+    def test_section_errors_name_the_section(self):
+        with self.assertRaisesRegex(dm.BeatError, "'empty' has no drums"):
+            dm.section_segment(dm.parse_song("[empty]\nrepeats: 2")["empty"], 100, 0, "square", [])
+        with self.assertRaisesRegex(dm.BeatError, r"\[a\] repeats must be between"):
+            dm.section_segment(dm.parse_song("[a]\nkick: x...\nrepeats: 999")["a"], 100, 0, "square", [])
+        with self.assertRaisesRegex(dm.BeatError, "sound 'kazoo'"):
+            dm.section_segment(dm.parse_song("[a]\nkick: x...\nsound: kazoo")["a"], 100, 0, "square", [])
+
+    def test_mismatched_lines_in_a_section_are_fixed_and_named(self):
+        notes = []
+        seg = dm.section_segment(dm.parse_song("[a]\nkick: x... x... x... x...\nhat: x.x. x.x. x.x. x.x\nbass: C2 . . .|. . . .|. . . .|. . . . .")["a"], 100, 0, "square", notes)
+        self.assertEqual(seg["steps"], 16)
+        self.assertEqual(len(notes), 2)
+        self.assertTrue(all(n.startswith("[a] ") for n in notes))
+
+
+class SongRenderTests(unittest.TestCase):
+    def test_tempo_changes_and_programs_in_the_midi(self):
+        sections = dm.parse_song(SONG)
+        segs = [dm.section_segment(sections[k], 100, 0, "square", []) for k in ("intro", "drop")]
+        data = dm.build_midi_song(segs, "t")
+        tempos = []
+        pos = data.index(b"\xff\x51\x03")
+        while pos != -1:
+            tempos.append(int.from_bytes(data[pos + 3:pos + 6], "big"))
+            pos = data.find(b"\xff\x51\x03", pos + 1)
+        self.assertEqual(tempos, [600000, 857143])
+        events = read_midi(data, any_channel=True)[2]
+        drop_start = 2 * 16 * 120
+        self.assertTrue(any(t == drop_start and k == "program" and n == 81 for t, k, n, _v, _c in events))  # saw lead from the drop on
+        self.assertEqual(min(t for t, k, n, _v, c in events if k == "on" and c == 1), drop_start)  # the melody only plays in the drop
+
+    def test_audio_length_is_the_sum_of_the_parts_at_their_own_tempos(self):
+        sections = dm.parse_song(SONG)
+        segs = [dm.section_segment(sections["intro"], 100, 0, "square", []), dm.section_segment(sections["drop"], 100, 0, "square", [])]
+        wav = dm.render_song(segs, 8000)
+        with wave.open(BytesIO(wav)) as w:
+            seconds = w.getnframes() / w.getframerate()
+        wanted = 32 * 0.15 + 64 * (60 / 70 / 4)  # intro 32 steps at 100 BPM; drop 64 steps at 70 BPM
+        self.assertGreater(seconds, wanted)
+        self.assertLess(seconds, wanted + 2.5)  # plus the last cymbal or note tail
+
+    def test_one_segment_wrappers_match_the_song_functions(self):
+        lanes, steps = dm.parse_pattern("kick: x...")
+        self.assertEqual(dm.render_wav(lanes, steps, 2, 100, 0, 8000), dm.render_song([dm.one_segment(lanes, steps, 2, 100, 0)], 8000))
+
+
 class ToolTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -351,6 +451,45 @@ class ToolTests(unittest.TestCase):
         out = self.run_tool(self.tool.list_beats())
         self.assertIn("bass: C2 . . .", out)
         self.assertIn("melody (saw): E4 . . .", out)
+
+    def test_make_song_end_to_end(self):
+        out = self.run_tool(self.tool.make_song(SONG, order="intro, drop, drop", title="Pressure"))
+        self.assertIn("Made the track: 3 parts (intro, drop, drop)", out)
+        meta = json.loads(next(Path(self.dir).glob("*.json")).read_text())
+        self.assertEqual((meta["order"], meta["title"]), (["intro", "drop", "drop"], "Pressure"))
+        self.assertEqual(sorted(p.suffix for p in Path(self.dir).iterdir()), [".json", ".mid", ".wav"])
+        listing = self.run_tool(self.tool.list_beats())
+        self.assertIn("order: intro, drop, drop", listing)
+
+    def test_make_song_default_order_and_a_single_unnamed_section(self):
+        out = self.run_tool(self.tool.make_song("kick: x... x... x... x...\nbass: C2 . . . | . . . . | G1 . . . | . . . .", bpm="120"))
+        self.assertIn("Made the track: 1 parts (main)", out)
+
+    def test_make_song_mistakes_are_explained(self):
+        for kwargs, expect in (
+            ({"song": SONG, "order": "intro, chorus"}, "not a section"),
+            ({"song": "   "}, "song is empty"),
+            ({"song": SONG, "melody_sound": "kazoo"}, "not one of"),
+            ({"song": SONG, "bpm": "10"}, "bpm must be between"),
+            ({"song": "[a]\nrepeats: 2"}, "no drums, bass or melody"),
+        ):
+            out = self.run_tool(self.tool.make_song(**kwargs))
+            self.assertTrue(out.startswith("Could not make the song"), out)
+            self.assertIn(expect, out)
+        self.assertEqual(list(Path(self.dir).iterdir()), [])
+
+    def test_make_song_limits(self):
+        self.tool.valves.MAX_SECONDS = 10
+        self.assertIn("seconds; the limit is 10", self.run_tool(self.tool.make_song(SONG, order="intro, drop, drop, drop")))
+        self.tool.valves.MAX_SECONDS = 300
+        self.tool.valves.MAX_ORDER_ITEMS = 3
+        self.assertIn("order has 4 parts", self.run_tool(self.tool.make_song(SONG, order="intro, drop x3")))
+        self.tool.valves.MAX_SECTIONS = 1
+        self.assertIn("2 sections; the limit is 1", self.run_tool(self.tool.make_song(SONG)))
+
+    def test_make_song_reply_lists_fixed_lines(self):
+        out = self.run_tool(self.tool.make_song("[a]\nkick: x... x... x... x...\nhat: x.x. x.x. x.x. x.x"))
+        self.assertIn("[a] hat had 15 steps", out)
 
     def test_list_beats(self):
         self.assertEqual(self.run_tool(self.tool.list_beats()), "No beats have been made yet.")

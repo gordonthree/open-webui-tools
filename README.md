@@ -68,7 +68,7 @@ Current tools:
   2.81 GB, about 16 s. The 7B caption model is 5.3 GB and would spill to the CPU. Create/update with
   `push_tool.py vision_describe describe_image --create` (a new Function is switched on but not global). Tests:
   `cd src && python3 -m unittest test_vision_describe`.
-- `drum_machine.py` → `make_beat`, `list_beats` — a step-sequencer for agents: drums, bass and melody (v0.2.0). The model writes one line per drum
+- `drum_machine.py` → `make_beat`, `make_song`, `list_beats` — a step-sequencer for agents: drums, bass and melody; one pattern or a whole track (v0.4.0). The model writes one line per drum
   (`kick: x...x...x...x...`; `x` hit, `X` accent, `g` ghost, `.` rest; 16 steps = one 4/4 bar; drums: kick, snare, rim, clap, hat,
   open_hat, low_tom, mid_tom, high_tom, crash, ride, cowbell, plus common spellings like `bd`/`hh`/`oh`; a JSON object is accepted too; a
   shorter lane that divides the longest repeats), with `bpm` (40-240, default 100), `repeats` (default 2), `swing` (0-60) and `title`. The
@@ -82,7 +82,14 @@ Current tools:
   the drums or a length that divides it (a shorter drum pattern loops to fill the longer tonal line; a bass-only or melody-only call
   needs no drums). Sounds are synthesized too (bass: sine plus two harmonics; square/saw softened by a low-pass; pluck: Karplus-Strong;
   pad: three detuned saws). The MIDI file puts bass on channel 1 (General MIDI program 38) and the melody on channel 2 (program 80 square,
-  81 saw, 11 sine, 24 pluck, 89 pad). Not built yet (the MP3 from the built-in synth is good enough to
+  81 saw, 11 sine, 24 pluck, 89 pad). v0.4.0 adds `make_song`: named sections played in an order, as one audio file and one MIDI file. The `song` text has
+  `[name]` headers (also `# name` or `name:` alone; text with no header is one section called `main`), each followed by the same lines as
+  `make_beat` (drum lines, `bass:`, `melody:`) and optional settings `repeats:` (times the section's pattern plays each time it comes up,
+  default 1, max 64), `bpm:` (a tempo change for just that section, e.g. a half-time drop), `swing:` and `sound:`. `order` lists section
+  names separated by commas or `>` (`intro, build x2, drop`; blank = each once, in the order written; `x3` or `*3` repeats a name). Each
+  section's lines are length-fitted like `make_beat`'s and the reply names what was fixed (`[drop] hat had 15 steps...`). The MIDI file
+  carries tempo changes and the melody's program changes. Limits: `MAX_SECONDS` for the whole track, `MAX_SECTIONS` (12), `MAX_ORDER_ITEMS`
+  (64). A 79 s seven-part track renders in about 2 s. `list_beats` shows a song's order. Not built yet (the MP3 from the built-in synth is good enough to
   get an agent's intent across; these are for later):
   - **Soundfont renderer** - render the same MIDI with FluidSynth (or `pyfluidsynth`) and a General MIDI soundfont (SF2, e.g. a free GM
     bank) for realistic drum kits and instruments. Needs `fluidsynth` and a soundfont file inside the Open WebUI container, which a
@@ -92,7 +99,7 @@ Current tools:
     (anti-aliased) square/saw for high notes.
   - **Chord names** (`Am7`, `Cmaj`) expanded to notes, **per-note velocity/accents** in the tonal lines, **more than one melody line**, and
     **sample playback** (the agent uploads a WAV and uses it as a drum) .
-  - **Longer arrangements** - named sections (`A`, `B`) and an order (`A A B A`) rather than one repeating pattern. Tests:
+ Tests:
   `cd src && python3 -m unittest test_drum_machine`. Created on the server with `push_tool.py drum_machine --create`; set its
   `OPEN_WEBUI_API_KEY` valve and attach it to the agent's model in the web UI.
 - `voice_memo.py` → `record_voice_memo`, `list_voice_memos`, `show_last_memo` (original and spoken text of the newest memo), `record_conversation` (several named speakers as one clip, each in the voice the `SPEAKER_VOICES` valve maps to that name; limit `MAX_CONVERSATION_LINES`. With `FISH_API_KEY` set it is ONE request to Fish's own API: `<|speaker:N|>` tags in the text plus a `reference_id` list, which is Fish's documented multi-speaker form; without it, or with `NATIVE_MULTI_SPEAKER` off or more than 4 speakers, it makes one speech call per turn and joins the mp3 clips), `voice_memo_help` — lets a model record a spoken memo: the text goes to

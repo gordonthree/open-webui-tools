@@ -1,8 +1,8 @@
 """
 title: Drum Machine
 author: Gordon
-version: 0.3.0
-description: A step-sequencer for agents: drums, a bass line and a melody. The model writes a pattern as lanes of steps (kick: x...x...,
+version: 0.4.0
+description: A step-sequencer for agents: drums, a bass line and a melody, one pattern (make_beat) or a whole track of named sections (make_song). The model writes a pattern as lanes of steps (kick: x...x...,
     bass: C2 . . . G1 . . .), the tool plays it on synthesized instruments and returns a short audio preview plus a standard MIDI file
     (drums on General MIDI channel 10) that opens in any music program. Pure Python: no GPU, no soundfont, no extra packages (MP3
     conversion uses ffmpeg when present).
@@ -260,45 +260,65 @@ def _vlq(value: int) -> bytes:
     return bytes(reversed(out))
 
 
-def build_midi(lanes: Dict[str, List[float]], steps: int, repeats: int, bpm: float, swing: float, title: str,
-               tonal: Optional[Dict[str, List[Tuple[int, int, List[int]]]]] = None, melody_sound: str = "square") -> bytes:
-    """A format-0 standard MIDI file: one track, drums on channel 10, bass on channel 1 and melody on channel 2 when given."""
+Segment = Dict[str, Any]  # one stretch of music: lanes, steps, repeats, bpm, swing, tonal, sound
+
+
+def one_segment(lanes: Dict[str, List[float]], steps: int, repeats: int, bpm: float, swing: float,
+                tonal: Optional[Dict[str, List[Tuple[int, int, List[int]]]]] = None, melody_sound: str = "square") -> Segment:
+    return {"lanes": lanes, "steps": steps, "repeats": repeats, "bpm": bpm, "swing": swing, "tonal": tonal or {}, "sound": melody_sound}
+
+
+def build_midi_song(segments: List[Segment], title: str) -> bytes:
+    """A format-0 standard MIDI file of the segments one after another: drums on channel 10, bass on channel 1 and melody on
+    channel 2 when present, a tempo change wherever the tempo changes."""
     events: List[Tuple[int, int, bytes]] = []  # (tick, sort order, bytes); note-offs sort before note-ons at the same tick
-    swing_ticks = int(round(MIDI_TICKS_PER_STEP * swing / 100))
-    for name, hits in lanes.items():
-        note = LANES[name][0]
-        for step in range(steps * repeats):
-            strength = hits[step % steps]
-            if not strength:
-                continue
-            tick = step * MIDI_TICKS_PER_STEP + (swing_ticks if step % 2 else 0)
-            velocity = max(1, min(127, int(round(strength * 127))))
-            events.append((tick, 1, bytes([0x90 | MIDI_CHANNEL, note, velocity])))
-            events.append((tick + MIDI_TICKS_PER_STEP // 2, 0, bytes([0x80 | MIDI_CHANNEL, note, 0])))
-    for kind, notes in (tonal or {}).items():
-        channel = TONAL_CHANNEL[kind]
-        events.append((0, -1, bytes([0xC0 | channel, BASS_PROGRAM if kind == "bass" else MELODY_SOUNDS.get(melody_sound, 80)])))
-        for repeat in range(repeats):
-            for start, length, midis in notes:
-                step = repeat * steps + start
-                tick = step * MIDI_TICKS_PER_STEP + (swing_ticks if step % 2 else 0)
-                off = (step + length) * MIDI_TICKS_PER_STEP - 10
-                for midi in midis:
-                    events.append((tick, 1, bytes([0x90 | channel, midi, 96])))
-                    events.append((max(tick + 1, off), 0, bytes([0x80 | channel, midi, 0])))
+    offset, programs = 0, {}
+    for seg in segments:
+        steps, repeats = seg["steps"], seg["repeats"]
+        swing_ticks = int(round(MIDI_TICKS_PER_STEP * seg["swing"] / 100))
+        events.append((offset, -2, b"\xff\x51\x03" + int(round(60_000_000 / seg["bpm"])).to_bytes(3, "big")))
+        for name, hits in seg["lanes"].items():
+            note = LANES[name][0]
+            for step in range(steps * repeats):
+                strength = hits[step % steps]
+                if not strength:
+                    continue
+                tick = offset + step * MIDI_TICKS_PER_STEP + (swing_ticks if step % 2 else 0)
+                velocity = max(1, min(127, int(round(strength * 127))))
+                events.append((tick, 1, bytes([0x90 | MIDI_CHANNEL, note, velocity])))
+                events.append((tick + MIDI_TICKS_PER_STEP // 2, 0, bytes([0x80 | MIDI_CHANNEL, note, 0])))
+        for kind, notes in seg["tonal"].items():
+            channel = TONAL_CHANNEL[kind]
+            program = BASS_PROGRAM if kind == "bass" else MELODY_SOUNDS.get(seg["sound"], 80)
+            if programs.get(channel) != program:
+                programs[channel] = program
+                events.append((offset, -1, bytes([0xC0 | channel, program])))
+            for repeat in range(repeats):
+                for start, length, midis in notes:
+                    step = repeat * steps + start
+                    tick = offset + step * MIDI_TICKS_PER_STEP + (swing_ticks if step % 2 else 0)
+                    off = offset + (step + length) * MIDI_TICKS_PER_STEP - 10
+                    for midi in midis:
+                        events.append((tick, 1, bytes([0x90 | channel, midi, 96])))
+                        events.append((max(tick + 1, off), 0, bytes([0x80 | channel, midi, 0])))
+        offset += steps * repeats * MIDI_TICKS_PER_STEP
     events.sort(key=lambda e: (e[0], e[1]))
     body = bytearray()
     label = (title or "drum beat").encode("ascii", "replace")[:60]
     body += b"\x00\xff\x03" + _vlq(len(label)) + label
-    body += b"\x00\xff\x51\x03" + int(round(60_000_000 / bpm)).to_bytes(3, "big")
     body += b"\x00\xff\x58\x04\x04\x02\x18\x08"  # 4/4
     last = 0
     for tick, _order, data in events:
         body += _vlq(tick - last) + data
         last = tick
-    end = steps * repeats * MIDI_TICKS_PER_STEP
-    body += _vlq(max(0, end - last)) + b"\xff\x2f\x00"
+    body += _vlq(max(0, offset - last)) + b"\xff\x2f\x00"
     return b"MThd" + struct.pack(">IHHH", 6, 0, 1, MIDI_TICKS_PER_BEAT) + b"MTrk" + struct.pack(">I", len(body)) + bytes(body)
+
+
+def build_midi(lanes: Dict[str, List[float]], steps: int, repeats: int, bpm: float, swing: float, title: str,
+               tonal: Optional[Dict[str, List[Tuple[int, int, List[int]]]]] = None, melody_sound: str = "square") -> bytes:
+    """A format-0 standard MIDI file of one pattern played `repeats` times."""
+    return build_midi_song([one_segment(lanes, steps, repeats, bpm, swing, tonal, melody_sound)], title)
 
 
 # --------------------------------------------------------------------------- #
@@ -435,42 +455,46 @@ def synth_note(sound: str, midi: int, seconds: float, sr: int, rng: random.Rando
     return out
 
 
-def render_wav(lanes: Dict[str, List[float]], steps: int, repeats: int, bpm: float, swing: float, sample_rate: int,
-               tonal: Optional[Dict[str, List[Tuple[int, int, List[int]]]]] = None, melody_sound: str = "square") -> bytes:
-    """The pattern as 16-bit mono WAV bytes."""
-    rng = random.Random(1)  # the same pattern always sounds the same
-    step_seconds = 60.0 / bpm / STEPS_PER_BEAT
-    sounds = {name: synth(name, sample_rate, rng) for name in lanes}
+def render_song(segments: List[Segment], sample_rate: int) -> bytes:
+    """The segments one after another as 16-bit mono WAV bytes."""
+    rng = random.Random(1)  # the same music always sounds the same
+    drum_names = sorted({name for seg in segments for name in seg["lanes"]})
+    sounds = {name: synth(name, sample_rate, rng) for name in drum_names}
     tail = max([len(x) for x in sounds.values()] + [int(sample_rate * RELEASE_SECONDS)])
-    total = int(sample_rate * step_seconds * steps * repeats) + tail
+    spans = [seg["steps"] * seg["repeats"] * 60.0 / seg["bpm"] / STEPS_PER_BEAT for seg in segments]
+    total = int(sample_rate * sum(spans)) + tail
     buf = array("d", bytes(8 * total))  # zeros; a plain list of floats would take four times the memory on a long track
-    swing_seconds = step_seconds * swing / 100
-    for name, hits in lanes.items():
-        level, sound = LANES[name][1], sounds[name]
-        for step in range(steps * repeats):
-            strength = hits[step % steps]
-            if not strength:
-                continue
-            at = int(sample_rate * (step * step_seconds + (swing_seconds if step % 2 else 0)))
-            gain = level * strength
-            end = min(total, at + len(sound))
-            for i in range(at, end):
-                buf[i] += sound[i - at] * gain
     cache: Dict[tuple, List[float]] = {}
-    for kind, notes in (tonal or {}).items():
-        voice = "bass" if kind == "bass" else melody_sound
-        level = TONAL_LEVEL[kind]
-        for repeat in range(repeats):
-            for start, length, midis in notes:
-                step = repeat * steps + start
-                at = int(sample_rate * (step * step_seconds + (swing_seconds if step % 2 else 0)))
-                for midi in midis:
-                    key = (voice, midi, length)
-                    if key not in cache:
-                        cache[key] = synth_note(voice, midi, length * step_seconds, sample_rate, rng)
-                    wave_ = cache[key]
-                    for i in range(at, min(total, at + len(wave_))):
-                        buf[i] += wave_[i - at] * level / math.sqrt(len(midis))
+    clock = 0.0
+    for seg, span in zip(segments, spans):
+        steps, repeats = seg["steps"], seg["repeats"]
+        step_seconds = 60.0 / seg["bpm"] / STEPS_PER_BEAT
+        swing_seconds = step_seconds * seg["swing"] / 100
+        for name, hits in seg["lanes"].items():
+            level, sound = LANES[name][1], sounds[name]
+            for step in range(steps * repeats):
+                strength = hits[step % steps]
+                if not strength:
+                    continue
+                at = int(sample_rate * (clock + step * step_seconds + (swing_seconds if step % 2 else 0)))
+                gain = level * strength
+                for i in range(at, min(total, at + len(sound))):
+                    buf[i] += sound[i - at] * gain
+        for kind, notes in seg["tonal"].items():
+            voice = "bass" if kind == "bass" else seg["sound"]
+            level = TONAL_LEVEL[kind]
+            for repeat in range(repeats):
+                for start, length, midis in notes:
+                    step = repeat * steps + start
+                    at = int(sample_rate * (clock + step * step_seconds + (swing_seconds if step % 2 else 0)))
+                    for midi in midis:
+                        key = (voice, midi, round(length * step_seconds, 4))
+                        if key not in cache:
+                            cache[key] = synth_note(voice, midi, length * step_seconds, sample_rate, rng)
+                        note_wave = cache[key]
+                        for i in range(at, min(total, at + len(note_wave))):
+                            buf[i] += note_wave[i - at] * level / math.sqrt(len(midis))
+        clock += span
     peak = max((abs(v) for v in buf), default=0.0) or 1.0
     scale = 0.9 / peak if peak > 0.9 else 1.0
     pcm = array("h", (int(max(-1.0, min(1.0, v * scale)) * 32767) for v in buf))
@@ -483,6 +507,107 @@ def render_wav(lanes: Dict[str, List[float]], steps: int, repeats: int, bpm: flo
             pcm.byteswap()
         w.writeframes(pcm.tobytes())
     return out.getvalue()
+
+
+def render_wav(lanes: Dict[str, List[float]], steps: int, repeats: int, bpm: float, swing: float, sample_rate: int,
+               tonal: Optional[Dict[str, List[Tuple[int, int, List[int]]]]] = None, melody_sound: str = "square") -> bytes:
+    """One pattern played `repeats` times, as 16-bit mono WAV bytes."""
+    return render_song([one_segment(lanes, steps, repeats, bpm, swing, tonal, melody_sound)], sample_rate)
+
+
+# --------------------------------------------------------------------------- #
+# Songs: named sections played in an order
+# --------------------------------------------------------------------------- #
+
+SECTION_SETTINGS = {"repeats", "bpm", "swing", "sound", "melody_sound"}
+MAX_SECTION_REPEATS = 64
+
+
+def section_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+
+
+def parse_song(text: Any) -> Dict[str, Dict[str, Any]]:
+    """The sections of a song text: `[name]` (also `# name` or `name:` alone) starts one; under it come drum lines, `bass:` and
+    `melody:` lines, and the settings `repeats:`, `bpm:`, `swing:` and `sound:`. Text with no header at all is one section, "main"."""
+    sections: Dict[str, Dict[str, Any]] = {}
+    current: Optional[Dict[str, Any]] = None
+
+    def start(name: str) -> Dict[str, Any]:
+        key = section_key(name) or "main"
+        if key in sections:
+            raise BeatError(f"The section {name!r} is defined twice. Give each section its own name.")
+        sections[key] = {"name": name.strip() or "main", "drums": [], "bass": None, "melody": None, "settings": {}}
+        return sections[key]
+
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or set(line) <= set("-=_* "):
+            continue
+        header = re.match(r"^\[(.+?)\]\s*$", line) or re.match(r"^#{1,6}\s*(.+?)\s*:?\s*$", line) or re.match(r"^([A-Za-z][A-Za-z0-9 _-]*?)\s*:\s*$", line)
+        if header:
+            current = start(header.group(1))
+            continue
+        if current is None:
+            current = start("main")
+        m = re.match(r"^([A-Za-z_ -]+?)\s*[:=]\s*(.*)$", line)
+        key = section_key(m.group(1)) if m else ""
+        if m and key in SECTION_SETTINGS:
+            current["settings"]["sound" if key == "melody_sound" else key] = m.group(2).strip()
+        elif m and key in ("bass", "melody", "lead"):
+            current["melody" if key == "lead" else key] = m.group(2)
+        else:
+            current["drums"].append(line)
+    if not sections:
+        raise BeatError("The song is empty. Write sections like  [intro]  then lines such as  kick: x... x... x... x...")
+    return sections
+
+
+def parse_order(text: Any, sections: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Section keys in playing order from "intro, build x2, drop". Blank = every section once, in the order written."""
+    raw = str(text or "").strip()
+    if is_unset(text) or not raw:
+        return list(sections)
+    if re.search(r"[,;>|\n]", raw):
+        pieces = [p for p in re.split(r"\s*(?:,|;|->|=>|>|\||\n)\s*", raw) if p.strip()]
+    else:  # no separators: names separated by spaces, with a trailing x3 or *3 belonging to the name before it
+        pieces = []
+        for token in raw.split():
+            if re.fullmatch(r"[x*×]\d+", token, re.I) and pieces:
+                pieces[-1] += " " + token
+            else:
+                pieces.append(token)
+    order: List[str] = []
+    for piece in pieces:
+        m = re.match(r"^(.*?)\s*[x*×]\s*(\d+)$", piece.strip(), re.I)
+        name, times = (m.group(1), int(m.group(2))) if m and section_key(m.group(1)) in sections else (piece, 1)
+        key = section_key(name)
+        if key not in sections:
+            raise BeatError(f"The order names {name.strip()!r}, which is not a section. The sections are: {', '.join(v['name'] for v in sections.values())}.")
+        order.extend([key] * max(1, min(times, 16)))
+    return order
+
+
+def section_segment(section: Dict[str, Any], default_bpm: float, default_swing: float, default_sound: str, notes: List[str]) -> Segment:
+    """One section as a segment (its lines fitted to one length; what had to be fixed is added to `notes`)."""
+    name = section["name"]
+    settings = section["settings"]
+    lanes = parse_lanes("\n".join(section["drums"])) if section["drums"] else {}
+    cells = {kind: parse_tonal(kind, section[kind]) for kind in ("bass", "melody") if section[kind] and section[kind].strip()}
+    if not lanes and not cells:
+        raise BeatError(f"The section {name!r} has no drums, bass or melody.")
+    lanes, cells, steps, fixes = fit_lengths(lanes, cells)
+    notes.extend(f"[{name}] {f}" for f in fixes)
+    sound = str(settings.get("sound") or default_sound).strip().lower()
+    if sound not in MELODY_SOUNDS:
+        raise BeatError(f"In [{name}], sound {sound!r} is not one of: {', '.join(MELODY_SOUNDS)}.")
+    return one_segment(
+        lanes, steps,
+        int(_number(settings.get("repeats"), 1, 1, MAX_SECTION_REPEATS, f"[{name}] repeats")),
+        _number(settings.get("bpm"), default_bpm, 40, 240, f"[{name}] bpm"),
+        _number(settings.get("swing"), default_swing, 0, 60, f"[{name}] swing"),
+        {kind: tonal_notes(c, steps, kind) for kind, c in cells.items()}, sound,
+    )
 
 
 def wav_to_mp3(wav: bytes) -> Optional[bytes]:
@@ -549,6 +674,8 @@ class Tools:
     class Valves(BaseModel):
         BEAT_DIR: str = Field(default="/app/backend/data/drum_beats", description="Folder (inside the Open WebUI container) where each beat's audio, MIDI file and a small .json sidecar are kept.")
         MAX_SECONDS: int = Field(default=300, description="Longest beat accepted, in seconds of pattern (before the final cymbal tail). A 150-second track renders in about 5 seconds and needs about 140 MB while it does.")
+        MAX_SECTIONS: int = Field(default=12, description="Most different sections one make_song call may define.")
+        MAX_ORDER_ITEMS: int = Field(default=64, description="Most parts one make_song order may list (a section listed twice counts twice).")
         MAX_STEPS: int = Field(default=128, description="Longest single pattern accepted, in steps (16 steps = one 4/4 bar).")
         SAMPLE_RATE: int = Field(default=44100, description="Audio sample rate. Lower (e.g. 22050) renders faster and smaller but dulls the hats.")
         OUTPUT_FORMAT: str = Field(default="mp3", description="'mp3' (needs ffmpeg in the container; falls back to wav if it is missing) or 'wav'.")
@@ -615,10 +742,75 @@ class Tools:
         except BeatError as e:
             return f"Could not make the beat: {e}"
 
-        await _emit(__event_emitter__, {"type": "status", "data": {"description": "Programming the sequencer...", "done": False}})
+        segment = one_segment(lanes, steps, times, tempo, swung, tonal, sound)
+        meta = {"bpm": tempo, "swing": swung, "repeats": times, "steps": steps,
+                "pattern": {n: "".join("X" if h >= 1 else "x" if h >= 0.8 else "g" if h else "." for h in hits) for n, hits in lanes.items()},
+                **({"bass": str(bass).strip()} if "bass" in cells else {}), **({"melody": str(melody).strip(), "melody_sound": sound} if "melody" in cells else {})}
+        played = f"{steps} steps x {times} at {tempo:g} BPM" + (f", swing {swung:g}" if swung else "") + f" ({seconds:.1f} s)"
+        if fixes:  # the beat was made anyway; say what was fixed so the next one is written right
+            played += ". Note: your lines were not all the same length, so I fixed them: " + "; ".join(fixes) + f". Next time give every line exactly {steps} steps (write drum steps in groups of four, like x... x... x... x...)"
         label = (title or "").strip() if not is_unset(title) else ""
-        wav = await asyncio.to_thread(render_wav, lanes, steps, times, tempo, swung, max(8000, v.SAMPLE_RATE), tonal, sound)
-        midi = build_midi(lanes, steps, times, tempo, swung, label, tonal, sound)
+        return await self._publish([segment], label, label or (next(iter(lanes)) if lanes else next(iter(cells))) + "-beat", meta, played, "beat", __event_emitter__)
+
+    async def make_song(
+        self, song: str, order: Optional[str] = None, bpm: Optional[str] = None, swing: Optional[str] = None, title: Optional[str] = None,
+        melody_sound: Optional[str] = None, __event_emitter__: Optional[Callable[[dict], Any]] = None,
+    ) -> str:
+        """
+        Build a whole track from named sections and play them in an order, as one audio file plus a MIDI file. Use it for an intro, a build-up, a drop and so on, instead of making each part separately.
+        Each section starts with its name in [brackets], then lines in the same style as make_beat: drum lines (kick: x... x... x... x...), a bass: line, a melody: line (one token per step, 16 steps per bar), and optional settings lines:
+        repeats: how many times the section's pattern plays each time it comes up (default 1), bpm: a tempo for this section only (for a half-time drop), swing:, sound: (square, saw, sine, pluck, pad).
+        Example:
+        song = "[intro]\nkick: x... .... x... ....\nhat: x.x. x.x. x.x. x.x.\nbass: C1 . . . | . . . . | C1 . . . | . . . .\nrepeats: 2\n\n[drop]\nkick: x... x... x... x...\nsnare: .... x... .... x...\nbass: C1 - - - | G1 - - - | Ab1 - - - | F1 - - -\nmelody: C3 . . . | Eb3 . . . | G3 . . . | C4 . . .\nsound: saw\nrepeats: 4"
+        order = "intro, drop, drop"
+
+        :param song: The sections as described above, each starting with [name]. A section may leave out drums, bass or melody. Text with no [name] at all is treated as one section.
+        :param order: Section names in the order they play, separated by commas; add x2 to repeat one, e.g. "intro, build x2, drop". Pass "" (or omit) to play every section once in the order written.
+        :param bpm: Tempo for the sections that do not set their own, 40 to 240. Pass "" (or omit) for 100.
+        :param swing: 0 to 60 for sections that do not set their own. Pass "" (or omit) for none.
+        :param title: A short name for the track. Pass "" (or omit) to leave it unnamed.
+        :param melody_sound: square (default), saw, sine, pluck or pad, for sections that do not set their own. Pass "" (or omit) for square.
+        """
+        v = self.valves
+        try:
+            sections = parse_song(song)
+            if len(sections) > v.MAX_SECTIONS:
+                raise BeatError(f"The song has {len(sections)} sections; the limit is {v.MAX_SECTIONS}.")
+            sequence = parse_order(order, sections)
+            if len(sequence) > v.MAX_ORDER_ITEMS:
+                raise BeatError(f"The order has {len(sequence)} parts; the limit is {v.MAX_ORDER_ITEMS}. Use a section's repeats: setting instead of listing it again and again.")
+            tempo = _number(bpm, 100, 40, 240, "bpm")
+            swung = _number(swing, 0, 0, 60, "swing")
+            sound = "square" if is_unset(melody_sound) else str(melody_sound).strip().lower()
+            if sound not in MELODY_SOUNDS:
+                raise BeatError(f"melody_sound {melody_sound!r} is not one of: {', '.join(MELODY_SOUNDS)}.")
+            fixes: List[str] = []
+            built = {key: section_segment(sections[key], tempo, swung, sound, fixes) for key in dict.fromkeys(sequence)}
+            for key, seg in built.items():
+                if seg["steps"] > v.MAX_STEPS:
+                    raise BeatError(f"The section {sections[key]['name']!r} is {seg['steps']} steps; the limit is {v.MAX_STEPS}. Split it into two sections.")
+            segments = [dict(built[key]) for key in sequence]
+            seconds = sum(seg["steps"] * seg["repeats"] * 60.0 / seg["bpm"] / STEPS_PER_BEAT for seg in segments)
+            if seconds > v.MAX_SECONDS:
+                raise BeatError(f"That song would be {seconds:.0f} seconds; the limit is {v.MAX_SECONDS}. Lower the repeats, or leave out some of the order.")
+        except BeatError as e:
+            return f"Could not make the song: {e}"
+
+        names = [sections[key]["name"] for key in sequence]
+        label = (title or "").strip() if not is_unset(title) else ""
+        meta = {"song": str(song).strip(), "order": names, "bpm": tempo, "swing": swung}
+        played = f"{len(segments)} parts ({', '.join(names)}), {seconds:.0f} s"
+        if fixes:
+            played += ". Note: some lines were not the same length as the rest of their section, so I fixed them: " + "; ".join(fixes) + ". Next time give every line in a section the same number of steps (16 per bar; write drum steps in groups of four)"
+        return await self._publish(segments, label, label or "song", meta, played, "track", __event_emitter__)
+
+    async def _publish(self, segments: List[Segment], label: str, name_hint: str, meta: Dict[str, Any], played: str, noun: str,
+                       emitter: Optional[Callable[[dict], Any]]) -> str:
+        """Render, save, upload and attach; the text the model gets back is the links (or why there are none)."""
+        v = self.valves
+        await _emit(emitter, {"type": "status", "data": {"description": "Programming the sequencer...", "done": False}})
+        wav = await asyncio.to_thread(render_song, segments, max(8000, v.SAMPLE_RATE))
+        midi = build_midi_song(segments, label)
         audio, ext = wav, "wav"
         if v.OUTPUT_FORMAT.strip().lower() == "mp3":
             mp3 = await asyncio.to_thread(wav_to_mp3, wav)
@@ -626,17 +818,13 @@ class Tools:
                 audio, ext = mp3, "mp3"
 
         stamp = datetime.now().astimezone()
-        base = f"{stamp:%Y%m%d-%H%M%S}-{slugify(label or (next(iter(lanes)) if lanes else next(iter(cells))) + '-beat')}"
+        base = f"{stamp:%Y%m%d-%H%M%S}-{slugify(name_hint)}"
         saved = ""
         try:
             folder = self._beat_dir()
             (folder / f"{base}.{ext}").write_bytes(audio)
             (folder / f"{base}.mid").write_bytes(midi)
-            (folder / f"{base}.json").write_text(json.dumps({
-                "title": label, "created": stamp.isoformat(timespec="seconds"), "bpm": tempo, "swing": swung, "repeats": times, "steps": steps,
-                "pattern": {n: "".join("X" if h >= 1 else "x" if h >= 0.8 else "g" if h else "." for h in hits) for n, hits in lanes.items()},
-                **({"bass": str(bass).strip()} if "bass" in cells else {}), **({"melody": str(melody).strip(), "melody_sound": sound} if "melody" in cells else {}),
-            }, indent=1))
+            (folder / f"{base}.json").write_text(json.dumps({"title": label, "created": stamp.isoformat(timespec="seconds"), **meta}, indent=1))
             saved = str(folder / f"{base}.{ext}")
         except OSError as e:
             saved = f"(not saved to disk: {e})"
@@ -650,24 +838,22 @@ class Tools:
                 else:
                     problem = err
         if links and v.ATTACH_TO_CHAT:
-            await _emit(__event_emitter__, {"type": "files", "data": {"files": [
+            await _emit(emitter, {"type": "files", "data": {"files": [
                 {"type": "file", "id": u.split("/api/v1/files/")[1].split("/")[0], "url": u, "name": n, "size": size, "status": "uploaded"}
                 for n, (u, size) in links.items()]}})
-        await _emit(__event_emitter__, {"type": "status", "data": {"description": "Beat ready", "done": True}})
+        await _emit(emitter, {"type": "status", "data": {"description": "Ready", "done": True}})
 
-        played = f"{steps} steps x {times} at {tempo:g} BPM" + (f", swing {swung:g}" if swung else "") + f" ({seconds:.1f} s)"
-        if fixes:  # the beat was made anyway; say what was fixed so the next one is written right
-            played += ". Note: your lines were not all the same length, so I fixed them: " + "; ".join(fixes) + f". Next time give every line exactly {steps} steps (write drum steps in groups of four, like x... x... x... x...)"
+        made = f"Made the {noun}: {played}"
         if f"{base}.{ext}" in links:
             audio_url = links[f"{base}.{ext}"][0]
-            reply = f"Made the beat: {played}. Put this link in your reply so the user can play it:\n[Play {label or 'beat'}]({audio_url})"
+            reply = f"{made}. Put this link in your reply so the user can play it:\n[Play {label or noun}]({audio_url})"
             if f"{base}.mid" in links:
                 reply += f"\n[MIDI file]({links[f'{base}.mid'][0]})"
             if v.PUBLIC_BASE_URL.strip():
                 reply += f"\nFull link for an email (opens only when the user is logged in to Open WebUI): {v.PUBLIC_BASE_URL.rstrip('/')}{audio_url}"
             return reply + f"\nSaved on the server as: {saved}"
         why = problem or "uploading to Open WebUI is turned off"
-        return f"Made the beat: {played}, saved on the server as: {saved}. No playable link could be made ({why}); tell the user, and that the tool's OPEN_WEBUI_API_KEY valve needs checking."
+        return f"{made}. Saved on the server as: {saved}. No playable link could be made ({why}); tell the user, and that the tool's OPEN_WEBUI_API_KEY valve needs checking."
 
     async def list_beats(self, limit: Optional[str] = None) -> str:
         """
@@ -688,8 +874,9 @@ class Tools:
                 meta = json.loads(path.read_text())
             except (OSError, ValueError):
                 continue
-            shown = [f"  {n}: {p}" for n, p in meta.get("pattern", {}).items()]
+            shown = [f"  order: {', '.join(meta['order'])}"] if meta.get("order") else []
+            shown += [f"  {n}: {p}" for n, p in meta.get("pattern", {}).items()]
             shown += [f"  bass: {meta['bass']}"] if meta.get("bass") else []
             shown += [f"  melody ({meta.get('melody_sound', 'square')}): {meta['melody']}"] if meta.get("melody") else []
-            lines.append(f"{path.stem} - {meta.get('title') or 'untitled'} ({meta.get('bpm'):g} BPM, swing {meta.get('swing', 0):g}, repeats {meta.get('repeats')})\n" + "\n".join(shown))
+            lines.append(f"{path.stem} - {meta.get('title') or 'untitled'} ({meta.get('bpm'):g} BPM, swing {meta.get('swing', 0):g}" + (f", repeats {meta['repeats']}" if meta.get("repeats") else "") + ")\n" + "\n".join(shown))
         return "\n\n".join(lines) or "No beats could be read."
