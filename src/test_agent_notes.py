@@ -924,7 +924,41 @@ class ListAndSearchTests(NotesTestCase):
         self.assertIn("past the last", past["note"])
         self.assertIn("read a whole entry", first["note"])
         none = self.run_async(self.tool.agent_notes_search("zebra"))
-        self.assertIn("No entry contains all of those words", none["note"])
+        self.assertIn("No entry contains any of those words", none["note"])
+
+    def test_search_words_drops_or_and_punctuation(self):
+        self.assertEqual(mod.search_words('Outfit OR gig, "clothes" | Outfit'), ["outfit", "gig", "clothes"])
+        self.assertEqual(mod.search_words("or"), ["or"])
+        self.assertEqual(mod.search_words("  "), [])
+
+    def test_search_with_no_entry_holding_every_word_falls_back_to_any_word_most_words_first(self):
+        self.create("a", "black dress for the gig")
+        self.run_async(self.tool.agent_notes_append("a", "gig tomorrow at eight"))
+        self.run_async(self.tool.agent_notes_append("a", "boots and a jacket"))
+        self.run_async(self.tool.agent_notes_append("a", "unrelated"))
+        out = self.run_async(self.tool.agent_notes_search("dress OR gig OR jacket"))
+        self.assertEqual(out["total_matching_entries"], 3)
+        self.assertEqual(out["matched"], "some of the words")
+        self.assertEqual({c["entry_no"]: c["words_matched"] for c in out["cards"]}, {1: 2, 2: 1, 3: 1})
+        self.assertEqual(out["cards"][0]["entry_no"], 1)  # two words beat one
+        self.assertIn("some of them", out["note"])
+
+    def test_search_prefers_entries_with_every_word_and_shows_no_fallback_marks(self):
+        self.create("a", "black dress for the gig")
+        self.run_async(self.tool.agent_notes_append("a", "gig tomorrow"))
+        out = self.run_async(self.tool.agent_notes_search("gig OR dress"))
+        self.assertEqual([c["entry_no"] for c in out["cards"]], [1])
+        self.assertNotIn("matched", out)
+        self.assertNotIn("words_matched", out["cards"][0])
+
+    def test_search_fallback_also_finds_notes_by_any_keyword_and_respects_note_filter(self):
+        self.create("outfit-plans", "x")
+        self.create("other", "dress is blue")
+        out = self.run_async(self.tool.agent_notes_search("outfit dress"))
+        self.assertEqual([n["note_name"] for n in out["matching_notes"]], ["outfit-plans"])
+        self.assertEqual([c["note_name"] for c in out["cards"]], ["other"])
+        only = self.run_async(self.tool.agent_notes_search("outfit dress", note="outfit-plans"))
+        self.assertEqual(only["cards"], [])
 
     def test_search_can_be_limited_to_one_note_and_does_not_list_notes_then(self):
         self.create("a", "needle in a")

@@ -1,7 +1,7 @@
 """
 title: Agent Notes Curation
 author: Gordon
-version: 1.17.0
+version: 1.18.0
 description: The upkeep half of Agent Notes (it needs the Agent Notes tool too, and the same NOTES_DB_PATH valve):
     tags (agent_notes_add_tags/agent_notes_remove_tag/agent_notes_rename_tag), summaries
     (agent_notes_update_summary/agent_notes_delete_summary), renaming a note or changing its comment
@@ -861,16 +861,21 @@ def list_notes_db(db_path: str, limit: int, needs_summary: bool = False, tag: Op
 
 
 def search_notes_db(db_path: str, query: str, limit: int) -> "tuple[List[Any], List[Any]]":
-    like = f"%{_like_escape(query)}%"
+    """Notes whose name, comment or tag contains the whole query; failing that, any one of its keywords."""
     conn = notes_db_connect(db_path)
     try:
-        notes = conn.execute(
-            "SELECT note_name, note_comment FROM note_id "
-            "WHERE note_name LIKE ? ESCAPE '\\' OR note_comment LIKE ? ESCAPE '\\' "
-            "OR note_pk IN (SELECT nt.note_pk FROM note_tag nt JOIN tag t ON t.tag_id = nt.tag_id WHERE t.tag_name LIKE ? ESCAPE '\\') "
-            "ORDER BY updated_at DESC LIMIT ?",
-            (like, like, like, limit),
-        ).fetchall()
+        def notes_like(terms: List[str]) -> list:
+            likes = [f"%{_like_escape(t)}%" for t in terms]
+            cond = " OR ".join("(note_name LIKE ? ESCAPE '\\' OR note_comment LIKE ? ESCAPE '\\' "
+                               "OR note_pk IN (SELECT nt.note_pk FROM note_tag nt JOIN tag t ON t.tag_id = nt.tag_id WHERE t.tag_name LIKE ? ESCAPE '\\'))" for _ in terms)
+            return conn.execute(f"SELECT note_name, note_comment FROM note_id WHERE {cond} ORDER BY updated_at DESC LIMIT ?",
+                                [x for like in likes for x in (like, like, like)] + [limit]).fetchall()
+
+        notes = notes_like([query])
+        words = search_words(query)
+        if not notes and len(words) > 1:
+            notes = notes_like(words)
+        like = f"%{_like_escape(query)}%"
         entries = conn.execute(
             f"SELECT n.note_name, d.entry_no, d.note_text, d.hits, d.weight, a.author_name, {_CHAIN_SQL} FROM note_data d JOIN note_id n ON n.note_pk = d.note_pk "
             "LEFT JOIN note_author a ON a.author_id = d.author_id "
@@ -975,27 +980,49 @@ def rank_entries_db(db_path: str, name: str, by: str, limit: int, weight: Option
         conn.close()
 
 
-def search_cards_db(db_path: str, query: str, limit: int, offset: int = 0, note: Optional[str] = None) -> "tuple[int, List[Any]]":
-    """Entries whose text contains every word of the query (optionally only in one note), strongest feeling first - the furthest
-    score from neutral, either way - then newest. Returns (how many match in all, the requested page)."""
-    words = list(dict.fromkeys(query.lower().split()))[:8]
+_SEARCH_NOISE = {"or", "and", "|", "||", "+", "-"}  # what models put between keywords; never part of what they are looking for
+
+
+def search_words(query: Any) -> List[str]:
+    """The keywords of a search query: lowercase, split on spaces, commas and similar, quotes and brackets trimmed, a bare
+    OR/AND between words dropped (unless that would leave nothing), repeats removed, at most 8."""
+    tokens = [t.strip("\"'`()[]{}<>,;:.!?") for t in re.split(r"[\s,;|]+", str(query or "").lower())]
+    tokens = [t for t in tokens if t]
+    words = [t for t in tokens if t not in _SEARCH_NOISE] or tokens
+    return list(dict.fromkeys(words))[:8]
+
+
+def search_cards_db(db_path: str, query: str, limit: int, offset: int = 0, note: Optional[str] = None) -> "tuple[int, List[Any], str]":
+    """Entries whose text contains every keyword of the query (optionally only in one note), strongest feeling first - the furthest
+    score from neutral, either way - then newest. If no entry has them all and there are several keywords, entries with any of
+    them: the most keywords first, then the same order. Returns (how many match, the requested page, "all" or "any")."""
+    words = search_words(query)
     if not words:
         raise NoteError("query is required.")
-    where = " AND ".join("d.note_text LIKE ? ESCAPE '\\'" for _ in words)
-    params: List[Any] = [f"%{_like_escape(w)}%" for w in words]
+    likes = [f"%{_like_escape(w)}%" for w in words]
+    contains = "d.note_text LIKE ? ESCAPE '\\'"
     conn = notes_db_connect(db_path)
     try:
+        note_clause, note_params = "", []
         if note is not None:
-            where += " AND d.note_pk = ?"
-            params.append(_get_note(conn, note)["note_pk"])
-        total = conn.execute(f"SELECT COUNT(*) FROM note_data d WHERE {where}", params).fetchone()[0]
+            note_clause, note_params = " AND d.note_pk = ?", [_get_note(conn, note)["note_pk"]]
+        mode = "all"
+        where, params = " AND ".join(contains for _ in words), list(likes)
+        total = conn.execute(f"SELECT COUNT(*) FROM note_data d WHERE {where}{note_clause}", params + note_params).fetchone()[0]
+        order, order_params = f"{_STRENGTH_SQL} DESC", []
+        if total == 0 and len(words) > 1:
+            mode = "any"
+            where = "(" + " OR ".join(contains for _ in words) + ")"
+            total = conn.execute(f"SELECT COUNT(*) FROM note_data d WHERE {where}{note_clause}", params + note_params).fetchone()[0]
+            order = "(" + " + ".join(f"({contains})" for _ in words) + f") DESC, {_STRENGTH_SQL} DESC"
+            order_params = list(likes)
         rows = conn.execute(
             f"SELECT n.note_name, d.entry_no, d.note_text, d.created_at, d.hits, d.weight, a.author_name FROM note_data d "
-            f"JOIN note_id n ON n.note_pk = d.note_pk LEFT JOIN note_author a ON a.author_id = d.author_id WHERE {where} "
-            f"ORDER BY {_STRENGTH_SQL} DESC, d.created_at DESC, d.entry_no DESC LIMIT ? OFFSET ?",
-            params + [limit, offset],
+            f"JOIN note_id n ON n.note_pk = d.note_pk LEFT JOIN note_author a ON a.author_id = d.author_id WHERE {where}{note_clause} "
+            f"ORDER BY {order}, d.created_at DESC, d.entry_no DESC LIMIT ? OFFSET ?",
+            params + note_params + order_params + [limit, offset],
         ).fetchall()
-        return total, rows
+        return total, rows, mode
     finally:
         conn.close()
 
@@ -1381,7 +1408,7 @@ def help_topics(
         "find": (
             "locating notes and entries",
             "agent_notes_list: every note, most recently changed first (tag= narrows it; needs_summary=true is for a summarizing agent).\n"
-            "agent_notes_search query: cards (note, entry number, score, the start of the text) for entries containing all your words, the strongest feelings first and then the newest; "
+            "agent_notes_search query: cards (note, entry number, score, the start of the text) for entries containing all your words (just list the words; no OR needed), the strongest feelings first and then the newest; if no entry has them all you get entries with some of them, most words first; "
             "it also lists notes whose name, comment or tags match. note= searches inside one note, page= shows more cards, and agent_notes_read with entry=N then reads a card's whole entry.\n"
             "agent_notes_search_summary query: finds the right note from words in its name or summary; the cheapest way to locate a note.\n"
             f"agent_notes_list_tags, then agent_notes_read_tagged tags: gathers everything about a subject (say tags \"identity, speech\") in one reply of at most about {tagged_chars} characters; "

@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.17.0
+version: 1.18.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -885,16 +885,21 @@ def list_notes_db(db_path: str, limit: int, needs_summary: bool = False, tag: Op
 
 
 def search_notes_db(db_path: str, query: str, limit: int) -> "tuple[List[Any], List[Any]]":
-    like = f"%{_like_escape(query)}%"
+    """Notes whose name, comment or tag contains the whole query; failing that, any one of its keywords."""
     conn = notes_db_connect(db_path)
     try:
-        notes = conn.execute(
-            "SELECT note_name, note_comment FROM note_id "
-            "WHERE note_name LIKE ? ESCAPE '\\' OR note_comment LIKE ? ESCAPE '\\' "
-            "OR note_pk IN (SELECT nt.note_pk FROM note_tag nt JOIN tag t ON t.tag_id = nt.tag_id WHERE t.tag_name LIKE ? ESCAPE '\\') "
-            "ORDER BY updated_at DESC LIMIT ?",
-            (like, like, like, limit),
-        ).fetchall()
+        def notes_like(terms: List[str]) -> list:
+            likes = [f"%{_like_escape(t)}%" for t in terms]
+            cond = " OR ".join("(note_name LIKE ? ESCAPE '\\' OR note_comment LIKE ? ESCAPE '\\' "
+                               "OR note_pk IN (SELECT nt.note_pk FROM note_tag nt JOIN tag t ON t.tag_id = nt.tag_id WHERE t.tag_name LIKE ? ESCAPE '\\'))" for _ in terms)
+            return conn.execute(f"SELECT note_name, note_comment FROM note_id WHERE {cond} ORDER BY updated_at DESC LIMIT ?",
+                                [x for like in likes for x in (like, like, like)] + [limit]).fetchall()
+
+        notes = notes_like([query])
+        words = search_words(query)
+        if not notes and len(words) > 1:
+            notes = notes_like(words)
+        like = f"%{_like_escape(query)}%"
         entries = conn.execute(
             f"SELECT n.note_name, d.entry_no, d.note_text, d.hits, d.weight, a.author_name, {_CHAIN_SQL} FROM note_data d JOIN note_id n ON n.note_pk = d.note_pk "
             "LEFT JOIN note_author a ON a.author_id = d.author_id "
@@ -999,27 +1004,49 @@ def rank_entries_db(db_path: str, name: str, by: str, limit: int, weight: Option
         conn.close()
 
 
-def search_cards_db(db_path: str, query: str, limit: int, offset: int = 0, note: Optional[str] = None) -> "tuple[int, List[Any]]":
-    """Entries whose text contains every word of the query (optionally only in one note), strongest feeling first - the furthest
-    score from neutral, either way - then newest. Returns (how many match in all, the requested page)."""
-    words = list(dict.fromkeys(query.lower().split()))[:8]
+_SEARCH_NOISE = {"or", "and", "|", "||", "+", "-"}  # what models put between keywords; never part of what they are looking for
+
+
+def search_words(query: Any) -> List[str]:
+    """The keywords of a search query: lowercase, split on spaces, commas and similar, quotes and brackets trimmed, a bare
+    OR/AND between words dropped (unless that would leave nothing), repeats removed, at most 8."""
+    tokens = [t.strip("\"'`()[]{}<>,;:.!?") for t in re.split(r"[\s,;|]+", str(query or "").lower())]
+    tokens = [t for t in tokens if t]
+    words = [t for t in tokens if t not in _SEARCH_NOISE] or tokens
+    return list(dict.fromkeys(words))[:8]
+
+
+def search_cards_db(db_path: str, query: str, limit: int, offset: int = 0, note: Optional[str] = None) -> "tuple[int, List[Any], str]":
+    """Entries whose text contains every keyword of the query (optionally only in one note), strongest feeling first - the furthest
+    score from neutral, either way - then newest. If no entry has them all and there are several keywords, entries with any of
+    them: the most keywords first, then the same order. Returns (how many match, the requested page, "all" or "any")."""
+    words = search_words(query)
     if not words:
         raise NoteError("query is required.")
-    where = " AND ".join("d.note_text LIKE ? ESCAPE '\\'" for _ in words)
-    params: List[Any] = [f"%{_like_escape(w)}%" for w in words]
+    likes = [f"%{_like_escape(w)}%" for w in words]
+    contains = "d.note_text LIKE ? ESCAPE '\\'"
     conn = notes_db_connect(db_path)
     try:
+        note_clause, note_params = "", []
         if note is not None:
-            where += " AND d.note_pk = ?"
-            params.append(_get_note(conn, note)["note_pk"])
-        total = conn.execute(f"SELECT COUNT(*) FROM note_data d WHERE {where}", params).fetchone()[0]
+            note_clause, note_params = " AND d.note_pk = ?", [_get_note(conn, note)["note_pk"]]
+        mode = "all"
+        where, params = " AND ".join(contains for _ in words), list(likes)
+        total = conn.execute(f"SELECT COUNT(*) FROM note_data d WHERE {where}{note_clause}", params + note_params).fetchone()[0]
+        order, order_params = f"{_STRENGTH_SQL} DESC", []
+        if total == 0 and len(words) > 1:
+            mode = "any"
+            where = "(" + " OR ".join(contains for _ in words) + ")"
+            total = conn.execute(f"SELECT COUNT(*) FROM note_data d WHERE {where}{note_clause}", params + note_params).fetchone()[0]
+            order = "(" + " + ".join(f"({contains})" for _ in words) + f") DESC, {_STRENGTH_SQL} DESC"
+            order_params = list(likes)
         rows = conn.execute(
             f"SELECT n.note_name, d.entry_no, d.note_text, d.created_at, d.hits, d.weight, a.author_name FROM note_data d "
-            f"JOIN note_id n ON n.note_pk = d.note_pk LEFT JOIN note_author a ON a.author_id = d.author_id WHERE {where} "
-            f"ORDER BY {_STRENGTH_SQL} DESC, d.created_at DESC, d.entry_no DESC LIMIT ? OFFSET ?",
-            params + [limit, offset],
+            f"JOIN note_id n ON n.note_pk = d.note_pk LEFT JOIN note_author a ON a.author_id = d.author_id WHERE {where}{note_clause} "
+            f"ORDER BY {order}, d.created_at DESC, d.entry_no DESC LIMIT ? OFFSET ?",
+            params + note_params + order_params + [limit, offset],
         ).fetchall()
-        return total, rows
+        return total, rows, mode
     finally:
         conn.close()
 
@@ -1405,7 +1432,7 @@ def help_topics(
         "find": (
             "locating notes and entries",
             "agent_notes_list: every note, most recently changed first (tag= narrows it; needs_summary=true is for a summarizing agent).\n"
-            "agent_notes_search query: cards (note, entry number, score, the start of the text) for entries containing all your words, the strongest feelings first and then the newest; "
+            "agent_notes_search query: cards (note, entry number, score, the start of the text) for entries containing all your words (just list the words; no OR needed), the strongest feelings first and then the newest; if no entry has them all you get entries with some of them, most words first; "
             "it also lists notes whose name, comment or tags match. note= searches inside one note, page= shows more cards, and agent_notes_read with entry=N then reads a card's whole entry.\n"
             "agent_notes_search_summary query: finds the right note from words in its name or summary; the cheapest way to locate a note.\n"
             f"agent_notes_list_tags, then agent_notes_read_tagged tags: gathers everything about a subject (say tags \"identity, speech\") in one reply of at most about {tagged_chars} characters; "
@@ -2043,7 +2070,7 @@ class Tools:
         (1-10, 5 is neutral) and the start of the text. Strongest feelings first (furthest from 5), then newest.
         Notes whose name, comment or tags match are listed too. Read a card's whole entry with agent_notes_read, entry=N.
 
-        :param query: Words to look for; an entry must contain all of them (any case).
+        :param query: Words to look for, separated by spaces (no OR needed; any case). Entries containing all of them come first; if there are none, entries with some of them are shown, most words first.
         :param limit: Cards per page, default 10. Pass "" (or omit) for the default.
         :param page: Which page of cards, default 1; use it when the reply says more match.
         :param note: Look only inside this note. Pass "" (or omit) to look in every note.
@@ -2057,35 +2084,41 @@ class Tools:
             cap = min(_to_int(limit, 10, "limit"), v.MAX_SEARCH_RESULTS)
             page_no = _to_int(page, 1, "page")
             only = None if is_unset(note) else validate_name(note)
-            total, rows = await asyncio.to_thread(search_cards_db, v.NOTES_DB_PATH, text, cap, (page_no - 1) * cap, only)
+            total, rows, mode = await asyncio.to_thread(search_cards_db, v.NOTES_DB_PATH, text, cap, (page_no - 1) * cap, only)
             notes = []
             if only is None and page_no == 1:
                 notes, _ = await asyncio.to_thread(search_notes_db, v.NOTES_DB_PATH, text, cap)
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
-        words = list(dict.fromkeys(text.lower().split()))[:8]
+        words = search_words(text)
         full = _to_bool(verbose)
         cards = []
         for r in rows:
             card = {"note_name": r["note_name"], "entry_no": r["entry_no"], "weight": weight_to_score(r["weight"]), "date": (r["created_at"] or "")[:10],
                     "snippet": make_snippet(r["note_text"], words, max(40, v.SEARCH_SNIPPET_CHARS))}
+            if mode == "any":
+                card["words_matched"] = sum(1 for w in words if w in (r["note_text"] or "").lower())
             if full:
                 card.update({"author": r["author_name"] or "unknown", "hits": r["hits"]})
             cards.append(card)
         out: Dict[str, Any] = {"success": True, "total_matching_entries": total, "page": page_no, "cards": cards}
+        if mode == "any":
+            out["matched"] = "some of the words"
         if notes:
             out["matching_notes"] = [{"note_name": r["note_name"], "note_comment": r["note_comment"]} for r in notes]
         first = (page_no - 1) * cap
         remarks = []
         if cards:
             out["showing"] = f"{first + 1}-{first + len(cards)} of {total}"
+            if mode == "any":
+                remarks.append("No entry has all of those words, so these have some of them, most words first.")
             remarks.append("These are cards: read a whole entry with agent_notes_read (name, entry=N).")
             if first + len(cards) < total:
                 remarks.append(f"{total - first - len(cards)} more match; ask for page={page_no + 1}.")
         elif total:
             remarks.append(f"Page {page_no} is past the last of {total} matches.")
         else:
-            remarks.append("No entry contains all of those words. Try fewer or different words.")
+            remarks.append("No entry contains any of those words. Try different words, or look in agent_notes_list.")
         out["note"] = " ".join(remarks)
         return out
 
