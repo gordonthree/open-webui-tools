@@ -4,6 +4,7 @@ Tests for agent_notes.py. Run with: python -m unittest test_agent_notes -v
 """
 
 import asyncio
+from collections import Counter as collections_counter
 import shutil
 import sqlite3
 import tempfile
@@ -21,6 +22,7 @@ class NotesTestCase(unittest.TestCase):
         self.tool = mod.Tools()
         self.tool.valves.NOTES_DB_PATH = self.db
         self.tool.valves.MIN_SUMMARY_CHARS = 0  # tests use tiny notes; the short-note rule has its own tests
+        self.tool.valves.STRONG_SPREAD = False  # strong memories are a fixed top-N unless a test asks for the random draw
         mod._overlong.clear()  # too-long retry counts are kept module-wide
 
     def tearDown(self):
@@ -782,6 +784,33 @@ class ListAndSearchTests(NotesTestCase):
         self.assertEqual(mod.auto_ramp_days(ago(400), 60, now), 60)
         self.assertEqual(mod.auto_ramp_days(ago(12), 0, now), 0)
         self.assertEqual(mod.auto_ramp_days("garbage", 90, now), 0)
+
+    def test_spread_draws_strong_memories_at_random_in_proportion_to_strength(self):
+        self.fill(40, scores={**{n: 8 for n in range(1, 21)}, 25: 10})
+        self.tool.valves.STRONG_SPREAD = True
+        self.tool.valves.STRONG_RAMP_MAX_DAYS = 0
+        self.tool.valves.READ_STRONG_EACH = 3
+        mod._rng.seed(1)
+        seen = collections_counter()
+        for _ in range(60):
+            picks = [e["entry_no"] for e in self.read()["strong_memories"]["positive"]]
+            self.assertEqual(len(picks), len(set(picks)))
+            self.assertTrue(set(picks) <= set(range(1, 21)) | {25})
+            seen.update(picks)
+        self.assertGreater(len(seen), 10)  # a spread of many, not the same three
+        self.assertGreater(seen[25], max(seen[n] for n in range(1, 21)))  # the 10 comes up more than any single 8
+
+    def test_spread_returns_everything_when_there_are_few_and_never_touches_persona(self):
+        self.fill(30, scores={3: 7, 7: 9})
+        self.tool.valves.STRONG_SPREAD = True
+        for _ in range(5):
+            self.assertEqual([e["entry_no"] for e in self.read()["strong_memories"]["positive"]], [7, 3])  # all qualify, strongest first
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE note_id SET kind = 'persona'")
+        conn.commit(); conn.close()
+        self.tool.valves.READ_STRONG_EACH = 1
+        for _ in range(5):
+            self.assertEqual([e["entry_no"] for e in self.read()["strong_memories"]["positive"]], [7])
 
     def test_age_factor(self):
         import datetime

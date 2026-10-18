@@ -1,7 +1,7 @@
 """
 title: Agent Notes Curation
 author: Gordon
-version: 1.16.0
+version: 1.17.0
 description: The upkeep half of Agent Notes (it needs the Agent Notes tool too, and the same NOTES_DB_PATH valve):
     tags (agent_notes_add_tags/agent_notes_remove_tag/agent_notes_rename_tag), summaries
     (agent_notes_update_summary/agent_notes_delete_summary), renaming a note or changing its comment
@@ -17,6 +17,7 @@ import datetime
 import difflib
 import json
 import logging
+import random
 import re
 import sqlite3
 import time
@@ -751,9 +752,21 @@ def age_factor(created_at: Any, ramp_days: float, now: "Optional[datetime.dateti
     return RAMP_FLOOR + (1 - RAMP_FLOOR) * max(0.0, min(1.0, age / ramp_days))
 
 
+_rng = random.Random()  # its own generator, so tests can seed it
+
+
+def weighted_pick(rows: list, weights: List[float], count: int) -> list:
+    """`count` of the rows chosen at random without repeats, each row's chance in proportion to its weight (Efraimidis-Spirakis);
+    returned strongest (heaviest) first. Fewer than `count` rows come back whole."""
+    if len(rows) <= count:
+        return [r for _, r in sorted(zip(weights, rows), key=lambda wr: -wr[0])]
+    keyed = sorted(((_rng.random() ** (1.0 / max(w, 1e-9)), w, i) for i, w in enumerate(weights)), reverse=True)[:count]
+    return [rows[i] for _, _, i in sorted(keyed, key=lambda k: -k[1])]
+
+
 def read_view_db(
     db_path: str, name: str, mode: str = "tiered", recent: int = 10, strong_each: int = 5, low: int = 3, high: int = 7,
-    before: Optional[int] = None, numbers: Optional[List[int]] = None, sample: int = 0, ramp_max_days: float = 0,
+    before: Optional[int] = None, numbers: Optional[List[int]] = None, sample: int = 0, ramp_max_days: float = 0, spread: bool = False,
 ) -> Dict[str, Any]:
     """One note, seen the way agent_notes_read shows it. mode:
       tiered  the `recent` newest entries, plus up to `strong_each` strongest memories on each side (scores <= low, >= high) older than those
@@ -761,7 +774,7 @@ def read_view_db(
       entries the entries numbered `numbers` (anything, however old)
       sample  `sample` random entries other than the `recent` newest
     Entries come back oldest first; `positive`/`negative` (tiered only) strongest first. With ramp_max_days > 0 a memory
-    note's strong entries are ranked by strength x age_factor, the ramp being the note's own age in whole weeks (auto_ramp_days, at most ramp_max_days), so a run of very recent peaks doesn't crowd out older ones (which
+    note's strong entries are ranked by strength x age_factor, the ramp being the note's own age in whole weeks (auto_ramp_days, at most ramp_max_days), and with spread=true a memory note's strong entries are drawn at random in proportion to that strength instead of taking the top ones, so a run of very recent peaks doesn't crowd out older ones (which
     entries qualify is still decided by the raw score; persona notes are not affected)."""
     conn = notes_db_connect(db_path)
     try:
@@ -800,12 +813,15 @@ def read_view_db(
                     ramp = auto_ramp_days(first, ramp_max_days)
 
                 def strongest(cutoff_sql: str, cutoff: int, order: str) -> list:
-                    if not ramp:
+                    spread_here = spread and not persona
+                    if not ramp and not spread_here:
                         return fetch(f"{exclude} AND {cutoff_sql} ?", skip + [cutoff], f"{order}, d.created_at DESC", strong_each)
                     rows = fetch(f"{exclude} AND {cutoff_sql} ?", skip + [cutoff], f"{order}, d.created_at DESC", 100000)
                     now = datetime.datetime.now(datetime.timezone.utc)
-                    rows.sort(key=lambda r: -abs(r["weight"] - DEFAULT_WEIGHT) * age_factor(r["created_at"], ramp, now))  # stable: ties keep newest first
-                    return rows[:strong_each]
+                    pull = [abs(r["weight"] - DEFAULT_WEIGHT) * age_factor(r["created_at"], ramp, now) for r in rows]
+                    if spread_here:
+                        return weighted_pick(rows, pull, strong_each)
+                    return [r for _, r in sorted(zip(pull, rows), key=lambda pr: -pr[0])][:strong_each]  # stable: ties keep newest first
 
                 out["positive"] = strongest(f"{_SCORE_SQL} >=", high, "d.weight DESC")
                 if not persona:  # in a persona note a low weight is a weak trait, not a painful memory
