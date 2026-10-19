@@ -835,11 +835,19 @@ scheduled prompt that creates a new chat each run, with the model's normal tools
 inside the Docker deployment. Files in `autonomy/`:
 
 - `charter.md` - Gordon-owned rules for a tick; the model reads it every tick and must not edit it
-  (copy to `companion-docs/autonomy/` and make it read-only, e.g. `chmod 444`).
+  (copy to `companion-docs/autonomy/` and make it read-only, e.g. `chmod 444`). This is a snapshot of the live charter taken
+  2026-10-19 (it had drifted from the first version: an email check as step 1, `shared-history` reads, an ACT-every-2-3-ticks nudge
+  with self-maintenance, an ownership paragraph), with the companion's name replaced by "the companion". Edit the live file, then
+  refresh this copy; the repo does not push it anywhere. Its step 3 still says to call `get_current_timestamp`; the system prompt
+  now supplies the time (`{{CURRENT_DATETIME}}`, with the container's `TZ` set), and variables do not work inside a file.
 - `seed.md` - the model-owned steering note (under 1000 characters): what has its attention, what to
-  look at next tick. The model rewrites it in place; `backup_companion.sh` keeps history.
-- `automation_prompt.md` - the static prompt to paste into the Automation. All variability comes from
-  the model's own seed, memory files (`companion-docs/autonomy/memory/`) and log.
+  look at next tick. The model rewrites it in place; `backup_companion.sh` keeps history. The repo copy is only the starter text a fresh seed begins with; the live one is the companion's own state and is not
+  copied here.
+- `automation_prompt.md` - the short prompt to paste into the Automation (2026-10-19: slimmed to the tick instruction plus "Run your
+  Session start protocol"; the persona and protocol come from the model's own system prompt, so there is one copy to maintain - an
+  earlier setup pasted the whole system prompt into the Automation, which doubled it and let the copy go stale). All variability comes from
+  the model's own seed, memory files (`companion-docs/autonomy/memory/`) and log. Prompt variables such as `{{CURRENT_WEEKDAY}}` are filled
+  in by the server's clock, so the container needs `TZ` set to Gordon's timezone.
 
 Transaction log: the `agent_notes` note `autonomy-log`, one entry per tick, action or inaction, formatted
 `NOOP|ACT|CONTACT - <what/why>` (the tool timestamps each entry) (in `agent_notes` rather than the companion folder so a pile
