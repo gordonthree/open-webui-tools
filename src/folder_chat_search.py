@@ -1,8 +1,8 @@
 """
 title: Folder Chat Search
 author: Gordon
-version: 0.1.0
-description: Searches the user's earlier chats like Open WebUI's built-in search_chats, but only inside the chat folders the owner has named in a valve. The model cannot choose or see the folders, and the owner also caps how many results one search can return.
+version: 0.2.0
+description: Searches and reads the user's earlier chats like Open WebUI's built-in search_chats and view_chat, but only inside the chat folders the owner has named in a valve. The model cannot choose or see the folders, and the owner caps how many results a search returns and how much of a chat one read returns.
 """
 
 import asyncio
@@ -136,6 +136,61 @@ def search_folder_chats_db(
     return len(pool), [h[2] for h in pool[: max(0, limit)]], mode
 
 
+def view_folder_chat_db(db_path: str, user_id: str, folders: List[str], subfolders: bool, chat_id: str, first: int, budget: int) -> Dict[str, Any]:
+    """One chat from the allowed folders as its message chain in order, from message `first` (1-based), whole messages until
+    `budget` characters are used (a single longer message is cut). A chat outside the folders looks exactly like a missing one."""
+    missing = SearchError("chat not found.")
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+    except sqlite3.Error:
+        raise SearchError("the chat database could not be opened.") from None
+    try:
+        ids = resolve_folder_ids(conn, user_id, folders, subfolders)
+        if not ids:
+            raise SearchError("none of the configured folders were found.")
+        row = conn.execute("SELECT id, title, created_at, updated_at, folder_id, chat, meta FROM chat WHERE id = ? AND user_id = ?", (chat_id, user_id)).fetchone()
+    finally:
+        conn.close()
+    if not row or row[4] not in ids:
+        raise missing
+    try:
+        chat = json.loads(row[5] or "{}") or {}
+    except ValueError:
+        raise missing from None
+    history = chat.get("history") or {}
+    by_id = history.get("messages") or {}
+    chain: List[Dict[str, str]] = []
+    if isinstance(by_id, dict) and history.get("currentId"):
+        seen, cur = set(), history.get("currentId")
+        while cur and cur not in seen and isinstance(by_id.get(cur), dict):
+            seen.add(cur)
+            m = by_id[cur]
+            chain.append({"role": m.get("role", ""), "content": m.get("content") if isinstance(m.get("content"), str) else " ".join(message_texts({"messages": [m]}))})
+            cur = m.get("parentId")
+        chain.reverse()
+    else:  # no current-message pointer (or the older flat layout): every message as stored
+        flat = list(by_id.values()) if isinstance(by_id, dict) and by_id else (chat.get("messages") or [])
+        chain = [{"role": m.get("role", ""), "content": " ".join(message_texts({"messages": [m]}))} for m in flat if isinstance(m, dict)]
+    total = len(chain)
+    start = min(max(first, 1), max(total, 1))
+    out: List[Dict[str, str]] = []
+    used = 0
+    for m in chain[start - 1:]:
+        room = budget - used
+        if room <= 0:
+            break
+        if len(m["content"]) > room:
+            if out:
+                break
+            m = {"role": m["role"], "content": m["content"][:room] + "... [message cut]"}
+        out.append(m)
+        used += len(m["content"])
+    result: Dict[str, Any] = {"id": row[0], "title": row[1], "folder": ids[row[4]], "created_at": row[2], "updated_at": row[3], "total_messages": total, "first_message": start, "messages": out}
+    if start - 1 + len(out) < total:
+        result["more"] = f"{total - (start - 1 + len(out))} more messages; call again with first_message={start + len(out)}."
+    return result
+
+
 class Tools:
     # Numbers are typed str on purpose: Open WebUI runs int() on a string given for an int parameter before the method sees it,
     # so a model passing "" for "not set" would fail there. to_int() does the parsing.
@@ -146,6 +201,7 @@ class Tools:
         DEFAULT_COUNT: int = Field(default=5, description="How many chats to return when the model gives no count (never more than MAX_RESULTS).")
         SNIPPET_CHARS: int = Field(default=200, description="Length of the excerpt shown for each result.")
         INCLUDE_ARCHIVED: bool = Field(default=False, description="Also search archived chats in those folders.")
+        MAX_VIEW_CHARS: int = Field(default=8000, description="Character budget for one view_folder_chat reply (about a quarter as many tokens). Whole messages only; the reply says where to continue.")
         CHATS_DB_PATH: str = Field(default="/app/backend/data/webui.db", description="Open WebUI's SQLite database (opened read-only).")
 
     def __init__(self):
@@ -192,3 +248,33 @@ class Tools:
         if mode == "any" and rows:
             out["note"] = "No chat had every keyword; these have some of them."
         return json.dumps(out, ensure_ascii=False)
+
+    async def view_folder_chat(
+        self,
+        chat_id: str,
+        first_message: str = "",
+        __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Read an earlier chat found with search_folder_chats: its messages in order. A long chat comes back in parts.
+        :param chat_id: The id of the chat, as search_folder_chats returned it.
+        :param first_message: Message number to start from (1 = the beginning), or "" to start at the beginning. Use the number a previous reply gave under "more".
+        :return: JSON with the chat's id, title, and messages.
+        """
+        v = self.valves
+        user_id = (__user__ or {}).get("id")
+        try:
+            if not user_id:
+                raise SearchError("user context not available.")
+            folders = configured_folders(v.FOLDERS)
+            if not folders:
+                raise SearchError("chat search is not set up (no folders configured).")
+            result = await asyncio.to_thread(
+                view_folder_chat_db, v.CHATS_DB_PATH, user_id, folders, v.INCLUDE_SUBFOLDERS, str(chat_id or "").strip(),
+                to_int(first_message, "first_message") or 1, max(500, v.MAX_VIEW_CHARS),
+            )
+        except SearchError as e:
+            return json.dumps({"error": str(e)})
+        except Exception as e:  # noqa: BLE001
+            return json.dumps({"error": f"could not read the chat ({type(e).__name__})."})
+        return json.dumps(result, ensure_ascii=False)

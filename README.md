@@ -68,13 +68,13 @@ Current tools:
   2.81 GB, about 16 s. The 7B caption model is 5.3 GB and would spill to the CPU. Create/update with
   `push_tool.py vision_describe describe_image --create` (a new Function is switched on but not global). Tests:
   `cd src && python3 -m unittest test_vision_describe`.
-- `folder_chat_search.py` → `search_folder_chats(query, count, start_timestamp, end_timestamp)` — Open WebUI's built-in `search_chats` has no way to
+- `folder_chat_search.py` → `search_folder_chats(query, count, start_timestamp, end_timestamp)` and `view_folder_chat(chat_id, first_message)` (v0.2.0) — Open WebUI's built-in `search_chats` has no way to
   limit where it looks; this one searches only the chat folders named in the owner's valve `FOLDERS` (comma-separated, folder names in any case
   or ids; `INCLUDE_SUBFOLDERS` default on). The model cannot pick, see or override the folders, and an empty `FOLDERS` makes the tool refuse
   rather than search everything. `MAX_RESULTS` (10) is a hard cap on results, applied on top of the model's `count` (`DEFAULT_COUNT` 5 when
   it gives none). It reads `webui.db` read-only (`CHATS_DB_PATH`), only the calling user's chats, skipping the current chat, archived chats
   (`INCLUDE_ARCHIVED`) and internal ones. Query words: chats with every word first, else some of them (`matched: all|any`). Results are
-  `{id, title, snippet, updated_at, folder}`. It does not read whole chats; the built-in `view_chat` still opens any id it is given. Tests:
+  `{id, title, snippet, updated_at, folder}`. `view_folder_chat` is the folder-limited `view_chat`: it opens only a chat inside those folders (anything else answers "chat not found", the same as a missing id), follows the current branch in order, and returns whole messages up to `MAX_VIEW_CHARS` (8000), saying `first_message=N` to continue. Together they replace the built-in `search_chats` / `view_chat`, which can be hidden from the agents. Tests:
   `cd src && python3 -m unittest test_folder_chat_search`.
 - `drum_machine.py` → `make_beat`, `make_song`, `list_beats` — a step-sequencer for agents: drums, bass and melody; one pattern or a whole track (v0.4.0). The model writes one line per drum
   (`kick: x...x...x...x...`; `x` hit, `X` accent, `g` ghost, `.` rest; 16 steps = one 4/4 bar; drums: kick, snare, rim, clap, hat,

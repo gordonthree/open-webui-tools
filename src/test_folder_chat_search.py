@@ -18,7 +18,7 @@ class SearchTestCase(unittest.TestCase):
         os.close(fd)
         c = sqlite3.connect(self.path)
         c.execute("CREATE TABLE folder (id TEXT, name TEXT, parent_id TEXT, user_id TEXT)")
-        c.execute("CREATE TABLE chat (id TEXT, user_id TEXT, title TEXT, updated_at INT, archived INT, chat TEXT, meta TEXT, folder_id TEXT)")
+        c.execute("CREATE TABLE chat (id TEXT, user_id TEXT, title TEXT, updated_at INT, archived INT, chat TEXT, meta TEXT, folder_id TEXT, created_at INT DEFAULT 0)")
         c.executemany("INSERT INTO folder VALUES (?,?,?,?)", [
             ("f1", "Companion", None, "u1"), ("f2", "Sub", "f1", "u1"), ("f3", "Secret", None, "u1"), ("f4", "Companion", None, "u2"),
         ])
@@ -31,7 +31,7 @@ class SearchTestCase(unittest.TestCase):
             ("f", "u1", "Old", 50, 1, chat_json("archived guitar"), "{}", "f1"),
             ("g", "u1", "Tick", 600, 0, chat_json("guitar tick"), '{"internal": true}', "f1"),
         ]
-        c.executemany("INSERT INTO chat VALUES (?,?,?,?,?,?,?,?)", rows)
+        c.executemany("INSERT INTO chat (id,user_id,title,updated_at,archived,chat,meta,folder_id) VALUES (?,?,?,?,?,?,?,?)", rows)
         c.commit()
         c.close()
         self.addCleanup(os.remove, self.path)
@@ -133,6 +133,62 @@ class QueryTests(SearchTestCase):
     def test_missing_db(self):
         out = self.run_tool(valves={"CHATS_DB_PATH": "/nonexistent/x.db"})
         self.assertIn("error", out)
+
+
+class ViewTests(SearchTestCase):
+    def view(self, chat_id, user="u1", **kw):
+        t = fcs.Tools()
+        t.valves.CHATS_DB_PATH = self.path
+        t.valves.FOLDERS = kw.pop("folders", "companion")
+        for k, val in kw.pop("valves", {}).items():
+            setattr(t.valves, k, val)
+        return json.loads(asyncio.run(t.view_folder_chat(chat_id, __user__={"id": user}, **kw)))
+
+    def test_reads_allowed_chat(self):
+        out = self.view("a")
+        self.assertEqual((out["title"], out["folder"], out["total_messages"]), ("Morning", "Companion", 1))
+        self.assertIn("blue guitar", out["messages"][0]["content"])
+
+    def test_subfolder_chat(self):
+        self.assertEqual(self.view("b")["title"], "Evening")
+
+    def test_outside_folder_looks_missing(self):
+        for cid in ("c", "d"):
+            self.assertEqual(self.view(cid), {"error": "chat not found."})
+        self.assertEqual(self.view("nope"), {"error": "chat not found."})
+
+    def test_other_users_chat(self):
+        self.assertEqual(self.view("e"), {"error": "chat not found."})
+        self.assertEqual(self.view("e", user="u2")["title"], "Other user")
+
+    def test_empty_valve_refuses(self):
+        self.assertIn("not set up", self.view("a", folders="")["error"])
+
+    def test_follows_current_branch_in_order(self):
+        msgs = {"m1": {"role": "user", "content": "one", "parentId": None}, "m2": {"role": "assistant", "content": "two", "parentId": "m1"},
+                "alt": {"role": "assistant", "content": "other branch", "parentId": "m1"}, "m3": {"role": "user", "content": "three", "parentId": "m2"}}
+        c = sqlite3.connect(self.path)
+        c.execute("INSERT INTO chat (id,user_id,title,updated_at,archived,chat,meta,folder_id) VALUES ('h','u1','Branchy',1,0,?,'{}','f1')", (json.dumps({"history": {"messages": msgs, "currentId": "m3"}}),))
+        c.commit(); c.close()
+        self.assertEqual([m["content"] for m in self.view("h")["messages"]], ["one", "two", "three"])
+
+    def test_budget_pages_whole_messages(self):
+        msgs = {f"m{i}": {"role": "user", "content": "x" * 400, "parentId": f"m{i-1}" if i else None} for i in range(5)}
+        c = sqlite3.connect(self.path)
+        c.execute("INSERT INTO chat (id,user_id,title,updated_at,archived,chat,meta,folder_id) VALUES ('long','u1','Long',1,0,?,'{}','f1')", (json.dumps({"history": {"messages": msgs, "currentId": "m4"}}),))
+        c.commit(); c.close()
+        out = self.view("long", valves={"MAX_VIEW_CHARS": 500})
+        self.assertEqual(len(out["messages"]), 1)
+        self.assertIn("first_message=2", out["more"])
+        out = self.view("long", first_message="5", valves={"MAX_VIEW_CHARS": 500})
+        self.assertEqual((out["first_message"], len(out["messages"]), "more" in out), (5, 1, False))
+
+    def test_single_huge_message_cut(self):
+        c = sqlite3.connect(self.path)
+        c.execute("INSERT INTO chat (id,user_id,title,updated_at,archived,chat,meta,folder_id) VALUES ('big','u1','Big',1,0,?,'{}','f1')", (json.dumps({"history": {"messages": {"m": {"role": "user", "content": "y" * 5000}}, "currentId": "m"}}),))
+        c.commit(); c.close()
+        out = self.view("big", valves={"MAX_VIEW_CHARS": 600})
+        self.assertTrue(out["messages"][0]["content"].endswith("[message cut]"))
 
 
 class HelperTests(unittest.TestCase):
