@@ -1105,6 +1105,20 @@ class LeadingDateTests(NotesTestCase):
             ("In 2026 we met", "In 2026 we met"),
             ("We met on 2026-10-14 and talked", "We met on 2026-10-14 and talked"),
             ("2026-10-14", "2026-10-14"),
+            ("ACT - Monday 10:11 PM EDT (quiet hours). No emails", "ACT - (quiet hours). No emails"),
+            ("NOOP: 2026-10-18 22:11 EDT - nothing", "NOOP: nothing"),
+            ("ACT - 2026-10-18T22:11:04-04:00 did x", "ACT - did x"),
+            ("Monday 10:11 PM EDT - x", "x"),
+            ("Sun 22:11 hi", "hi"),
+            ("Monday: we met", "we met"),
+            ("10:11 PM - did x", "did x"),
+            ("[10:11 PM] did x", "did x"),
+            ("Monday was rough", "Monday was rough"),
+            ("Friday night plans", "Friday night plans"),
+            ("We met at 10:11 PM", "We met at 10:11 PM"),
+            ("22:11 next day we met", "22:11 next day we met"),
+            ("ACT - did the thing", "ACT - did the thing"),
+            ("ACT - Monday", "ACT - Monday"),
         ]:
             self.assertEqual(mod.strip_leading_date(text), want, text)
 

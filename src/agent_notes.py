@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.18.0
+version: 1.18.1
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -432,11 +432,11 @@ def validate_comment(comment: Any) -> str:
 _MONTHS = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|Sept?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
 _WEEKDAY = r"(?:(?:Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)[a-z]*\.?,?\s+)?"
 _ORDINAL = r"(?:st|nd|rd|th)?"
-_TIME = r"(?:\s*(?:,|@|at|-|\u2013|\u2014)?\s*\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp]\.?[Mm]\.?)?(?:\s*(?:Z|UTC|GMT|[A-Z]{2,4}T|[+-]\d{2}:?\d{2}))?)?"
+_TIME = r"(?:\s*(?:,|@|at|-|\u2013|\u2014)?\s*\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp]\.?[Mm]\.?)?(?:\s*(?:Z|UTC|GMT|[ECMP][SD]T|[+-]\d{2}:?\d{2}))?)?"
 # A date written out in full (year, or a numeric form) can be followed by anything; one without a year ("Oct 14") only
 # counts as a stamp when punctuation or a closing bracket follows, so "May 5 people came" is left alone.
 _FULL_DATE = re.compile(
-    r"(?:\d{4}-\d{1,2}-\d{1,2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?"
+    r"(?:\d{4}-\d{1,2}-\d{1,2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}|\s*(?:UTC|GMT|[ECMP][SD]T))?)?"
     r"|\d{1,2}/\d{1,2}/\d{2,4}" + _TIME + r"|\d{4}/\d{1,2}/\d{1,2}" + _TIME +
     rf"|{_WEEKDAY}{_MONTHS}\.?\s+\d{{1,2}}{_ORDINAL},?\s+\d{{4}}" + _TIME +
     rf"|{_WEEKDAY}\d{{1,2}}{_ORDINAL}\s+(?:of\s+)?{_MONTHS}\.?,?\s+\d{{4}}" + _TIME + r")",
@@ -445,29 +445,38 @@ _FULL_DATE = re.compile(
 _SHORT_DATE = re.compile(rf"(?:{_WEEKDAY}{_MONTHS}\.?\s+\d{{1,2}}{_ORDINAL}|{_WEEKDAY}\d{{1,2}}{_ORDINAL}\s+{_MONTHS}\.?)" + _TIME, re.IGNORECASE)
 _STAMP_OPEN = r"(?:(?:on\s+|date\s*:\s*)?[\[(*_#>]*\s*)"
 _STAMP_CLOSE = r"[\])*_]*\s*[:\-\u2013\u2014|,.;]*\s*"
+_WEEKDAY_NAME = r"(?:Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)(?:day|sday|nesday|rsday|urday)?\.?"
+_CLOCK = r"\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp]\.?[Mm]\.?)?(?:\s*(?:Z|UTC|GMT|[ECMP][SD]T))?"
+_LABEL = re.compile(r"^[A-Z]{2,10}\s*[-:–—]\s+")  # a status word an entry opens with ("ACT - ", "NOOP: "); a stamp right after it is still a leading stamp
 _LEADING_STAMPS = (
     re.compile(rf"^{_STAMP_OPEN}{_FULL_DATE.pattern}{_STAMP_CLOSE}", re.IGNORECASE),
-    re.compile(rf"^{_STAMP_OPEN}{_SHORT_DATE.pattern}(?:[\])*_]+\s*[:\-\u2013\u2014|,.;]*|\s*[:\-\u2013\u2014|;])\s*", re.IGNORECASE),
+    re.compile(rf"^{_STAMP_OPEN}{_SHORT_DATE.pattern}(?:[\])*_]+\s*[:\-–—|,.;]*|\s*[:\-–—|;])\s*", re.IGNORECASE),
+    re.compile(rf"^{_STAMP_OPEN}{_WEEKDAY_NAME}\s*,?\s*(?:at\s+)?{_CLOCK}{_STAMP_CLOSE}", re.IGNORECASE),  # Monday 10:11 PM EDT
+    re.compile(rf"^{_STAMP_OPEN}{_WEEKDAY_NAME}\s*[:–—|-]\s*", re.IGNORECASE),  # Monday - / Monday:
+    re.compile(rf"^{_STAMP_OPEN}{_CLOCK}(?:[\])*_]+\s*[:\-–—|,.;]*|\s*[:\-–—|;])\s*", re.IGNORECASE),  # 22:11 EDT - / [10:11 PM]
 )
 
 
 def strip_leading_date(text: str) -> str:
-    """Remove a datestamp an agent put at the very start of a text ("[2026-10-14] ...", "October 14, 2026 - ...",
-    "Oct 14: ..."), and a timestamp after it. Only the start is touched, and a text that is nothing but a date is left as is.
-    Entries already carry the real time they were saved, so a written-in date only adds a chance of a wrong one."""
-    current = text
+    """Remove a date or time stamp an agent put at the very start of a text ("[2026-10-14] ...", "October 14, 2026 - ...",
+    "Oct 14: ...", "Monday 10:11 PM EDT ...", "22:11 - ..."), also right after a status word the text opens with ("ACT - 2026-10-18 22:11 ...").
+    Only the start is touched, and a text that is nothing but a stamp is left as is. Entries already carry the real time they were
+    saved, so a written-in one only adds a chance of a wrong one."""
+    label = _LABEL.match(text)
+    prefix = label.group(0) if label else ""
+    current = text[len(prefix):]
     for _ in range(3):
         for pattern in _LEADING_STAMPS:
             m = pattern.match(current)
             if m:
                 rest = current[m.end():].lstrip()
                 if not rest:
-                    return current
+                    return prefix + current
                 current = rest
                 break
         else:
             break
-    return current
+    return prefix + current
 
 
 def validate_text(text: Any) -> str:
