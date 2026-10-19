@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.18.1
+version: 1.18.2
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -473,6 +473,7 @@ _LEADING_STAMPS = (
     re.compile(rf"^{_STAMP_OPEN}{_WEEKDAY_NAME}\s*,?\s*(?:at\s+)?{_CLOCK}{_STAMP_CLOSE}", re.IGNORECASE),  # Monday 10:11 PM EDT
     re.compile(rf"^{_STAMP_OPEN}{_WEEKDAY_NAME}\s*[:–—|-]\s*", re.IGNORECASE),  # Monday - / Monday:
     re.compile(rf"^{_STAMP_OPEN}{_CLOCK}(?:[\])*_]+\s*[:\-–—|,.;]*|\s*[:\-–—|;])\s*", re.IGNORECASE),  # 22:11 EDT - / [10:11 PM]
+    re.compile(rf"^{_STAMP_OPEN}\d{{1,2}}\s*[AaPp]\.?[Mm]\.?(?:\s*(?:Z|UTC|GMT|[ECMP][SD]T))?(?:\s*,?\s*{_WEEKDAY_NAME})?(?:[\])*_]+\s*[:\-–—|,.;]*|\s*[:\-–—|,;])\s*", re.IGNORECASE),  # 10pm EDT Sunday, / 9pm -
 )
 
 

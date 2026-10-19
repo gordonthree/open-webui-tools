@@ -1119,6 +1119,10 @@ class LeadingDateTests(NotesTestCase):
             ("22:11 next day we met", "22:11 next day we met"),
             ("ACT - did the thing", "ACT - did the thing"),
             ("ACT - Monday", "ACT - Monday"),
+            ("NOOP - 10pm EDT Sunday, all emails read", "NOOP - all emails read"),
+            ("9pm - did x", "did x"),
+            ("3pm story brainstorming was fun", "3pm story brainstorming was fun"),
+            ("NOOP - 2026-10-19 02:30 UTC: checked email", "NOOP - checked email"),
         ]:
             self.assertEqual(mod.strip_leading_date(text), want, text)
 
