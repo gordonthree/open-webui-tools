@@ -68,6 +68,13 @@ Current tools:
   2.81 GB, about 16 s. The 7B caption model is 5.3 GB and would spill to the CPU. Create/update with
   `push_tool.py vision_describe describe_image --create` (a new Function is switched on but not global). Tests:
   `cd src && python3 -m unittest test_vision_describe`.
+- `nextcloud_mail.py` (v0.5.0) — mail through the Nextcloud Mail app. `read_email` hands the model a clean plain-text body: HTML entities decoded
+  (Nextcloud sends even plain-text mail HTML-escaped, with links as `<a>` tags, which showed up as `&gt;` and `<a href=...>` noise), links
+  reduced to their words (`label (url)`, mailto links to the address), HTML tags and `<blockquote>`s handled like plain `>` quoting. The valve
+  `QUOTED_TEXT` decides what happens to the quoted earlier messages in a reply: `omit` (default) replaces a quote at the end of the mail with
+  one line (`[Quoted earlier message omitted from "Hannah Lee" ...: 4 lines]`); if the sender wrote answers between the quoted lines the
+  quotes are kept, indented, without the `>` marks, because the answers need them; `clean` always does that; `keep` leaves the quoting as
+  written. `MAX_BODY_CHARS` applies after cleaning. Tests: `cd src && python3 -m unittest test_nextcloud_mail`.
 - `folder_chat_search.py` → `search_folder_chats(query, count, start_timestamp, end_timestamp)` and `view_folder_chat(chat_id, first_message)` (v0.2.0) — Open WebUI's built-in `search_chats` has no way to
   limit where it looks; this one searches only the chat folders named in the owner's valve `FOLDERS` (comma-separated, folder names in any case
   or ids; `INCLUDE_SUBFOLDERS` default on). The model cannot pick, see or override the folders, and an empty `FOLDERS` makes the tool refuse
@@ -698,7 +705,7 @@ Each tool has a matching `test_*.py` file that simulates ComfyUI's HTTP API with
 module — no live ComfyUI or Open WebUI server needed. Run all of them from `src/`:
 
 ```
-python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes test_agent_notes_split test_agent_duo test_voice_memo test_openrouter_image test_drum_machine test_vision_describe test_folder_chat_search -v
+python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes test_agent_notes_split test_agent_duo test_voice_memo test_openrouter_image test_drum_machine test_vision_describe test_folder_chat_search test_nextcloud_mail -v
 ```
 
 `scripts/import_server_history.py` has its own test file the same way — run from `scripts/`:

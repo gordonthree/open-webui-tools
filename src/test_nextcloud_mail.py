@@ -98,6 +98,70 @@ class ReadEmailTests(Base):
         self.assertIn("could not mark", out)
 
 
+class CleanBodyTests(unittest.TestCase):
+    HORDE = (
+        "Hi Hannah,\n\nSend me one.\n\nWarmest,\nGordon\n\n"
+        "&quot;Hannah Lee&quot; <a href=\"mailto:hannah@dimension-x.net\">hannah@dimension-x.net</a> &ndash; October 19, 2026 at 11:12 PM\n"
+        "&gt; Hey Gordon,\n&gt; \n&gt; I&#039;ve tried `record_voice_memo`.\n&gt;\n&gt; Best,\n&gt; Hannah\n&gt;"
+    )
+
+    def test_reply_quote_omitted_with_who_it_quoted(self):
+        out = mod.clean_email_text(self.HORDE, False)
+        self.assertTrue(out.startswith("Hi Hannah,\n\nSend me one.\n\nWarmest,\nGordon\n\n"))
+        self.assertIn("[Quoted earlier message omitted from \"Hannah Lee\" hannah@dimension-x.net \u2013 October 19, 2026 at 11:12 PM: 4 lines]", out)
+        for junk in (">", "&gt;", "&quot;", "<a", "&#039;"):
+            self.assertNotIn(junk, out)
+
+    def test_clean_mode_keeps_the_quote_without_markers(self):
+        out = mod.clean_email_text(self.HORDE, False, "clean")
+        self.assertIn("    I've tried `record_voice_memo`.", out)
+        self.assertNotIn(">", out)
+        self.assertIn("[End of quoted text]", out)
+
+    def test_keep_mode_leaves_the_quote_as_written(self):
+        out = mod.clean_email_text(self.HORDE, False, "keep")
+        self.assertIn("> Hey Gordon,", out)
+        self.assertNotIn("&gt;", out)  # entities are still decoded
+
+    def test_answers_between_quoted_lines_keep_their_questions(self):
+        text = "Hi\n\nOn Mon, Bob wrote:\n> Q1?\n\nA1\n\n> Q2?\nA2"
+        out = mod.clean_email_text(text, False)
+        self.assertIn("Q1?", out)
+        self.assertIn("Q2?", out)
+        self.assertNotIn("omitted", out)
+        self.assertNotIn(">", out)
+
+    def test_nested_quotes_count_once(self):
+        out = mod.clean_email_text("ok\n\nOn Mon, Bob wrote:\n> a\n>> b\n>>> c", False)
+        self.assertEqual(out, "ok\n\n[Quoted earlier message omitted from On Mon, Bob wrote: 3 lines]")
+        self.assertNotIn(">", out)
+
+    def test_no_attribution(self):
+        self.assertEqual(mod.clean_email_text("yes\n\n> q", False), "yes\n\n[Quoted earlier message omitted: 1 line]")
+
+    def test_plain_text_angle_brackets_survive(self):
+        self.assertEqual(mod.clean_email_text("write to <bob@example.com> if a < b", False), "write to <bob@example.com> if a < b")
+
+    def test_links_become_words(self):
+        out = mod.clean_email_text('see <a href="https://x.org/a">the page</a> or <a href="https://y.org">https://y.org</a>', False)
+        self.assertEqual(out, "see the page (https://x.org/a) or https://y.org")
+
+    def test_html_blockquotes_follow_the_same_rules(self):
+        html_body = "<div>Sounds good<br>Gordon</div><blockquote>Earlier <blockquote>older</blockquote></blockquote>"
+        self.assertEqual(mod.clean_email_text(html_body, True), "Sounds good\nGordon\n\n[Quoted earlier message omitted: 2 lines]")
+        self.assertIn("    Earlier", mod.clean_email_text(html_body, True, "clean"))
+
+    def test_html_tags_and_scripts_removed(self):
+        out = mod.clean_email_text("<style>p{}</style><p>Hello <b>there</b></p><script>x()</script>", True)
+        self.assertEqual(out, "Hello there")
+
+    def test_read_email_uses_the_valve(self):
+        tool = mod.Tools()
+        self.assertEqual(tool.valves.QUOTED_TEXT, "omit")
+        tool.valves.QUOTED_TEXT = "keep"
+        self.assertIn("> q", tool._clean_body("yes\n&gt; q", False))
+
+
 class MarkTests(Base):
     def test_mark_unread(self):
         fake = self.run_with(FakeNC())

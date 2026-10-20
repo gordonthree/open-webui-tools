@@ -1,7 +1,7 @@
 """
 title: Nextcloud Mail
 description: Read (and optionally send) email through the Nextcloud Mail app's OCS API, using a Nextcloud app password.
-version: 0.4.0
+version: 0.5.0
 requirements: requests
 """
 
@@ -11,6 +11,93 @@ from datetime import datetime, timezone
 
 import requests
 from pydantic import BaseModel, Field
+
+
+_QUOTE_LINE = re.compile(r"^\s*>")
+_ATTRIBUTION = re.compile(r"(wrote|writes|said|schrieb|écrit|escribió)\s*:?\s*$|\b(19|20)\d\d\b.*\b\d{1,2}:\d\d|^-{2,}\s*original message", re.I)
+_ANCHOR = re.compile(r"<a\b[^>]*?href\s*=\s*[\"']([^\"']*)[\"'][^>]*>(.*?)</a>", re.I | re.S)
+_BLOCKQUOTE = re.compile(r"<blockquote\b[^>]*>((?:(?!<blockquote\b).)*?)</blockquote>", re.I | re.S)
+
+
+def _anchor_text(m: "re.Match") -> str:
+    """A link as its words: a mailto or a link whose text is the address shows once; a web link keeps its address after the words."""
+    href, label = m.group(1).strip(), re.sub(r"<[^>]+>", "", m.group(2)).strip()
+    if href.lower().startswith("mailto:"):
+        return label or href[7:]
+    if not label or label.rstrip("/") == href.rstrip("/"):
+        return href
+    return f"{label} ({href})" if href.lower().startswith("http") else label
+
+
+def _unquote_depth(line: str) -> str:
+    return re.sub(r"^(\s*>)+ ?", "", line)
+
+
+def tidy_quotes(text: str, mode: str) -> str:
+    """Handle the '>' quoting of a plain-text reply. omit: a quoted block with nothing of the sender's after it (the usual reply) becomes one
+    line naming who it quoted; a quote with the sender's own text after it (answers written between the quoted lines) is kept, since the
+    answers need their questions. clean: every quote is kept without the '>' markers, set off by indentation. keep: left as written."""
+    mode = (mode or "omit").strip().lower()
+    if mode == "keep":
+        return text
+    lines = text.split("\n")
+    blocks, i = [], 0  # (start, end) of each run of quoted lines (blank lines inside a run stay in it)
+    while i < len(lines):
+        if _QUOTE_LINE.match(lines[i]):
+            j = i
+            while j + 1 < len(lines) and (_QUOTE_LINE.match(lines[j + 1]) or (not lines[j + 1].strip() and j + 2 < len(lines) and _QUOTE_LINE.match(lines[j + 2]))):
+                j += 1
+            blocks.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+    # The sender answered between the quoted lines when real text (not just a "... wrote:" line) follows the first quote.
+    interleaved = bool(blocks) and any(
+        l.strip() and not _QUOTE_LINE.match(l) and not _ATTRIBUTION.search(l) for l in lines[blocks[0][1] + 1:]
+    )
+    out, pos = [], 0
+    for a, b in blocks:
+        out.extend(lines[pos:a])
+        gap = bool(out) and not out[-1].strip()
+        while out and not out[-1].strip():
+            out.pop()
+        attribution = out.pop().strip() if out and len(out[-1]) < 250 and _ATTRIBUTION.search(out[-1]) else ""
+        if gap and out:
+            out.append("")
+        body = [_unquote_depth(l).rstrip() for l in lines[a:b + 1]]
+        if mode == "omit" and not interleaved:
+            count = sum(1 for l in body if l.strip())
+            who = f" from {attribution.rstrip(':')}" if attribution else ""
+            out.append(f"[Quoted earlier message omitted{who}: {count} line{'s' if count != 1 else ''}]")
+        else:
+            out.append(f"[{attribution}]" if attribution else "[Quoted text:]")
+            out.extend("    " + l if l.strip() else "" for l in body)
+            out.append("[End of quoted text]")
+        pos = b + 1
+    out.extend(lines[pos:])
+    return "\n".join(out)
+
+
+def clean_email_text(body: str, is_html: bool, quoted: str = "omit") -> str:
+    """An email body as plain text for a model: no markup or HTML entities (Nextcloud also sends plain-text mail HTML-escaped, with links as
+    <a> tags), links reduced to their words, and reply quoting handled as `quoted` says (see tidy_quotes)."""
+    text = body or ""
+    text = re.sub(r"<(script|style)\b.*?</\1>", "", text, flags=re.S | re.I)
+    text = _ANCHOR.sub(_anchor_text, text)
+    if is_html:
+        while True:  # innermost first, so nesting becomes '>>'
+            text, n = _BLOCKQUOTE.subn(lambda m: "\n" + "\n".join("> " + l for l in re.sub(r"<br\s*/?>|</p>|</div>", "\n", m.group(1), flags=re.I).strip().split("\n")) + "\n", text)
+            if not n:
+                break
+        text = re.sub(r"<br\s*/?>|<p\b[^>]*>|</p>|</div>|</tr>", "\n", text, flags=re.I)
+    if is_html:
+        text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    text = text.replace("\r\n", "\n")
+    text = tidy_quotes(text, quoted)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"(?<=\S)[ \t]{2,}", " ", text)
+    return re.sub(r"\n\s*\n+", "\n\n", text).strip()
 
 
 class MailError(RuntimeError):
@@ -39,6 +126,10 @@ class Tools:
         )
         MAX_BODY_CHARS: int = Field(
             default=8000, description="Truncate message bodies to this length"
+        )
+        QUOTED_TEXT: str = Field(
+            default="omit",
+            description="What read_email does with the quoted earlier messages in a reply (lines starting with '>'): omit = replace a quote at the end of the mail with one line saying who it quoted (a quote with the sender's answers written between its lines is kept), clean = keep every quote but drop the '>' marks and indent it, keep = leave it as written.",
         )
         MARK_READ_ON_OPEN: bool = Field(
             default=True,
@@ -192,14 +283,7 @@ class Tools:
             return ""
 
     def _clean_body(self, body: str, is_html: bool) -> str:
-        text = body or ""
-        if is_html:
-            text = re.sub(r"<(script|style)\b.*?</\1>", "", text, flags=re.S | re.I)
-            text = re.sub(r"<br\s*/?>|</p>|</div>|</tr>", "\n", text, flags=re.I)
-            text = re.sub(r"<[^>]+>", "", text)
-            text = html.unescape(text)
-        text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+        text = clean_email_text(body, is_html, self.valves.QUOTED_TEXT)
         limit = self.valves.MAX_BODY_CHARS
         return text if len(text) <= limit else text[:limit] + "\n...[truncated]"
 
