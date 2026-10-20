@@ -24,6 +24,7 @@ class NotesTestCase(unittest.TestCase):
         self.tool.valves.NOTES_DB_PATH = self.db
         self.tool.valves.MIN_SUMMARY_CHARS = 0  # tests use tiny notes; the short-note rule has its own tests
         self.tool.valves.STRONG_SPREAD = False  # strong memories are a fixed top-N unless a test asks for the random draw
+        self.tool.valves.VERBOSE_FIELDS = "author,created_at,hits,weight"  # verbose = everything here; VerboseFieldsTests covers the default
         mod._overlong.clear()  # too-long retry counts are kept module-wide
 
     def tearDown(self):
@@ -1883,6 +1884,72 @@ class PinnedTests(NotesTestCase):
         self.create("n")
         with self.assertRaises(mod.NoteError):
             self.pin("n", 9)
+
+
+class VerboseFieldsTests(unittest.TestCase):
+    """The VERBOSE_FIELDS valve: by default verbose=true adds only timestamps."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = str(Path(self.tmp) / "n.sqlite3")
+        self.tool = mod.Tools()
+        self.tool.valves.NOTES_DB_PATH = self.db
+        self.tool.valves.STRONG_SPREAD = False
+        self.run = asyncio.run
+        self.run(self.tool.agent_notes_create("n", "first entry", "a note", author_name="Alice"))
+        self.run(self.tool.agent_notes_append("n", "second entry about needles", author_name="Bob", weight="9"))
+        self.run(self.tool.agent_notes_add_tags("n", "topic")) if hasattr(self.tool, "agent_notes_add_tags") else None
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_default_is_timestamps_only(self):
+        self.assertEqual(self.tool.valves.VERBOSE_FIELDS, "created_at")
+        out = self.run(self.tool.agent_notes_read("n", verbose=True))
+        e = out["entries"][0]
+        self.assertEqual(set(e), {"entry_no", "created_at", "text"})
+        self.assertEqual(set(out["entries"][1]), {"entry_no", "created_at", "text", "weight"})  # a weight someone set is still shown
+        self.assertNotIn("started_by", out)
+        self.assertNotIn("hits", out)
+
+    def test_plain_read_is_unchanged(self):
+        e = self.run(self.tool.agent_notes_read("n"))["entries"][0]
+        self.assertEqual(set(e), {"entry_no", "text"})
+
+    def test_each_field_can_be_switched_on(self):
+        self.tool.valves.VERBOSE_FIELDS = "author, HITS , weight, nonsense"
+        out = self.run(self.tool.agent_notes_read("n", verbose=True))
+        self.assertEqual(set(out["entries"][0]), {"entry_no", "author", "text", "hits", "weight"})
+        self.assertEqual(out["started_by"], "Alice")
+        self.assertIn("hits", out)
+        self.assertNotIn("created_at", out["entries"][0])
+
+    def test_blank_valve_means_plain(self):
+        self.tool.valves.VERBOSE_FIELDS = ""
+        self.assertEqual(set(self.run(self.tool.agent_notes_read("n", verbose=True))["entries"][0]), {"entry_no", "text"})
+
+    def test_read_tagged_verbose_follows_the_valve(self):
+        note = self.run(self.tool.agent_notes_read_tagged("topic", verbose=True))["notes"][0]
+        self.assertEqual(set(note["entries"][0]), {"entry_no", "created_at", "text"})
+        self.assertNotIn("hits", note)
+        self.tool.valves.VERBOSE_FIELDS = "author,created_at,hits,weight"
+        note = self.run(self.tool.agent_notes_read_tagged("topic", verbose=True))["notes"][0]
+        self.assertEqual(set(note["entries"][0]), {"entry_no", "author", "created_at", "text", "hits", "weight"})
+        self.assertIn("hits", note)
+
+    def test_search_and_rank_verbose_follow_the_valve(self):
+        card = self.run(self.tool.agent_notes_search("needles", verbose=True))["cards"][0]
+        self.assertNotIn("author", card)
+        self.assertNotIn("hits", card)
+        item = self.run(self.tool.agent_notes_rank_entries("n", "strongest", verbose=True))["entries"][0]
+        self.assertEqual(set(item), {"entry_no", "text", "weight", "hits", "created_at"})
+        self.tool.valves.VERBOSE_FIELDS = "author,hits"
+        card = self.run(self.tool.agent_notes_search("needles", verbose=True))["cards"][0]
+        self.assertEqual((card["author"], "hits" in card), ("Bob", True))
+
+    def test_the_timestamp_is_what_recent_means(self):
+        out = self.run(self.tool.agent_notes_read("n", verbose=True))
+        self.assertTrue(all(len(e["created_at"]) > 20 for e in out["entries"]))
 
 
 if __name__ == "__main__":

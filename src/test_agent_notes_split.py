@@ -107,6 +107,7 @@ class SharedDatabaseTests(unittest.TestCase):
         self.run_async(self.a.agent_notes_read("n"))  # counts reads
         self.assertTrue(self.run_async(self.b.agent_notes_reset_hits("n"))["success"])
         self.assertTrue(self.run_async(self.b.agent_notes_delete_entry("n", "1"))["success"])
+        self.a.valves.VERBOSE_FIELDS = "hits"
         entries = self.run_async(self.a.agent_notes_read("n", verbose=True))["entries"]
         self.assertEqual([(e["entry_no"], e["hits"]) for e in entries], [(2, 0)])
         self.assertTrue(self.run_async(self.b.agent_notes_delete("n"))["success"])

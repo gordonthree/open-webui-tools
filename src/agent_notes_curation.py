@@ -1,7 +1,7 @@
 """
 title: Agent Notes Curation
 author: Gordon
-version: 1.21.0
+version: 1.22.0
 description: The upkeep half of Agent Notes (it needs the Agent Notes tool too, and the same NOTES_DB_PATH valve):
     tags (agent_notes_add_tags/agent_notes_remove_tag/agent_notes_rename_tag), summaries
     (agent_notes_update_summary/agent_notes_delete_summary), renaming a note or changing its comment
@@ -585,11 +585,22 @@ def _chain_marks(row: Any) -> Dict[str, Any]:
     return out
 
 
-def _score_marks(row: Any, verbose: bool) -> Dict[str, Any]:
-    """An entry's weight (as its 1-10 score) and read count for the model: both when verbose, otherwise only a weight someone deliberately set."""
-    if verbose:
-        return {"hits": row["hits"], "weight": weight_to_score(row["weight"])}
-    return {} if row["weight"] == DEFAULT_WEIGHT else {"weight": weight_to_score(row["weight"])}
+VERBOSE_FIELD_NAMES = ("author", "created_at", "hits", "weight")
+
+
+def verbose_fields(text: Any) -> set:
+    """The extras verbose=true adds to entries, from the VERBOSE_FIELDS valve: a comma-separated choice of author, created_at (an edit time
+    comes with it), hits (read counts) and weight (shown even when neutral). Unknown words are ignored."""
+    return {w for w in (p.strip().lower() for p in str(text or "").split(",")) if w in VERBOSE_FIELD_NAMES}
+
+
+def _score_marks(row: Any, fields: set) -> Dict[str, Any]:
+    """An entry's weight (as its 1-10 score) and read count for the model. The count only when the owner asked for it with `fields`; the
+    weight when asked for too, otherwise only a weight someone deliberately set."""
+    marks: Dict[str, Any] = {"hits": row["hits"]} if "hits" in fields else {}
+    if "weight" in fields or row["weight"] != DEFAULT_WEIGHT:
+        marks["weight"] = weight_to_score(row["weight"])
+    return marks
 
 
 def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: str, author: str, created_at: Optional[str] = None, weight: Optional[int] = None) -> Dict[str, Any]:
@@ -1350,12 +1361,34 @@ def _size(obj: Any) -> int:
     return len(json.dumps(obj, ensure_ascii=False)) + 2  # + the ", " that separates it from its neighbour
 
 
-def _shape_tagged(note: Dict[str, Any], verbose: bool) -> Dict[str, Any]:
+def _verbose_tagged(note: Dict[str, Any], fields: set) -> Dict[str, Any]:
+    """A tagged note with each entry cut down to the extras the owner enabled (see verbose_fields)."""
+    entries = []
+    for e in note["entries"]:
+        item: Dict[str, Any] = {"entry_no": e["entry_no"]}
+        if "author" in fields:
+            item["author"] = e["author"]
+        if "created_at" in fields:
+            item["created_at"] = e["created_at"]
+        item["text"] = e["text"]
+        if "hits" in fields:
+            item["hits"] = e["hits"]
+        if "weight" in fields or e["weight"] != SCORE_NEUTRAL:
+            item["weight"] = e["weight"]
+        item.update({k: e[k] for k in ("continues_from", "continues_at") if k in e})
+        entries.append(item)
+    out = {**note, "entries": entries}
+    if "hits" not in fields:
+        out.pop("hits", None)
+    return out
+
+
+def _shape_tagged(note: Dict[str, Any], verbose: bool, fields: Optional[set] = None) -> Dict[str, Any]:
     """The note as the model will receive it. Plain mode keeps only what a reader needs: the name, the summary if
     there is one, and the entry texts as bare strings."""
     persona = note.get("kind") == "persona"
     if verbose:
-        return {**note, "_verbose": True, **({"_persona": True} if persona else {})}
+        return {**_verbose_tagged(note, fields if fields is not None else set(VERBOSE_FIELD_NAMES)), "_verbose": True, **({"_persona": True} if persona else {})}
     shaped: Dict[str, Any] = {"note_name": note["note_name"], "_pinned_idx": note.get("_pinned_idx", set()), **({"_persona": True} if persona else {})}
     if note["summary"]:
         shaped["summary"] = note["summary"]
@@ -1478,7 +1511,7 @@ def help_topics(
             "4) agent_notes_edit_entry only to correct an entry.\n"
             'Tips: for any optional argument you do not need, pass "" or leave it out. Numbers can be written 3 or "#3". '
             "A reply that has success=false tells you exactly what to change; fix it and call again. "
-            "Replies are kept short; verbose=true adds authors, timestamps and read counts. "
+            "Replies are kept short; verbose=true adds timestamps. "
             "Tagging, summaries, renaming, deleting and resetting counts are in the separate Agent Notes Curation tool, which you may not have been given.",
         ),
         "find": (

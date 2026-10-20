@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.21.0
+version: 1.22.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -609,11 +609,22 @@ def _chain_marks(row: Any) -> Dict[str, Any]:
     return out
 
 
-def _score_marks(row: Any, verbose: bool) -> Dict[str, Any]:
-    """An entry's weight (as its 1-10 score) and read count for the model: both when verbose, otherwise only a weight someone deliberately set."""
-    if verbose:
-        return {"hits": row["hits"], "weight": weight_to_score(row["weight"])}
-    return {} if row["weight"] == DEFAULT_WEIGHT else {"weight": weight_to_score(row["weight"])}
+VERBOSE_FIELD_NAMES = ("author", "created_at", "hits", "weight")
+
+
+def verbose_fields(text: Any) -> set:
+    """The extras verbose=true adds to entries, from the VERBOSE_FIELDS valve: a comma-separated choice of author, created_at (an edit time
+    comes with it), hits (read counts) and weight (shown even when neutral). Unknown words are ignored."""
+    return {w for w in (p.strip().lower() for p in str(text or "").split(",")) if w in VERBOSE_FIELD_NAMES}
+
+
+def _score_marks(row: Any, fields: set) -> Dict[str, Any]:
+    """An entry's weight (as its 1-10 score) and read count for the model. The count only when the owner asked for it with `fields`; the
+    weight when asked for too, otherwise only a weight someone deliberately set."""
+    marks: Dict[str, Any] = {"hits": row["hits"]} if "hits" in fields else {}
+    if "weight" in fields or row["weight"] != DEFAULT_WEIGHT:
+        marks["weight"] = weight_to_score(row["weight"])
+    return marks
 
 
 def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: str, author: str, created_at: Optional[str] = None, weight: Optional[int] = None) -> Dict[str, Any]:
@@ -1374,12 +1385,34 @@ def _size(obj: Any) -> int:
     return len(json.dumps(obj, ensure_ascii=False)) + 2  # + the ", " that separates it from its neighbour
 
 
-def _shape_tagged(note: Dict[str, Any], verbose: bool) -> Dict[str, Any]:
+def _verbose_tagged(note: Dict[str, Any], fields: set) -> Dict[str, Any]:
+    """A tagged note with each entry cut down to the extras the owner enabled (see verbose_fields)."""
+    entries = []
+    for e in note["entries"]:
+        item: Dict[str, Any] = {"entry_no": e["entry_no"]}
+        if "author" in fields:
+            item["author"] = e["author"]
+        if "created_at" in fields:
+            item["created_at"] = e["created_at"]
+        item["text"] = e["text"]
+        if "hits" in fields:
+            item["hits"] = e["hits"]
+        if "weight" in fields or e["weight"] != SCORE_NEUTRAL:
+            item["weight"] = e["weight"]
+        item.update({k: e[k] for k in ("continues_from", "continues_at") if k in e})
+        entries.append(item)
+    out = {**note, "entries": entries}
+    if "hits" not in fields:
+        out.pop("hits", None)
+    return out
+
+
+def _shape_tagged(note: Dict[str, Any], verbose: bool, fields: Optional[set] = None) -> Dict[str, Any]:
     """The note as the model will receive it. Plain mode keeps only what a reader needs: the name, the summary if
     there is one, and the entry texts as bare strings."""
     persona = note.get("kind") == "persona"
     if verbose:
-        return {**note, "_verbose": True, **({"_persona": True} if persona else {})}
+        return {**_verbose_tagged(note, fields if fields is not None else set(VERBOSE_FIELD_NAMES)), "_verbose": True, **({"_persona": True} if persona else {})}
     shaped: Dict[str, Any] = {"note_name": note["note_name"], "_pinned_idx": note.get("_pinned_idx", set()), **({"_persona": True} if persona else {})}
     if note["summary"]:
         shaped["summary"] = note["summary"]
@@ -1502,7 +1535,7 @@ def help_topics(
             "4) agent_notes_edit_entry only to correct an entry.\n"
             'Tips: for any optional argument you do not need, pass "" or leave it out. Numbers can be written 3 or "#3". '
             "A reply that has success=false tells you exactly what to change; fix it and call again. "
-            "Replies are kept short; verbose=true adds authors, timestamps and read counts. "
+            "Replies are kept short; verbose=true adds timestamps. "
             "Tagging, summaries, renaming, deleting and resetting counts are in the separate Agent Notes Curation tool, which you may not have been given.",
         ),
         "find": (
@@ -1684,6 +1717,7 @@ class Tools:
         STRONG_HIGH: int = Field(default=7, description="An entry rated at or above this (1-10, 5 is neutral) counts as a strong positive memory.")
         STRONG_RAMP_MAX_DAYS: float = Field(default=90, description="Age bias for the strong older memories agent_notes_read adds (memory notes only): a memory counts for 25% of its strength when brand new, rising evenly to 100% once it is as old as the ramp. The ramp is worked out from the note itself: how long ago its first entry was made, in whole weeks (a 12-day-old note ramps over 14 days, a 4-week-old one over 28), and never more than this many days. So a run of very recent peaks doesn't crowd out older ones, and nothing needs adjusting as the note grows. 0 turns the bias off (the strongest are then simply the most extreme scores, newest first on ties).")
         STRONG_SPREAD: bool = Field(default=True, description="Which strong older memories agent_notes_read adds (memory notes only): true draws them at random, each one's chance in proportion to its strength (with the age bias above), so over many reads the agent meets all of its strong memories and the strongest turn up most; false always takes the top ones, the same each time.")
+        VERBOSE_FIELDS: str = Field(default="created_at", description="What verbose=true adds to entries in agent_notes_read, agent_notes_read_tagged, agent_notes_search and agent_notes_rank_entries, as a comma-separated choice of: created_at (timestamps; an edit time comes with it), author, hits (read counts) and weight (shown even when neutral; otherwise only a weight someone set is shown). The default is timestamps only: an agent rarely needs the rest and each costs context. Entry numbers are always shown.")
         SEARCH_SNIPPET_CHARS: int = Field(default=120, description="How much of each entry agent_notes_search shows on its result cards.")
         MAX_LIST_RESULTS: int = Field(default=50, description="Caps agent_notes_list results.")
         MIN_SUMMARY_CHARS: int = Field(default=1000, description="A note whose entries total fewer characters than this isn't offered for summarizing (agent_notes_list needs_summary=true skips it, and shows 'short'): a summary of a note that small would just copy it. 0 summarizes everything.")
@@ -1783,7 +1817,7 @@ class Tools:
         :param entry: Entry numbers to read in full, e.g. 12 or "12, 15". Pass "" (or omit) for a normal read.
         :param sample: How many random older entries to bring back, e.g. 5. Pass "" (or omit) for a normal read.
         :param count: false for a routine sweep, so the read isn't added to the popularity counts. Pass "" (or omit) to count it.
-        :param verbose: true adds authors, timestamps and other bookkeeping; false (the normal choice) is shorter.
+        :param verbose: true adds timestamps; false (the normal choice) is shorter.
         """
         v = self.valves
         try:
@@ -1813,14 +1847,18 @@ class Tools:
         shown_pinned = len(result["pinned"])
         kept_pos, kept_neg = pinned_pos + kept_pos, pinned_neg + kept_neg
 
-        def shape(r) -> Dict[str, Any]:
-            marks = _score_marks(r, full)
-            if full:
-                item = {"entry_no": r["entry_no"], "author": r["author_name"] or "unknown", "created_at": r["created_at"], "text": r["note_text"], **marks, **_chain_marks(r)}
-                if r["edited_at"]:
-                    item["edited_at"] = r["edited_at"]
-                return item
-            return {"entry_no": r["entry_no"], "text": r["note_text"], **marks, **_chain_marks(r)}  # the number stays: edit_entry/delete_entry need it
+        extras = verbose_fields(v.VERBOSE_FIELDS) if full else set()
+
+        def shape(r) -> Dict[str, Any]:  # the entry number stays in every form: edit_entry/delete_entry need it
+            item: Dict[str, Any] = {"entry_no": r["entry_no"]}
+            if "author" in extras:
+                item["author"] = r["author_name"] or "unknown"
+            if "created_at" in extras:
+                item["created_at"] = r["created_at"]
+            item.update({"text": r["note_text"], **_score_marks(r, extras), **_chain_marks(r)})
+            if "created_at" in extras and r["edited_at"]:
+                item["edited_at"] = r["edited_at"]
+            return item
 
         out: Dict[str, Any] = {
             "success": True,
@@ -1833,14 +1871,17 @@ class Tools:
         strong = {k: [shape(r) for r in rows] for k, rows in (("positive", kept_pos), ("negative", kept_neg)) if rows}
         if strong:
             out["strong_memories"] = strong
-        if full:
+        if "author" in extras:
             out["started_by"] = result["started_by"] or "unknown"
+        if "hits" in extras:
             out["hits"] = result["note"]["hits"]
         if result["summary"]:
             sm = result["summary"]
             out["summary"] = {"text": sm["summary_text"], "stale": bool(sm["stale"])}
-            if full:
-                out["summary"].update({"last_summarized": sm["last_summarized"], "summarized_by": sm["author_name"] or "unknown"})
+            if "created_at" in extras:
+                out["summary"]["last_summarized"] = sm["last_summarized"]
+            if "author" in extras:
+                out["summary"]["summarized_by"] = sm["author_name"] or "unknown"
         shown = len(kept_recent) + len(kept_pos) + len(kept_neg)
         dropped = len(recent_first) + len(result["positive"]) + len(result["negative"]) + shown_pinned - shown
         remarks = []
@@ -2111,7 +2152,7 @@ class Tools:
 
         :param tags: One tag, or several separated by commas, e.g. "identity, speech". Variant spellings are matched (see agent_notes_list_tags).
         :param match: "any" (default; best match first) for notes with at least one of the tags, or "all" for notes with every tag. Pass "" (or omit) for any.
-        :param verbose: true adds entry numbers, authors, timestamps and tags; false (the normal choice) is much shorter.
+        :param verbose: true adds timestamps and tags; false (the normal choice) is much shorter.
         """
         v = self.valves
         try:
@@ -2123,7 +2164,8 @@ class Tools:
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
         full = _to_bool(verbose)
-        shaped = [_shape_tagged(n, full) for n in notes]
+        fields = verbose_fields(v.VERBOSE_FIELDS)
+        shaped = [_shape_tagged(n, full, fields) for n in notes]
         kept: Dict[str, List[int]] = {}
         packed, left_out = pack_tagged(shaped, max(500, v.MAX_TAGGED_CHARS) - 300, kept)  # 300: the reply's own keys and remarks
         by_name = {n["note_name"]: n for n in notes}
@@ -2158,7 +2200,7 @@ class Tools:
         :param limit: Cards per page, default 10. Pass "" (or omit) for the default.
         :param page: Which page of cards, default 1; use it when the reply says more match.
         :param note: Look only inside this note. Pass "" (or omit) to look in every note.
-        :param verbose: true adds authors and read counts; false (the normal choice) is shorter.
+        :param verbose: true adds a few more details; false (the normal choice) is shorter.
         """
         v = self.valves
         try:
@@ -2176,6 +2218,7 @@ class Tools:
             return _error(e)
         words = search_words(text)
         full = _to_bool(verbose)
+        extras = verbose_fields(v.VERBOSE_FIELDS)
         cards = []
         for r in rows:
             card = {"note_name": r["note_name"], "entry_no": r["entry_no"], "weight": weight_to_score(r["weight"]), "date": (r["created_at"] or "")[:10],
@@ -2183,7 +2226,10 @@ class Tools:
             if mode == "any":
                 card["words_matched"] = sum(1 for w in words if w in (r["note_text"] or "").lower())
             if full:
-                card.update({"author": r["author_name"] or "unknown", "hits": r["hits"]})
+                if "author" in extras:
+                    card["author"] = r["author_name"] or "unknown"
+                if "hits" in extras:
+                    card["hits"] = r["hits"]
             cards.append(card)
         out: Dict[str, Any] = {"success": True, "total_matching_entries": total, "page": page_no, "cards": cards}
         if mode == "any":
@@ -2263,7 +2309,7 @@ class Tools:
         :param by: "strongest", "above_weight", "below_weight", "most_popular" or "least_popular".
         :param limit: How many entries, default 10. Pass "" (or omit) for the default.
         :param weight: The score to compare with, 1 to 10; needed for above_weight and below_weight. Pass "" (or omit) otherwise.
-        :param verbose: true adds authors and timestamps; false (the normal choice) is shorter.
+        :param verbose: true adds timestamps; false (the normal choice) is shorter.
         """
         v = self.valves
         try:
@@ -2280,11 +2326,14 @@ class Tools:
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
         full = _to_bool(verbose)
+        extras = verbose_fields(v.VERBOSE_FIELDS)
         entries = []
         for r in result["entries"]:
             item = {"entry_no": r["entry_no"], "text": r["note_text"], "weight": weight_to_score(r["weight"]), "hits": r["hits"], **_chain_marks(r)}
-            if full:
-                item.update({"author": r["author_name"] or "unknown", "created_at": r["created_at"]})
+            if full and "author" in extras:
+                item["author"] = r["author_name"] or "unknown"
+            if full and "created_at" in extras:
+                item["created_at"] = r["created_at"]
             entries.append(item)
         out: Dict[str, Any] = {"success": True, "note_name": result["note"]["note_name"], "by": mode, "total_matching": result["total"], "entries": entries}
         if result["total"] > len(entries):
