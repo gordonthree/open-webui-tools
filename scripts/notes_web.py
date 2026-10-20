@@ -165,6 +165,18 @@ def render_index(db: str, q: str, tag: str = "") -> str:
     return page("Agent notes", body)
 
 
+def pin_button(note_name: str, r) -> str:
+    """Pin / unpin an entry (and the rest of its chain): a pinned entry is always returned to the agent, outside every quota and size
+    limit, and the agent is never told. Floats right of the entry's header line."""
+    on = bool(r["pinned"])
+    return (
+        f"<form method='post' action='/pin' style='float:right;margin:0'><input type='hidden' name='name' value='{e(note_name)}'>"
+        f"<input type='hidden' name='entry_no' value='{r['entry_no']}'><input type='hidden' name='pinned' value='{0 if on else 1}'>"
+        f"<button title='{'Pinned: always shown to the agent, outside its quotas. Click to unpin.' if on else 'Pin: always show this entry to the agent, outside its quotas. The agent is not told.'}'>"
+        f"{'&#128204; pinned' if on else 'pin'}</button></form>"
+    )
+
+
 def render_note(db: str, name: str) -> str:
     result = notes.read_note_db(db, name, ALL)
     note, entries = result["note"], result["entries"]
@@ -193,7 +205,7 @@ def render_note(db: str, name: str) -> str:
     for r in reversed(entries):  # read_note_db returns oldest first; the page shows the newest on top
         edited = f" &middot; edited {e(when(r['edited_at']))}" if r["edited_at"] else ""
         body += (
-            f"<div class='entry' id='e{r['entry_no']}'><span class='muted'>#{r['entry_no']} &middot; {e(r['author_name'] or 'unknown')} &middot; {e(when(r['created_at']))}{edited}{links(r)} &middot; weight {notes.weight_to_score(r['weight'])} &middot; read {r['hits']}x</span>"
+            f"<div class='entry' id='e{r['entry_no']}'>{pin_button(n, r)}<span class='muted'>#{r['entry_no']} &middot; {e(r['author_name'] or 'unknown')} &middot; {e(when(r['created_at']))}{edited}{links(r)} &middot; weight {notes.weight_to_score(r['weight'])} &middot; read {r['hits']}x</span>"
             f"<pre>{e(r['note_text'])}</pre>"
             f"<details><summary>edit / delete</summary>"
             f"<form method='post' action='/edit'>{hidden}<input type='hidden' name='entry_no' value='{r['entry_no']}'>"
@@ -267,6 +279,9 @@ def handle_post(db: str, path: str, form: Dict[str, str], author: str = DEFAULT_
         if path == "/reset_hits":  # with entry_no: that entry only; without: the note and all its entries
             done = notes.reset_hits_db(db, name(), entry)
             return redirect(note_url(done["note_name"]) + (f"#e{entry}" if entry is not None else ""))
+        if path == "/pin":
+            done = notes.set_pinned_db(db, name(), entry, form.get("pinned") == "1")
+            return redirect(note_url(done["note_name"]) + f"#e{entry}")
         if path == "/update":
             new_name = notes.validate_name(form.get("new_name"))
             author_text = (form.get("author") or "").strip()

@@ -48,6 +48,22 @@ class CullTests(unittest.TestCase):
         self.assertEqual(self.entries(), [3, 4, 5])  # 3 is old but chained to recent 4
         self.assertEqual(self.entries(2), [1])
 
+    def test_pinned_entries_are_never_culled(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE note_data SET pinned = 1 WHERE note_pk = 1 AND entry_no = 1")
+        conn.commit()
+        conn.close()
+        self.assertEqual(cn.main(["--note", "autonomy-log", "--days", "7", "--db", self.db, "--yes", "--no-backup"]), 0)
+        self.assertEqual(self.entries(), [1, 3, 4, 5])
+
+    def test_a_database_without_the_pinned_column_still_culls(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute("ALTER TABLE note_data DROP COLUMN pinned")
+        conn.commit()
+        conn.close()
+        self.assertEqual(cn.main(["--note", "autonomy-log", "--days", "7", "--db", self.db, "--yes", "--no-backup"]), 0)
+        self.assertEqual(self.entries(), [3, 4, 5])
+
     def test_summary_cleared_only_on_request(self):
         cn.main(["--note", "autonomy-log", "--days", "7", "--db", self.db, "--yes", "--no-backup"])
         conn = sqlite3.connect(self.db)

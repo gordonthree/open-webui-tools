@@ -4,6 +4,7 @@ Tests for agent_notes.py. Run with: python -m unittest test_agent_notes -v
 """
 
 import asyncio
+import json
 from collections import Counter as collections_counter
 import shutil
 import sqlite3
@@ -1681,6 +1682,158 @@ class OpenWebUICoercionTests(unittest.TestCase):
         for name, fn in inspect.getmembers(mod.Tools, inspect.iscoroutinefunction):
             for pname, param in inspect.signature(fn).parameters.items():
                 self.assertNotIn(param.annotation, (int, Optional[int]), f"{name}({pname})")
+
+
+class PinnedTests(NotesTestCase):
+    """Entries the owner pins (web interface only) always come back, outside every quota and size limit, and a model is never told."""
+
+    def fill(self, name="n", count=30, weight=None, kind=None):
+        self.create(name, "entry 1")
+        for i in range(2, count + 1):
+            self.run_async(self.tool.agent_notes_append(name, f"entry {i}", weight=weight))
+        if kind:
+            conn = sqlite3.connect(self.db)
+            conn.execute("UPDATE note_id SET kind = ? WHERE lower(note_name) = ?", (kind, name))
+            conn.commit()
+            conn.close()
+
+    def pin(self, name, no, on=True):
+        return mod.set_pinned_db(self.db, name, no, on)
+
+    def texts(self, out):
+        return [e["text"] for e in out["entries"]] + [e["text"] for rows in out.get("strong_memories", {}).values() for e in rows]
+
+    def test_column_is_added_to_an_older_database(self):
+        self.create("n")
+        conn = sqlite3.connect(self.db)
+        conn.execute("ALTER TABLE note_data DROP COLUMN pinned")
+        conn.commit()
+        conn.close()
+        mod._schema_ready.clear()
+        self.assertEqual(self.pin("n", 1)["entries_changed"], 1)
+        self.assertEqual(self.sql("SELECT pinned FROM note_data"), [(1,)])
+
+    def test_pinned_old_entry_is_in_the_default_read_and_unmarked(self):
+        self.fill()
+        self.pin("n", 2)
+        out = self.run_async(self.tool.agent_notes_read("n"))
+        self.assertIn("entry 2", self.texts(out))
+        self.assertEqual(len(out["entries"]), 10)
+        self.assertNotIn("pinned", json.dumps(out).lower())
+        self.assertNotIn("pinned", json.dumps(self.run_async(self.tool.agent_notes_read("n", verbose=True))).lower())
+
+    def test_unpinned_old_entry_is_not(self):
+        self.fill()
+        self.pin("n", 2)
+        self.pin("n", 2, False)
+        self.assertNotIn("entry 2", self.texts(self.run_async(self.tool.agent_notes_read("n"))))
+        self.assertEqual(self.sql("SELECT pinned FROM note_data WHERE entry_no = 2"), [(None,)])
+
+    def test_pinned_entry_ignores_the_strong_quota_and_does_not_use_a_slot(self):
+        self.tool.valves.READ_STRONG_EACH = 2
+        self.fill(count=20)
+        for no in (2, 3, 4, 5):
+            self.run_async(self.tool.agent_notes_set_weight("n", str(no), weight="9"))
+        self.pin("n", 2)
+        out = self.run_async(self.tool.agent_notes_read("n"))
+        self.assertEqual(len(out["strong_memories"]["positive"]), 3)  # the pinned one plus the usual two
+        self.assertIn("entry 2", self.texts(out))
+        self.tool.valves.READ_STRONG_EACH = 0
+        self.assertIn("entry 2", self.texts(self.run_async(self.tool.agent_notes_read("n"))))  # even with the strong tier off
+
+    def test_pinned_entry_goes_on_the_side_of_its_score(self):
+        self.fill(count=20)
+        self.run_async(self.tool.agent_notes_set_weight("n", "2", weight="1"))
+        self.pin("n", 2)
+        out = self.run_async(self.tool.agent_notes_read("n"))
+        self.assertEqual([e["text"] for e in out["strong_memories"]["negative"]], ["entry 2"])
+
+    def test_pinned_entry_in_a_persona_note_is_a_trait_shown(self):
+        self.fill(count=20, kind="persona")
+        self.pin("n", 3)
+        out = self.run_async(self.tool.agent_notes_read("n"))
+        self.assertEqual([e["text"] for e in out["strong_memories"]["positive"]], ["entry 3"])
+
+    def test_pinned_entry_survives_the_size_limit(self):
+        self.tool.valves.READ_MAX_CHARS = 500
+        self.create("n", "start")
+        for i in range(2, 12):
+            self.run_async(self.tool.agent_notes_append("n", f"entry {i} " + "x" * 400))
+        self.pin("n", 1)
+        out = self.run_async(self.tool.agent_notes_read("n"))
+        self.assertIn("start", self.texts(out))
+        self.assertTrue(any(e["text"].startswith("entry 11") for e in out["entries"]))  # the newest is still there
+
+    def test_other_read_modes_are_unchanged(self):
+        self.fill()
+        self.pin("n", 2)
+        out = self.run_async(self.tool.agent_notes_read("n", before="20", limit="5"))
+        self.assertNotIn("entry 2", self.texts(out))
+
+    def test_read_tagged_keeps_a_pinned_entry_the_budget_would_drop(self):
+        self.tool.valves.MAX_TAGGED_CHARS = 800
+        self.create("n", "oldest special entry")
+        for i in range(2, 15):
+            self.run_async(self.tool.agent_notes_append("n", f"entry {i} " + "y" * 150))
+        self.run_async(self.tool.agent_notes_add_tags("n", "topic"))
+        before = self.run_async(self.tool.agent_notes_read_tagged("topic"))
+        self.assertNotIn("oldest special entry", json.dumps(before))
+        self.pin("n", 1)
+        out = self.run_async(self.tool.agent_notes_read_tagged("topic"))
+        self.assertIn("oldest special entry", json.dumps(out))
+        self.assertEqual(out["notes"][0]["entries"][0], "oldest special entry")  # time order is kept
+        self.assertNotIn("pinned", json.dumps(self.run_async(self.tool.agent_notes_read_tagged("topic", verbose=True))).lower())
+
+    def test_read_tagged_note_over_budget_is_still_admitted_for_its_pinned_entry(self):
+        self.tool.valves.MAX_TAGGED_CHARS = 500
+        for name in ("a", "b"):
+            self.create(name, "first of " + name + " " + "z" * 200)
+            self.run_async(self.tool.agent_notes_add_tags(name, "topic"))
+        self.pin("b", 1)
+        out = self.run_async(self.tool.agent_notes_read_tagged("topic"))
+        self.assertIn("b", [n["note_name"] for n in out["notes"]])
+
+    def test_search_always_shows_a_matching_pinned_entry(self):
+        self.create("n", "apple pie")
+        for i in range(2, 8):
+            self.run_async(self.tool.agent_notes_append("n", f"apple entry {i}", weight="9"))
+        self.pin("n", 1)
+        out = self.run_async(self.tool.agent_notes_search("apple", limit="2"))
+        self.assertEqual(len(out["cards"]), 3)
+        self.assertIn(1, [c["entry_no"] for c in out["cards"]])
+        self.assertEqual(out["showing"], "1-2 of 7")
+        self.assertIn("5 more match", out["note"])
+        self.assertNotIn("pinned", json.dumps(out).lower())
+        page2 = self.run_async(self.tool.agent_notes_search("apple", limit="2", page="2"))
+        self.assertEqual(len(page2["cards"]), 2)
+
+    def test_search_does_not_show_a_pinned_entry_that_does_not_match(self):
+        self.create("n", "pear tart")
+        self.pin("n", 1)
+        out = self.run_async(self.tool.agent_notes_search("apple"))
+        self.assertEqual(out["cards"], [])
+
+    def test_pinning_one_piece_of_a_chain_pins_them_all(self):
+        self.run_async(self.tool.agent_notes_create("n", "word " * 300, continues=True))
+        pieces = self.sql("SELECT COUNT(*) FROM note_data")[0][0]
+        self.assertGreater(pieces, 1)
+        self.assertEqual(self.pin("n", 2)["entries_changed"], pieces)
+        self.pin("n", 2, False)
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM note_data WHERE pinned IS NOT NULL"), [(0,)])
+
+    def test_editing_an_entry_keeps_its_pin(self):
+        self.create("n", "before")
+        self.pin("n", 1)
+        self.run_async(self.tool.agent_notes_edit_entry("n", "1", "after"))
+        self.assertEqual(self.sql("SELECT pinned FROM note_data"), [(1,)])
+
+    def test_no_tool_method_can_pin(self):
+        self.assertFalse([m for m in dir(self.tool) if "pin" in m.lower()])
+
+    def test_bad_entry_number(self):
+        self.create("n")
+        with self.assertRaises(mod.NoteError):
+            self.pin("n", 9)
 
 
 if __name__ == "__main__":

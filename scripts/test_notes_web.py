@@ -60,6 +60,26 @@ class HandlerTests(unittest.TestCase):
         _, _, body = self.get("/note", name="Ideas")
         self.assertNotIn("<pre>first</pre>", body)
 
+    def test_pin_button_pins_and_unpins_and_shows_the_state(self):
+        self.post("/create", name="Ideas", text="first")
+        _, _, body = self.get("/note", name="Ideas")
+        self.assertIn("<button title='Pin: always show", body)
+        self.assertIn(">pin</button>", body)
+        status, headers, _ = self.post("/pin", name="Ideas", entry_no="1", pinned="1")
+        self.assertEqual((status, headers["Location"]), (303, "/note?name=Ideas#e1"))
+        _, _, body = self.get("/note", name="Ideas")
+        self.assertIn("&#128204; pinned", body)
+        self.assertIn("name='pinned' value='0'", body)  # the button now unpins
+        self.post("/pin", name="Ideas", entry_no="1", pinned="0")
+        _, _, body = self.get("/note", name="Ideas")
+        self.assertNotIn("&#128204;", body)
+
+    def test_pin_unknown_entry_is_an_error_page(self):
+        self.post("/create", name="Ideas", text="first")
+        status, _, body = self.post("/pin", name="Ideas", entry_no="9", pinned="1")
+        self.assertEqual(status, 400)
+        self.assertIn("no entry #9", body)
+
     def test_note_page_shows_newest_entries_first(self):
         self.post("/create", name="Ideas", text="oldest")
         self.post("/append", name="Ideas", text="middle")

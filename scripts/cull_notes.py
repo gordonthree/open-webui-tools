@@ -34,11 +34,17 @@ def cutoff_iso(days: float, now: "datetime.datetime | None" = None) -> str:
     return (now - datetime.timedelta(days=days)).isoformat()
 
 
-# Entries to cull: older than the cutoff, and not part of a chain that has a piece inside the window.
+# Entries to cull: older than the cutoff, not pinned, and not part of a chain that has a piece inside the window.
 _OLD_SQL = (
     "FROM note_data d WHERE d.note_pk = :pk AND d.created_at < :cutoff AND NOT EXISTS ("
     " SELECT 1 FROM note_data c WHERE c.note_pk = d.note_pk AND c.chain_id IS NOT NULL AND c.chain_id = d.chain_id AND c.created_at >= :cutoff)"
 )
+
+
+def old_sql(conn: sqlite3.Connection) -> str:
+    """_OLD_SQL, leaving out entries pinned in the web interface (a database from before pinning has no such column)."""
+    has_pinned = "pinned" in [r[1] for r in conn.execute("PRAGMA table_info(note_data)")]
+    return _OLD_SQL + (" AND d.pinned IS NULL" if has_pinned else "")
 
 
 def cull_note(conn: sqlite3.Connection, name: str, cutoff: str, clear_summary: bool = False, dry_run: bool = False) -> dict:
@@ -48,10 +54,10 @@ def cull_note(conn: sqlite3.Connection, name: str, cutoff: str, clear_summary: b
         raise LookupError(f"No note named {name!r}.")
     pk = row[0]
     total = conn.execute("SELECT COUNT(*) FROM note_data WHERE note_pk = ?", (pk,)).fetchone()[0]
-    old = conn.execute(f"SELECT COUNT(*) {_OLD_SQL}", {"pk": pk, "cutoff": cutoff}).fetchone()[0]
+    old = conn.execute(f"SELECT COUNT(*) {old_sql(conn)}", {"pk": pk, "cutoff": cutoff}).fetchone()[0]
     cleared = False
     if not dry_run:
-        conn.execute(f"DELETE FROM note_data WHERE rowid IN (SELECT d.rowid {_OLD_SQL})", {"pk": pk, "cutoff": cutoff})
+        conn.execute(f"DELETE FROM note_data WHERE rowid IN (SELECT d.rowid {old_sql(conn)})", {"pk": pk, "cutoff": cutoff})
         if clear_summary and old:
             cleared = conn.execute("DELETE FROM note_summary WHERE note_pk = ?", (pk,)).rowcount > 0
     return {"note": row[1], "total": total, "removed": old, "kept": total - old, "summary_cleared": cleared}

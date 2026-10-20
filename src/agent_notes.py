@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.19.0
+version: 1.20.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS note_data (
     chain_id INTEGER,
     hits {HITS_DDL},
     weight {WEIGHT_DDL},
+    pinned INTEGER CHECK (pinned IS NULL OR pinned = 1),
     PRIMARY KEY (note_pk, entry_no)
 );
 CREATE INDEX IF NOT EXISTS idx_note_data_time ON note_data(note_pk, created_at);
@@ -143,6 +144,7 @@ def notes_db_connect(db_path: str) -> sqlite3.Connection:
         _migrate_chains(conn)
         _migrate_scores(conn)
         _migrate_note_settings(conn)
+        _migrate_pinned(conn)
         _schema_ready.add(db_path)
     return conn
 
@@ -213,6 +215,14 @@ def _migrate_scores(conn: sqlite3.Connection) -> None:
         for table, column, ddl in (("note_id", "hits", HITS_DDL), ("note_data", "hits", HITS_DDL), ("note_data", "weight", WEIGHT_DDL)):
             if column not in [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def _migrate_pinned(conn: sqlite3.Connection) -> None:
+    """Add note_data.pinned: NULL for an ordinary entry, 1 for one its owner pinned (set only from the web interface, never by a model).
+    Nullable with no default, so an older copy of the tool can still insert rows."""
+    with _write_txn(conn):
+        if "pinned" not in [r["name"] for r in conn.execute("PRAGMA table_info(note_data)")]:
+            conn.execute("ALTER TABLE note_data ADD COLUMN pinned INTEGER CHECK (pinned IS NULL OR pinned = 1)")
 
 
 def _migrate_note_settings(conn: sqlite3.Connection) -> None:
@@ -719,7 +729,7 @@ def read_note_db(db_path: str, name: str, limit: int) -> Dict[str, Any]:
         note = _get_note(conn, name)
         total = conn.execute("SELECT COUNT(*) FROM note_data WHERE note_pk = ?", (note["note_pk"],)).fetchone()[0]
         rows = conn.execute(
-            f"SELECT d.entry_no, d.note_text, d.created_at, d.edited_at, d.hits, d.weight, a.author_name, {_CHAIN_SQL} FROM note_data d "
+            f"SELECT d.entry_no, d.note_text, d.created_at, d.edited_at, d.hits, d.weight, d.pinned, a.author_name, {_CHAIN_SQL} FROM note_data d "
             "LEFT JOIN note_author a ON a.author_id = d.author_id WHERE d.note_pk = ? "
             "ORDER BY d.created_at DESC, d.entry_no DESC LIMIT ?",
             (note["note_pk"], limit),
@@ -729,7 +739,7 @@ def read_note_db(db_path: str, name: str, limit: int) -> Dict[str, Any]:
         conn.close()
 
 
-_ENTRY_COLUMNS = f"d.entry_no, d.note_text, d.created_at, d.edited_at, d.hits, d.weight, a.author_name, {_CHAIN_SQL}"
+_ENTRY_COLUMNS = f"d.entry_no, d.note_text, d.created_at, d.edited_at, d.hits, d.weight, d.pinned, a.author_name, {_CHAIN_SQL}"
 _ENTRY_FROM = "FROM note_data d LEFT JOIN note_author a ON a.author_id = d.author_id"
 
 
@@ -802,7 +812,7 @@ def read_view_db(
             return conn.execute(f"SELECT {_ENTRY_COLUMNS} {_ENTRY_FROM} WHERE d.note_pk = ? {where} ORDER BY {order} LIMIT ?", [pk] + params + [limit]).fetchall()
 
         newest = lambda n: fetch("", [], "d.created_at DESC, d.entry_no DESC", n)  # noqa: E731
-        out: Dict[str, Any] = {**_note_extras(conn, note), "total": total, "positive": [], "negative": [], "not_found": [], "older_left": None}
+        out: Dict[str, Any] = {**_note_extras(conn, note), "total": total, "positive": [], "negative": [], "pinned": [], "not_found": [], "older_left": None}
         if mode == "entries":
             rows = fetch(f"AND d.entry_no IN ({','.join('?' * len(numbers))})", list(numbers), "d.entry_no", len(numbers))
             out["not_found"] = sorted(set(numbers) - {r["entry_no"] for r in rows})
@@ -820,6 +830,9 @@ def read_view_db(
             rows = newest(recent)
             out["entries"] = list(reversed(rows))
             skip = [r["entry_no"] for r in rows]
+            # Entries the owner pinned always come back, on top of the quotas below; the strong draws leave them out so they never use a slot.
+            out["pinned"] = [r for r in fetch("AND d.pinned = 1", [], "d.weight DESC, d.created_at DESC, d.entry_no DESC", 100000) if r["entry_no"] not in skip]
+            skip = skip + [r["entry_no"] for r in out["pinned"]]
             exclude = f"AND d.entry_no NOT IN ({','.join('?' * len(skip))})" if skip else ""
             if strong_each > 0:
                 persona = note["kind"] == "persona"
@@ -963,6 +976,25 @@ def set_weight_db(db_path: str, name: str, entry_no: int, weight: Optional[int],
         conn.close()
 
 
+def set_pinned_db(db_path: str, name: str, entry_no: int, pinned: bool) -> Dict[str, Any]:
+    """Pin or unpin an entry (and, for a long text saved as linked pieces, all its pieces). A pinned entry is always returned by
+    agent_notes_read, agent_notes_read_tagged and agent_notes_search, outside their quotas and size limits. For the owner's web
+    interface only: no tool method calls this, and nothing a model receives says an entry is pinned. Not a content change."""
+    conn = notes_db_connect(db_path)
+    try:
+        with _write_txn(conn):
+            note = _get_note(conn, name)
+            entry = _get_entry(conn, note, entry_no)
+            value = 1 if pinned else None
+            if entry["chain_id"] is not None:
+                cur = conn.execute("UPDATE note_data SET pinned = ? WHERE note_pk = ? AND chain_id = ?", (value, note["note_pk"], entry["chain_id"]))
+            else:
+                cur = conn.execute("UPDATE note_data SET pinned = ? WHERE note_pk = ? AND entry_no = ?", (value, note["note_pk"], entry_no))
+        return {"note_name": note["note_name"], "entry_no": entry_no, "pinned": bool(pinned), "entries_changed": cur.rowcount}
+    finally:
+        conn.close()
+
+
 # An entry's 1-10 score in SQL, and how far it is from neutral. Strong = at or beyond a cutoff on either side.
 _SCORE_SQL = f"((d.weight + {SCORE_STEP // 2}) / {SCORE_STEP})"
 _STRENGTH_SQL = f"ABS(d.weight - {DEFAULT_WEIGHT})"
@@ -1038,6 +1070,16 @@ def search_cards_db(db_path: str, query: str, limit: int, offset: int = 0, note:
             f"ORDER BY {order}, d.created_at DESC, d.entry_no DESC LIMIT ? OFFSET ?",
             params + note_params + order_params + [limit, offset],
         ).fetchall()
+        rows = [dict(r) for r in rows]
+        if offset == 0:  # pinned entries that match are always shown, in addition to the page
+            seen = {(r["note_name"], r["entry_no"]) for r in rows}
+            extra = conn.execute(
+                f"SELECT n.note_name, d.entry_no, d.note_text, d.created_at, d.hits, d.weight, a.author_name FROM note_data d "
+                f"JOIN note_id n ON n.note_pk = d.note_pk LEFT JOIN note_author a ON a.author_id = d.author_id WHERE {where}{note_clause} AND d.pinned = 1 "
+                f"ORDER BY {_STRENGTH_SQL} DESC, d.created_at DESC, d.entry_no DESC",
+                params + note_params,
+            ).fetchall()
+            rows += [{**dict(r), "_extra": True} for r in extra if (r["note_name"], r["entry_no"]) not in seen]
         return total, rows, mode
     finally:
         conn.close()
@@ -1252,7 +1294,7 @@ def rename_tag_db(db_path: str, tag: str, new_tag: str) -> Dict[str, Any]:
 
 def tagged_notes_db(db_path: str, tags: List[str], match_all: bool) -> "tuple[List[Any], List[str], List[str]]":
     """Notes carrying the given tags, best match first: (notes, tags found, tags that don't exist). Each note is a dict with its
-    tags, summary and every entry (newest first), ready for pack_tagged."""
+    tags, summary and every entry (newest first), ready for pack_tagged; "_pinned_idx" holds the positions of pinned entries."""
     conn = notes_db_connect(db_path)
     try:
         counts = _tag_counts(conn)
@@ -1281,7 +1323,7 @@ def tagged_notes_db(db_path: str, tags: List[str], match_all: bool) -> "tuple[Li
             note_tags = _note_tags(conn, r["note_pk"])
             summary = conn.execute("SELECT summary_text FROM note_summary WHERE note_pk = ?", (r["note_pk"],)).fetchone()
             entries = conn.execute(
-                f"SELECT d.entry_no, d.note_text, d.created_at, d.hits, d.weight, a.author_name, {_CHAIN_SQL} FROM note_data d LEFT JOIN note_author a ON a.author_id = d.author_id "
+                f"SELECT d.entry_no, d.note_text, d.created_at, d.hits, d.weight, d.pinned, a.author_name, {_CHAIN_SQL} FROM note_data d LEFT JOIN note_author a ON a.author_id = d.author_id "
                 "WHERE d.note_pk = ? ORDER BY d.created_at DESC, d.entry_no DESC",
                 (r["note_pk"],),
             ).fetchall()
@@ -1292,6 +1334,7 @@ def tagged_notes_db(db_path: str, tags: List[str], match_all: bool) -> "tuple[Li
                 "summary": summary["summary_text"] if summary else None,
                 "entries": [{"entry_no": e["entry_no"], "author": e["author_name"] or "unknown", "created_at": e["created_at"], "text": e["note_text"], "hits": e["hits"], "weight": weight_to_score(e["weight"]), **_chain_marks(e)} for e in entries],
                 "hits": r["hits"],
+                "_pinned_idx": {i for i, e in enumerate(entries) if e["pinned"]},
             })
         return notes, found, missing
     finally:
@@ -1311,7 +1354,7 @@ def _shape_tagged(note: Dict[str, Any], verbose: bool) -> Dict[str, Any]:
     persona = note.get("kind") == "persona"
     if verbose:
         return {**note, "_verbose": True, **({"_persona": True} if persona else {})}
-    shaped: Dict[str, Any] = {"note_name": note["note_name"], **({"_persona": True} if persona else {})}
+    shaped: Dict[str, Any] = {"note_name": note["note_name"], "_pinned_idx": note.get("_pinned_idx", set()), **({"_persona": True} if persona else {})}
     if note["summary"]:
         shaped["summary"] = note["summary"]
     # a piece of a long text keeps its links, so it's a small object; every other entry stays a bare string
@@ -1324,41 +1367,56 @@ def _shape_tagged(note: Dict[str, Any], verbose: bool) -> Dict[str, Any]:
     return shaped
 
 
-def pack_tagged(notes: List[Dict[str, Any]], budget: int) -> "tuple[List[Dict[str, Any]], List[str]]":
+def pack_tagged(notes: List[Dict[str, Any]], budget: int, kept_out: "Optional[Dict[str, List[int]]]" = None) -> "tuple[List[Dict[str, Any]], List[str]]":
     """Fit as much as possible of these notes into `budget` characters without ever cutting a string in half.
-    Pass 1 admits each note's heading (name, tags, summary) in rank order, stopping at the first that doesn't fit.
-    Pass 2 then adds entries newest-first, rotating across the admitted notes so one long note can't use the whole
-    budget; a note stops growing the first time its next entry doesn't fit. Returns (notes with entries in time
-    order, names of the notes left out)."""
+    Pass 1 admits each note's heading (name, tags, summary) in rank order, stopping at the first that doesn't fit (a note with pinned
+    entries is admitted regardless). Pass 2 takes every pinned entry of the admitted notes, whatever the budget, then adds the other
+    entries newest-first, rotating across the admitted notes so one long note can't use the whole budget; a note stops growing the
+    first time its next entry doesn't fit. Returns (notes with entries in time order, names of the notes left out). `kept_out`, if
+    given, receives for each note name the positions (in the order the entries came in) of the entries that were kept."""
     used = 0
     packed: List[Dict[str, Any]] = []
+    left_out: List[str] = []
+    full = False
     for note in notes:
-        cost = _HEADING_EXTRAS + _size({k: v for k, v in note.items() if k != "entries"})
-        if used + cost > budget:
-            break
+        pins = note.get("_pinned_idx") or set()
+        head = {k: v for k, v in note.items() if k not in ("entries", "_pinned_idx")}
+        cost = _HEADING_EXTRAS + _size(head)
+        if full or used + cost > budget:
+            if not pins:
+                full = True
+                left_out.append(note["note_name"])
+                continue
         used += cost
-        packed.append({**{k: v for k, v in note.items() if k != "entries"}, "total_entries": len(note["entries"]), "_pending": list(note["entries"]), "entries": []})
+        packed.append({**head, "total_entries": len(note["entries"]), "_all": list(note["entries"]), "_taken": set(pins), "_pending": [i for i in range(len(note["entries"])) if i not in pins], "entries": []})
+    for note in packed:
+        used += sum(_size(note["_all"][i]) for i in note["_taken"])
     open_notes = list(packed)
     while open_notes:
         for note in list(open_notes):
             if not note["_pending"]:
                 open_notes.remove(note)
                 continue
-            cost = _size(note["_pending"][0])
+            cost = _size(note["_all"][note["_pending"][0]])
             if used + cost > budget:
                 open_notes.remove(note)  # soft stop: this note is done growing; others may still have shorter entries that fit
                 continue
             used += cost
-            note["entries"].append(note["_pending"].pop(0))
+            note["_taken"].add(note["_pending"].pop(0))
     for note in packed:
+        kept = sorted(note.pop("_taken"))
+        note["entries"] = [note["_all"][i] for i in kept]
+        note.pop("_all")
         note.pop("_pending")
+        if kept_out is not None:
+            kept_out[note["note_name"]] = kept
         if not note.pop("_persona", False):
             note["entries"].reverse()  # newest-first while packing; read in time order (a persona note stays strongest-first)
         hidden = note.pop("total_entries") - len(note["entries"])
         verbose = note.pop("_verbose", False)
         if hidden or verbose:
             note["entries_not_shown"] = hidden
-    return packed, [n["note_name"] for n in notes[len(packed):]]
+    return packed, left_out
 
 
 def empty_note_db(db_path: str, name: str) -> Dict[str, Any]:
@@ -1719,8 +1777,15 @@ class Tools:
         note_name = result["note"]["note_name"]
         # preference order for the size limit: the entry nearest the newest/start of the request first, strong memories after
         recent_first = list(reversed(result["entries"]))
-        kept_recent, kept_pos, kept_neg = fit_entries([recent_first, result["positive"], result["negative"]], max(500, v.READ_MAX_CHARS))
+        # entries the owner pinned come first and are never cut: they are shown among the strong memories, on the side of their score
+        # (a persona note has only the positive side), and the budget for everything else is what they leave
+        pinned_pos = [r for r in result["pinned"] if result["note"]["kind"] == "persona" or r["weight"] >= DEFAULT_WEIGHT]
+        pinned_neg = [r for r in result["pinned"] if r not in pinned_pos]
+        pinned_cost = sum(len(r["note_text"]) + 60 for r in result["pinned"])
+        kept_recent, kept_pos, kept_neg = fit_entries([recent_first, result["positive"], result["negative"]], max(500, v.READ_MAX_CHARS) - pinned_cost)
         kept_recent.reverse()
+        shown_pinned = len(result["pinned"])
+        kept_pos, kept_neg = pinned_pos + kept_pos, pinned_neg + kept_neg
 
         def shape(r) -> Dict[str, Any]:
             marks = _score_marks(r, full)
@@ -1751,7 +1816,7 @@ class Tools:
             if full:
                 out["summary"].update({"last_summarized": sm["last_summarized"], "summarized_by": sm["author_name"] or "unknown"})
         shown = len(kept_recent) + len(kept_pos) + len(kept_neg)
-        dropped = len(recent_first) + len(result["positive"]) + len(result["negative"]) - shown
+        dropped = len(recent_first) + len(result["positive"]) + len(result["negative"]) + shown_pinned - shown
         remarks = []
         if mode == "tiered":
             hidden = result["total"] - shown
@@ -1906,11 +1971,12 @@ class Tools:
             return _error(e)
         full = _to_bool(verbose)
         shaped = [_shape_tagged(n, full) for n in notes]
-        packed, left_out = pack_tagged(shaped, max(500, v.MAX_TAGGED_CHARS) - 300)  # 300: the reply's own keys and remarks
-        # packed is a prefix of notes, and each shows the newest few of its entries (see pack_tagged), so what was delivered is known
+        kept: Dict[str, List[int]] = {}
+        packed, left_out = pack_tagged(shaped, max(500, v.MAX_TAGGED_CHARS) - 300, kept)  # 300: the reply's own keys and remarks
+        by_name = {n["note_name"]: n for n in notes}
         await self._count_reads(
             [p["note_name"] for p in packed],
-            [(n["note_name"], e["entry_no"]) for n, p in zip(notes, packed) for e in n["entries"][: len(p["entries"])]],
+            [(name, by_name[name]["entries"][i]["entry_no"]) for name, positions in kept.items() for i in positions],
         )
         out: Dict[str, Any] = {"success": True, "notes": packed}
         if full:
@@ -1973,13 +2039,14 @@ class Tools:
             out["matching_notes"] = [{"note_name": r["note_name"], "note_comment": r["note_comment"]} for r in notes]
         first = (page_no - 1) * cap
         remarks = []
+        paged = len(cards) - sum(1 for r in rows if r.get("_extra"))  # pinned matches ride along; they are not part of the page
         if cards:
-            out["showing"] = f"{first + 1}-{first + len(cards)} of {total}"
+            out["showing"] = f"{first + 1}-{first + paged} of {total}" if paged else f"{len(cards)} shown"
             if mode == "any":
                 remarks.append("No entry has all of those words, so these have some of them, most words first.")
             remarks.append("These are cards: read a whole entry with agent_notes_read (name, entry=N).")
-            if first + len(cards) < total:
-                remarks.append(f"{total - first - len(cards)} more match; ask for page={page_no + 1}.")
+            if first + paged < total:
+                remarks.append(f"{total - first - paged} more match; ask for page={page_no + 1}.")
         elif total:
             remarks.append(f"Page {page_no} is past the last of {total} matches.")
         else:
