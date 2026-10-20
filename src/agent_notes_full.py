@@ -1,7 +1,7 @@
 """
 title: Agent Notes
 author: Gordon
-version: 1.18.2
+version: 1.19.0
 description: A persistent notebook for agents, easier to use than Open WebUI's built-in note tool.
     A note is a name plus an append-only log of short numbered entries (500 characters each), kept
     in its own SQLite database. To add to a note, append an entry - nothing is ever rewritten or
@@ -512,18 +512,19 @@ def validate_text(text: Any) -> str:
 
 
 def split_text(text: Any, max_parts: int) -> List[str]:
-    """Cut text into pieces of at most NOTE_TEXT_MAX characters for agent_notes_create/_append continues=true. The words are kept exactly as given: a cut
-    falls on a paragraph break if one is near, else a line break, else a space (only that break itself is dropped),
-    and only in a word longer than a whole piece does it fall mid-word."""
+    """Cut text into pieces of at most NOTE_TEXT_MAX characters for agent_notes_create/_append continues=true. The text is kept exactly as given:
+    the pieces joined end to end give it back. A cut falls just after a paragraph break if one is near, else after a line break, else after a
+    space (that break stays at the end of the piece, so words don't run together when the pieces are put back together), and only in a word
+    longer than a whole piece does it fall mid-word."""
     rest = strip_leading_date(str(text or "").strip())
     if not rest:
         raise NoteError("Entry text is required and can't be empty.")
     parts: List[str] = []
     while len(rest) > NOTE_TEXT_MAX:  # fits in one entry as is: no pieces, no marker
-        window = rest[: NOTE_TEXT_MAX + 1]
-        cut = next((c for c in (window.rfind("\n\n"), window.rfind("\n"), window.rfind(" ")) if c >= NOTE_TEXT_MAX // 2), NOTE_TEXT_MAX)
-        parts.append(rest[:cut].strip())
-        rest = rest[cut:].strip()
+        window = rest[:NOTE_TEXT_MAX]
+        cut = next((i + len(sep) for sep in ("\n\n", "\n", " ") if (i := window.rfind(sep)) >= 0 and i + len(sep) >= NOTE_TEXT_MAX // 2), NOTE_TEXT_MAX)
+        parts.append(rest[:cut])
+        rest = rest[cut:]
     parts.append(rest)
     if len(parts) > max_parts:
         raise NoteError(
@@ -531,7 +532,7 @@ def split_text(text: Any, max_parts: int) -> List[str]:
             f"({max_parts * NOTE_TEXT_MAX} characters) can be saved in one call. Nothing was saved. "
             "Save the first part now and the rest in a later agent_notes_append call."
         )
-    return [p for p in parts if p]
+    return [p for p in parts if p.strip()]
 
 
 def entry_parts(text: Any, continues: Any, max_parts: int) -> List[str]:

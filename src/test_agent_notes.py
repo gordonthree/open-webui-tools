@@ -317,7 +317,7 @@ class ListAndSearchTests(NotesTestCase):
         self.assertEqual(more["entry_numbers"], "6-7")
         entries = self.run_async(self.tool.agent_notes_read("long"))["entries"]
         self.assertTrue(all(len(e["text"]) <= mod.NOTE_TEXT_MAX for e in entries))
-        self.assertEqual(" ".join(e["text"] for e in entries[:5]), text)  # the stored text is exactly the words given
+        self.assertEqual("".join(e["text"] for e in entries[:5]), text)  # the pieces joined end to end are exactly what was given
         self.assertEqual([e.get("continues_at") for e in entries], [2, 3, 4, 5, None, 7, None])
         self.assertEqual([e.get("continues_from") for e in entries], [None, 1, 2, 3, 4, None, 6])
         self.assertEqual(self.sql("SELECT DISTINCT chain_id FROM note_data WHERE entry_no > 5"), [(6,)])
@@ -622,7 +622,7 @@ class ListAndSearchTests(NotesTestCase):
         self.assertEqual(third["entry_numbers"], "2-3")
         self.assertNotIn("note", third)  # no scolding or advertising in the reply
         entries = self.run_async(self.tool.agent_notes_read("n"))["entries"]
-        self.assertEqual(" ".join(e["text"] for e in entries[1:]), self.LONG.strip())
+        self.assertEqual("".join(e["text"] for e in entries[1:]), self.LONG.strip())
         self.assertEqual(entries[1]["continues_at"], 3)
         self.assertFalse(self.append()["success"])  # the count starts again after an automatic save
 
@@ -997,6 +997,26 @@ class ListAndSearchTests(NotesTestCase):
         self.assertEqual([entries[n]["text"] for n in (1, 2, 3, 4)], ["plain", "alpha", "beta", "gamma"])
         self.assertEqual((entries[2]["continues_at"], entries[3]["continues_at"], entries[4]["continues_from"]), (3, 4, 3))
         self.assertNotIn("continues_at", entries[1])
+
+    def test_continues_keeps_the_break_so_joined_pieces_equal_the_text(self):
+        for text in (
+            "alpha beta gamma. " * 90,  # spaces
+            "\n\n".join(f"Paragraph {i} " + "lorem ipsum " * 12 for i in range(12)),  # paragraph breaks
+            "\n".join(f"line {i} " + "dolor sit " * 9 for i in range(20)),  # line breaks
+            "word   " * 150,  # runs of spaces
+        ):
+            parts = mod.split_text(text, 20)
+            self.assertGreater(len(parts), 1)
+            self.assertTrue(all(len(p) <= mod.NOTE_TEXT_MAX for p in parts))
+            self.assertEqual("".join(parts), text.strip())
+            self.assertTrue(all(not p[0].isspace() for p in parts[1:]) or "   " in text)
+
+    def test_continues_stored_pieces_keep_their_trailing_break(self):
+        text = "abcd " * 300
+        self.run_async(self.tool.agent_notes_create("sp", text, continues=True))
+        entries = self.run_async(self.tool.agent_notes_read("sp"))["entries"]
+        self.assertEqual("".join(e["text"] for e in entries), text.strip())
+        self.assertTrue(entries[0]["text"].endswith(" "))
 
     def test_continues_hard_cuts_an_unbroken_run_and_every_entry_fits(self):
         self.run_async(self.tool.agent_notes_create("blob", "x" * 1400, continues=True))
