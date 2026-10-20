@@ -74,6 +74,16 @@ class HandlerTests(unittest.TestCase):
         _, _, body = self.get("/note", name="Ideas")
         self.assertNotIn("&#128204;", body)
 
+    def test_the_owner_can_still_edit_and_delete_a_pinned_entry(self):
+        self.post("/create", name="Ideas", text="first")
+        self.post("/pin", name="Ideas", entry_no="1", pinned="1")
+        self.post("/edit", name="Ideas", entry_no="1", text="owner revised")
+        _, _, body = self.get("/note", name="Ideas")
+        self.assertIn("owner revised", body)
+        self.post("/delete_entry", name="Ideas", entry_no="1")
+        _, _, body = self.get("/note", name="Ideas")
+        self.assertNotIn("owner revised", body)
+
     def test_pin_unknown_entry_is_an_error_page(self):
         self.post("/create", name="Ideas", text="first")
         status, _, body = self.post("/pin", name="Ideas", entry_no="9", pinned="1")

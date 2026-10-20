@@ -1830,6 +1830,55 @@ class PinnedTests(NotesTestCase):
     def test_no_tool_method_can_pin(self):
         self.assertFalse([m for m in dir(self.tool) if "pin" in m.lower()])
 
+    # ---- the lock: a model's changes to a pinned entry are quietly dropped ----
+    def two(self):
+        self.create("n", "pinned text")
+        self.run_async(self.tool.agent_notes_append("n", "plain text"))
+        self.pin("n", 1)
+
+    def test_edit_of_a_pinned_entry_looks_successful_and_changes_nothing(self):
+        self.two()
+        locked = self.run_async(self.tool.agent_notes_edit_entry("n", "1", "rewritten", weight="9"))
+        plain = self.run_async(self.tool.agent_notes_edit_entry("n", "2", "rewritten", weight="9"))
+        self.assertTrue(locked["success"])
+        self.assertEqual(set(locked), set(plain))
+        self.assertEqual(self.sql("SELECT note_text, weight, edited_at FROM note_data WHERE entry_no = 1"), [("pinned text", 50, None)])
+        self.assertEqual(self.sql("SELECT note_text, weight FROM note_data WHERE entry_no = 2"), [("rewritten", 90)])
+
+    def test_delete_of_a_pinned_entry_looks_successful_and_changes_nothing(self):
+        self.two()
+        locked = self.run_async(self.tool.agent_notes_delete_entry("n", "1"))
+        self.assertEqual((locked["success"], locked["remaining"]), (True, 1))
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM note_data"), [(2,)])
+        self.assertEqual(self.sql("SELECT pinned FROM note_data WHERE entry_no = 1"), [(1,)])
+
+    def test_reweighting_a_pinned_entry_looks_successful_and_changes_nothing(self):
+        self.two()
+        locked = self.run_async(self.tool.agent_notes_set_weight("n", "1", weight="9"))
+        plain = self.run_async(self.tool.agent_notes_set_weight("n", "2", weight="9"))
+        self.assertEqual(locked, {**plain, "entry_no": 1})
+        self.assertEqual(self.sql("SELECT weight FROM note_data ORDER BY entry_no"), [(50,), (90,)])
+
+    def test_the_lock_does_not_bind_the_owner(self):
+        self.two()
+        mod.edit_entry_db(self.db, "n", 1, "owner edit", 8)
+        self.assertEqual(self.sql("SELECT note_text, weight FROM note_data WHERE entry_no = 1"), [("owner edit", 80)])
+        mod.set_weight_db(self.db, "n", 1, 2, None)
+        self.assertEqual(self.sql("SELECT weight FROM note_data WHERE entry_no = 1"), [(20,)])
+        mod.delete_entry_db(self.db, "n", 1)
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM note_data"), [(1,)])
+
+    def test_unpinning_releases_the_lock(self):
+        self.two()
+        self.pin("n", 1, False)
+        self.run_async(self.tool.agent_notes_edit_entry("n", "1", "now editable"))
+        self.assertEqual(self.sql("SELECT note_text FROM note_data WHERE entry_no = 1"), [("now editable",)])
+
+    def test_a_locked_edit_still_reports_a_missing_entry_and_bad_text(self):
+        self.two()
+        self.assertFalse(self.run_async(self.tool.agent_notes_edit_entry("n", "9", "x"))["success"])
+        self.assertFalse(self.run_async(self.tool.agent_notes_edit_entry("n", "1", "x" * 501))["success"])
+
     def test_bad_entry_number(self):
         self.create("n")
         with self.assertRaises(mod.NoteError):

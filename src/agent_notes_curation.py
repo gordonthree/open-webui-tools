@@ -1,7 +1,7 @@
 """
 title: Agent Notes Curation
 author: Gordon
-version: 1.20.0
+version: 1.21.0
 description: The upkeep half of Agent Notes (it needs the Agent Notes tool too, and the same NOTES_DB_PATH valve):
     tags (agent_notes_add_tags/agent_notes_remove_tag/agent_notes_rename_tag), summaries
     (agent_notes_update_summary/agent_notes_delete_summary), renaming a note or changing its comment
@@ -947,9 +947,9 @@ def reset_hits_db(db_path: str, name: str, entry_no: Optional[int] = None) -> Di
         conn.close()
 
 
-def set_weight_db(db_path: str, name: str, entry_no: int, weight: Optional[int], change: Optional[int]) -> Dict[str, Any]:
+def set_weight_db(db_path: str, name: str, entry_no: int, weight: Optional[int], change: Optional[int], respect_pin: bool = False) -> Dict[str, Any]:
     """Set an entry's score (1-10) outright, or move it by a signed amount (kept within 1-10). Not a content change: updated_at
-    is left alone."""
+    is left alone. With respect_pin (what the tools pass), a pinned entry keeps its score and the reply is the usual one."""
     if (weight is None) == (change is None):
         raise NoteError(f"Give exactly one of weight (the new score, {SCORE_MIN}-{SCORE_MAX}) or change (an amount to add, such as 2 or -2).")
     if weight is not None and not SCORE_MIN <= weight <= SCORE_MAX:
@@ -962,7 +962,8 @@ def set_weight_db(db_path: str, name: str, entry_no: int, weight: Optional[int],
             old = weight_to_score(entry["weight"])
             wanted = weight if weight is not None else old + change
             new = max(SCORE_MIN, min(SCORE_MAX, wanted))
-            conn.execute("UPDATE note_data SET weight = ? WHERE note_pk = ? AND entry_no = ?", (new * SCORE_STEP, note["note_pk"], entry_no))
+            if not (respect_pin and entry["pinned"]):
+                conn.execute("UPDATE note_data SET weight = ? WHERE note_pk = ? AND entry_no = ?", (new * SCORE_STEP, note["note_pk"], entry_no))
         out = {"note_name": note["note_name"], "entry_no": entry_no, "old_weight": old, "weight": new}
         if new != wanted:
             out["note"] = f"{wanted} is outside {SCORE_MIN}-{SCORE_MAX}, so the weight was set to {new}."
@@ -1080,29 +1081,35 @@ def search_cards_db(db_path: str, query: str, limit: int, offset: int = 0, note:
         conn.close()
 
 
-def edit_entry_db(db_path: str, name: str, entry_no: str, text: str, weight: Optional[int] = None) -> Dict[str, Any]:
-    """Replace an entry's text; with weight, also re-rate it (otherwise its weight is kept)."""
+def edit_entry_db(db_path: str, name: str, entry_no: str, text: str, weight: Optional[int] = None, respect_pin: bool = False) -> Dict[str, Any]:
+    """Replace an entry's text; with weight, also re-rate it (otherwise its weight is kept). With respect_pin (what the tools pass), a
+    pinned entry is left exactly as it was and the reply looks like any successful edit: the owner's pin is not something to tell a model."""
     conn = notes_db_connect(db_path)
     try:
         with _write_txn(conn):
             note = _get_note(conn, name)
-            _get_entry(conn, note, entry_no)
+            entry = _get_entry(conn, note, entry_no)
             now = _now_iso()
-            conn.execute("UPDATE note_data SET note_text = ?, edited_at = ? WHERE note_pk = ? AND entry_no = ?", (text, now, note["note_pk"], entry_no))
-            if weight is not None:
-                conn.execute("UPDATE note_data SET weight = ? WHERE note_pk = ? AND entry_no = ?", (weight * SCORE_STEP, note["note_pk"], entry_no))
-            conn.execute("UPDATE note_id SET updated_at = ? WHERE note_pk = ?", (now, note["note_pk"]))
+            if not (respect_pin and entry["pinned"]):
+                conn.execute("UPDATE note_data SET note_text = ?, edited_at = ? WHERE note_pk = ? AND entry_no = ?", (text, now, note["note_pk"], entry_no))
+                if weight is not None:
+                    conn.execute("UPDATE note_data SET weight = ? WHERE note_pk = ? AND entry_no = ?", (weight * SCORE_STEP, note["note_pk"], entry_no))
+                conn.execute("UPDATE note_id SET updated_at = ? WHERE note_pk = ?", (now, note["note_pk"]))
         return {"note_name": note["note_name"], "entry_no": entry_no, "edited_at": now, **({"weight": weight} if weight is not None else {})}
     finally:
         conn.close()
 
 
-def delete_entry_db(db_path: str, name: str, entry_no: str) -> Dict[str, Any]:
+def delete_entry_db(db_path: str, name: str, entry_no: str, respect_pin: bool = False) -> Dict[str, Any]:
+    """Delete one entry. With respect_pin (what the tools pass), a pinned entry stays and the reply is the one a real delete would give."""
     conn = notes_db_connect(db_path)
     try:
         with _write_txn(conn):
             note = _get_note(conn, name)
-            _get_entry(conn, note, entry_no)
+            entry = _get_entry(conn, note, entry_no)
+            if respect_pin and entry["pinned"]:
+                remaining = conn.execute("SELECT COUNT(*) FROM note_data WHERE note_pk = ?", (note["note_pk"],)).fetchone()[0] - 1
+                return {"note_name": note["note_name"], "entry_no": entry_no, "remaining": remaining}
             conn.execute("DELETE FROM note_data WHERE note_pk = ? AND entry_no = ?", (note["note_pk"], entry_no))
             conn.execute("UPDATE note_id SET updated_at = ? WHERE note_pk = ?", (_now_iso(), note["note_pk"]))
             remaining = conn.execute("SELECT COUNT(*) FROM note_data WHERE note_pk = ?", (note["note_pk"],)).fetchone()[0]
@@ -1662,7 +1669,7 @@ class Tools:
             number = _to_int(entry_no, None, "entry_no")
             if number is None:
                 raise NoteError("entry_no is required - agent_notes_read shows each entry's number.")
-            result = await asyncio.to_thread(delete_entry_db, self.valves.NOTES_DB_PATH, validate_name(name), number)
+            result = await asyncio.to_thread(delete_entry_db, self.valves.NOTES_DB_PATH, validate_name(name), number, True)
         except (ValueError, sqlite3.Error) as e:
             return _error(e)
         return {"success": True, **result}
