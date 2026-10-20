@@ -162,6 +162,32 @@ class CleanBodyTests(unittest.TestCase):
         self.assertIn("> q", tool._clean_body("yes\n&gt; q", False))
 
 
+class PreviewTests(Base):
+    def test_clean_preview(self):
+        self.assertEqual(mod.clean_preview("Thanks &amp; see you\n\n&gt; Hey Gordon, &gt; &gt; I&#039;ve tried it"), "Thanks & see you Hey Gordon, I've tried it")
+        self.assertEqual(mod.clean_preview("> Hey Gordon, thanks"), "Hey Gordon, thanks")
+        self.assertEqual(mod.clean_preview("if a > b then stop"), "if a > b then stop")
+        self.assertEqual(mod.clean_preview("> quoted", "keep"), "> quoted")
+        self.assertEqual(len(mod.clean_preview("word " * 100)), 139)
+
+    def test_list_emails_shows_clean_previews(self):
+        fake = FakeNC()
+        orig = fake.__call__
+
+        def patched(method, url, **kw):
+            r = orig(method, url, **kw)
+            data = r.json()["ocs"]["data"]
+            if isinstance(data, list):
+                for m in data:
+                    m["previewText"] = "&gt; Hi &gt; there &amp; all"
+            return r
+
+        self.run_with(patched)
+        out = self.tool.list_emails()
+        self.assertIn("Preview: Hi there & all", out)
+        self.assertNotIn("&gt;", out)
+
+
 class MarkTests(Base):
     def test_mark_unread(self):
         fake = self.run_with(FakeNC())

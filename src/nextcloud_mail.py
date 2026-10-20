@@ -1,7 +1,7 @@
 """
 title: Nextcloud Mail
 description: Read (and optionally send) email through the Nextcloud Mail app's OCS API, using a Nextcloud app password.
-version: 0.5.0
+version: 0.5.1
 requirements: requests
 """
 
@@ -100,6 +100,17 @@ def clean_email_text(body: str, is_html: bool, quoted: str = "omit") -> str:
     return re.sub(r"\n\s*\n+", "\n\n", text).strip()
 
 
+def clean_preview(text: str, quoted: str = "omit", limit: int = 140) -> str:
+    """A list preview as one line: entities decoded, links as words, and (unless quoted is 'keep') the '>' marks of quoted lines dropped. Nextcloud
+    flattens a preview's line breaks, so quote marks show up as lone '>' tokens in the text; they are removed when the preview starts with
+    one or has several, so a single 'a > b' in a sentence stays."""
+    flat = " ".join(clean_email_text(text, False, "keep").split())
+    marks = re.findall(r"(?:^|\s)>+(?=\s|$)", flat)
+    if (quoted or "omit").strip().lower() != "keep" and (flat.startswith(">") or len(marks) >= 2):
+        flat = " ".join(re.sub(r"(?:^|\s)>+(?=\s|$)", " ", flat).split())
+    return flat[:limit].rstrip()
+
+
 class MailError(RuntimeError):
     """A failed Nextcloud call, keeping the HTTP status so errors can be explained."""
 
@@ -129,7 +140,7 @@ class Tools:
         )
         QUOTED_TEXT: str = Field(
             default="omit",
-            description="What read_email does with the quoted earlier messages in a reply (lines starting with '>'): omit = replace a quote at the end of the mail with one line saying who it quoted (a quote with the sender's answers written between its lines is kept), clean = keep every quote but drop the '>' marks and indent it, keep = leave it as written.",
+            description="What read_email and list_emails do with the quoted earlier messages in a reply (lines starting with '>'): omit = replace a quote at the end of the mail with one line saying who it quoted (a quote with the sender's answers written between its lines is kept), clean = keep every quote but drop the '>' marks and indent it, keep = leave it as written.",
         )
         MARK_READ_ON_OPEN: bool = Field(
             default=True,
@@ -354,7 +365,7 @@ class Tools:
                 flags = m.get("flags", {})
                 state = "read" if flags.get("seen") else "UNREAD"
                 attach = " 📎" if flags.get("hasAttachments") else ""
-                preview = (m.get("previewText") or "").strip().replace("\n", " ")[:140]
+                preview = clean_preview(m.get("previewText") or "", self.valves.QUOTED_TEXT)
                 lines.append(
                     f"id {m['databaseId']} | {self._date(m.get('dateInt'))} | {state}{attach}\n"
                     f"  From: {self._addrs(m.get('from'))}\n"
