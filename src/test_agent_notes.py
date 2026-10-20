@@ -9,6 +9,7 @@ from collections import Counter as collections_counter
 import shutil
 import sqlite3
 import tempfile
+import typing
 import unittest
 from typing import Optional
 from pathlib import Path
@@ -25,6 +26,7 @@ class NotesTestCase(unittest.TestCase):
         self.tool.valves.MIN_SUMMARY_CHARS = 0  # tests use tiny notes; the short-note rule has its own tests
         self.tool.valves.STRONG_SPREAD = False  # strong memories are a fixed top-N unless a test asks for the random draw
         self.tool.valves.VERBOSE_FIELDS = "author,created_at,hits,weight"  # verbose = everything here; VerboseFieldsTests covers the default
+        self.tool.valves.RESULT_FORMAT = "pretty"  # replies stay dicts here; ResultFormatTests covers the other formats
         mod._overlong.clear()  # too-long retry counts are kept module-wide
 
     def tearDown(self):
@@ -1895,6 +1897,7 @@ class VerboseFieldsTests(unittest.TestCase):
         self.tool = mod.Tools()
         self.tool.valves.NOTES_DB_PATH = self.db
         self.tool.valves.STRONG_SPREAD = False
+        self.tool.valves.RESULT_FORMAT = "pretty"
         self.run = asyncio.run
         self.run(self.tool.agent_notes_create("n", "first entry", "a note", author_name="Alice"))
         self.run(self.tool.agent_notes_append("n", "second entry about needles", author_name="Bob", weight="9"))
@@ -1950,6 +1953,67 @@ class VerboseFieldsTests(unittest.TestCase):
     def test_the_timestamp_is_what_recent_means(self):
         out = self.run(self.tool.agent_notes_read("n", verbose=True))
         self.assertTrue(all(len(e["created_at"]) > 20 for e in out["entries"]))
+
+
+class ResultFormatTests(unittest.TestCase):
+    """RESULT_FORMAT: Open WebUI indents a dict reply by two spaces; a string passes through, so the tool can send it leaner."""
+
+    SAMPLE = {"success": True, "note_name": "n", "tags": ["a", "b"], "entries": [{"entry_no": 1, "text": "one \u2014 \"quoted\""}, {"entry_no": 2, "text": "two"}],
+              "strong_memories": {"positive": [{"entry_no": 3, "text": "x" * 100}], "negative": []}, "note": "ok"}
+
+    def test_pretty_leaves_the_dict_alone(self):
+        self.assertIs(mod.render_result(self.SAMPLE, "pretty"), self.SAMPLE)
+        self.assertIs(mod.render_result(self.SAMPLE, ""), self.SAMPLE)
+        self.assertIs(mod.render_result(self.SAMPLE, "nonsense"), self.SAMPLE)
+
+    def test_every_format_is_the_same_json(self):
+        for mode in ("lines", "compact"):
+            out = mod.render_result(self.SAMPLE, mode)
+            self.assertIsInstance(out, str)
+            self.assertEqual(json.loads(out), self.SAMPLE)
+        self.assertEqual(json.loads(mod.render_result([1, {"a": 2}], "lines")), [1, {"a": 2}])
+
+    def test_compact_is_one_line_and_lines_puts_each_entry_on_its_own(self):
+        self.assertNotIn("\n", mod.render_result(self.SAMPLE, "compact"))
+        out = mod.render_result(self.SAMPLE, "lines")
+        self.assertIn('{"entry_no":1,"text":"one \u2014 \\"quoted\\""},\n{"entry_no":2,"text":"two"}', out)
+        self.assertEqual(out.splitlines()[0], '{"success":true,')
+        self.assertNotIn("  ", out)  # no indentation
+        self.assertLess(len(out), len(json.dumps(self.SAMPLE, indent=2, ensure_ascii=False)))
+
+    def test_non_dict_results_pass_through(self):
+        self.assertEqual(mod.render_result("text", "lines"), "text")
+        self.assertIsNone(mod.render_result(None, "compact"))
+
+    def test_tool_methods_honour_the_valve_and_keep_their_specs(self):
+        import inspect
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        tool = mod.Tools()
+        tool.valves.NOTES_DB_PATH = str(Path(tmp) / "n.sqlite3")
+        self.assertEqual(tool.valves.RESULT_FORMAT, "lines")
+        created = asyncio.run(tool.agent_notes_create("n", "one"))
+        self.assertIsInstance(created, str)
+        self.assertTrue(json.loads(created)["success"])
+        tool.valves.RESULT_FORMAT = "pretty"
+        self.assertIsInstance(asyncio.run(tool.agent_notes_append("n", "two")), dict)
+        # what Open WebUI builds a tool's spec and extra parameters from must still be there on the wrapped method
+        sig = inspect.signature(tool.agent_notes_create)
+        self.assertIn("continues", sig.parameters)
+        self.assertIn("__model__", sig.parameters)
+        self.assertTrue(inspect.iscoroutinefunction(tool.agent_notes_create))
+        self.assertIn("Start a new note", tool.agent_notes_create.__doc__)
+        self.assertEqual(tool.agent_notes_create.__name__, "agent_notes_create")
+        self.assertIn("text", typing.get_type_hints(tool.agent_notes_create))
+
+    def test_curation_tool_has_no_valve_and_keeps_open_webuis_formatting(self):
+        import agent_notes_curation as cur
+        self.assertNotIn("RESULT_FORMAT", cur.Tools().valves.model_dump())
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        tool = cur.Tools()
+        tool.valves.NOTES_DB_PATH = str(Path(tmp) / "n.sqlite3")
+        self.assertIsInstance(asyncio.run(tool.agent_notes_delete("missing")), dict)
 
 
 if __name__ == "__main__":

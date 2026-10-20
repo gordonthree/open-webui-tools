@@ -80,6 +80,7 @@ class SharedDatabaseTests(unittest.TestCase):
         self.a, self.b = core.Tools(), curation.Tools()
         self.a.valves.NOTES_DB_PATH = self.b.valves.NOTES_DB_PATH = self.db
         self.a.valves.MIN_SUMMARY_CHARS = 0
+        self.a.valves.RESULT_FORMAT = "pretty"  # these tests read dicts
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)

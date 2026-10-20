@@ -87,7 +87,8 @@ def build(source: str, name: str) -> str:
             drop = (node.name in all_methods and node.name not in spec["methods"]) or node.name in spec["drop_private"]
             if drop:
                 end = node.end_lineno + (1 if lines[node.end_lineno:node.end_lineno + 1] == ["\n"] else 0)  # and the blank line after it
-                cuts.append((node.lineno, end))
+                first = min([node.lineno] + [d.lineno for d in node.decorator_list])  # a decorator belongs to the method it decorates
+                cuts.append((first, end))
         elif isinstance(node, ast.ClassDef) and node.name == "Valves" and spec["valves"] is not None:
             for field in node.body:
                 if isinstance(field, ast.AnnAssign) and field.target.id not in spec["valves"]:
