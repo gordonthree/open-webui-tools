@@ -75,6 +75,15 @@ Current tools:
   one line (`[Quoted earlier message omitted from "Hannah Lee" ...: 4 lines]`); if the sender wrote answers between the quoted lines the
   quotes are kept, indented, without the `>` marks, because the answers need them; `clean` always does that; `keep` leaves the quoting as
   written. `MAX_BODY_CHARS` applies after cleaning. `list_emails` previews get the same treatment (entities, links, and the lone `>` marks Nextcloud leaves in a flattened preview of a reply). Tests: `cd src && python3 -m unittest test_nextcloud_mail`.
+- `memory_entry_check.py` (v0.1.0) → `check_memory_entry(text)` — a writing-rules checker for the `mara-stories` memory index. Models can't count characters
+  and skip steps in long instructions, so the rules live in code: given a draft entry it returns the character count, the **problems** to fix
+  (over the limit, no `Title (file-name.md).` start, line breaks or markdown, labelled parts, digits, spelled-out numbers, exact schedules such as
+  "monthly", a banned stock phrase, "Mara" in the third person) and **warnings** worth a look (about 50 over the target, too short, no "I", no feeling
+  word, a list of things, more than one quotation, "Gordon" in a backstory memory). The story's own title is exempt from the number checks.
+  Valves `TARGET_CHARS` (400), `LIMIT_CHARS` (500), `BANNED_PHRASES` (default: spin cycle, low-voltage, quiet strength). It saves nothing. Checked against
+  the 19 lab drafts of 2026-10-20: it passes the good ones (all four of the local model's variant-D entries pass), and catches the real failures
+  (spelled-out "nine"/"seventeen", "recording daily", "too many spin cycles", a missing title, a 510-character draft). Attached to `medium-mara`
+  and `mara-duo`; `memory-guidance.md` ("Before I write") tells her to run it until it reports no problems. Tests: `cd src && python3 -m unittest test_memory_entry_check`.
 - `folder_chat_search.py` → `search_folder_chats(query, count, start_timestamp, end_timestamp)` and `view_folder_chat(chat_id, first_message)` (v0.2.0) — Open WebUI's built-in `search_chats` has no way to
   limit where it looks; this one searches only the chat folders named in the owner's valve `FOLDERS` (comma-separated, folder names in any case
   or ids; `INCLUDE_SUBFOLDERS` default on). The model cannot pick, see or override the folders, and an empty `FOLDERS` makes the tool refuse
@@ -705,7 +714,7 @@ Each tool has a matching `test_*.py` file that simulates ComfyUI's HTTP API with
 module — no live ComfyUI or Open WebUI server needed. Run all of them from `src/`:
 
 ```
-python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes test_agent_notes_split test_agent_duo test_voice_memo test_openrouter_image test_drum_machine test_vision_describe test_folder_chat_search test_nextcloud_mail -v
+python -m unittest test_comfy_sdxl_direct test_comfy_sdxl_graph test_comfy_sdxl_retrieve test_comfy_sdxl_poses test_agent_notes test_agent_notes_split test_agent_duo test_voice_memo test_openrouter_image test_drum_machine test_vision_describe test_folder_chat_search test_nextcloud_mail test_memory_entry_check -v
 ```
 
 `scripts/import_server_history.py` has its own test file the same way — run from `scripts/`:
