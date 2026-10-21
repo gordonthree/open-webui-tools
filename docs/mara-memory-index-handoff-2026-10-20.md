@@ -15,6 +15,10 @@ note `mara-stories`, so Mara can recall "something from her past" when a feeling
 - Builtin tools trimmed on `medium-mara` and `mara-duo` (about 3,200 tokens less per request). Sub-agents stays on because the `timer` tool lives under it.
 - Corrections appended: `shared-history` #199 (pinned) and `autonomy-log` #249. **Unpin #199 when the indexing is finished.**
 
+- Cleanup, late 2026-10-20 (backup `tmp/agent_notes_before_cleanup_20261020T230730.sqlite3`): `mara-stories` #2 no longer says "'90s" or "He died 2003" (those clashed with Mara being in her
+  mid thirties; now "long ago"). `shared-history` #198 and #200-#205 (duplicates from the three parallel test chats) were deleted and replaced by #206. #196, #197 and the pinned #199 were kept.
+  Lesson: dates and ages in entries cause continuity errors; the no-numbers rule exists partly for this. Entries 7 and 10 still hold ages (sixty-three, twenty-three); they do not clash.
+
 ## Findings (the lab and three live runs)
 - The local Qwen 27B (`medium-mara`) is the best at this: warmest voice, best feeling, uses Brian's role as told, follows the bedtime directive. Slow (about 4-6 minutes a turn).
 - Nemotron Super/Ultra are fast but flat when the message is a list of edits; they edit the previous draft instead of rewriting, ignore a conditional fact ("if Brian is in the story..."), and
