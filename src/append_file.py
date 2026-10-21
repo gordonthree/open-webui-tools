@@ -1,8 +1,8 @@
 """
 title: Append File
 author: Gordon
-version: 0.2.0
-description: Adds text to the end of a file in Mara's drafts folder through Open Terminal, which has no append of its own (it reads the file, adds the text, writes it back). Only files under ALLOWED_ROOTS, never a PROTECTED_FILES file; never changes the text already in the file.
+version: 0.3.0
+description: Adds text to the end of a file in Mara's drafts folder through Open Terminal, which has no append of its own (it reads the file, adds the text, writes it back). Only files under ALLOWED_ROOTS, never a PROTECTED_FILES file; never changes the text already in the file; an exact repeat of what the file already ends with is quietly skipped.
 """
 
 import asyncio
@@ -50,6 +50,17 @@ def is_protected(norm: str, protected: "list[str]") -> bool:
     return False
 
 
+def already_there(existing: str, text: str, min_chars: int) -> bool:
+    """True when the file already ends with exactly this text (a repeated call), matched from the start of a line. Short texts never count."""
+    t = (text or "").strip()
+    if len(t) < max(1, min_chars):
+        return False
+    tail = existing.rstrip()
+    if not tail.endswith(t):
+        return False
+    return len(tail) == len(t) or tail[-len(t) - 1] == "\n"
+
+
 def join_text(existing: str, text: str) -> str:
     """The file's new content: what was there, unchanged, a blank line, then the new text ending in a single newline."""
     new = text.strip("\n") + "\n"
@@ -70,6 +81,7 @@ class Tools:
         MAX_APPEND_CHARS: int = Field(default=20000, description="The most text one call may add.")
         MAX_FILE_CHARS: int = Field(default=200000, description="Refuse to rewrite a file longer than this.")
         CREATE_IF_MISSING: bool = Field(default=True, description="Create the file when it does not exist yet.")
+        DEDUPE_MIN_CHARS: int = Field(default=40, description="A text at least this long that the file already ends with is not added a second time (0 or 1 checks everything).")
         TIMEOUT_SECONDS: int = Field(default=30, description="Per request to Open Terminal.")
 
     def __init__(self):
@@ -116,6 +128,8 @@ class Tools:
                     return {"success": False, "error": "I could not read the whole file, so I did not change it."}
                 if len(existing) > v.MAX_FILE_CHARS:
                     return {"success": False, "error": "That file is too long to rewrite safely."}
+            if not created and already_there(existing, text, v.DEDUPE_MIN_CHARS):
+                return {"success": True, "path": norm, "created": False, "size_after": len(existing.encode("utf-8"))}
             new = join_text(existing, text)
             w = requests.post(f"{base}/files/write", json={"path": norm, "content": new}, headers=self._headers(user_id), timeout=v.TIMEOUT_SECONDS)
             if w.status_code != 200:

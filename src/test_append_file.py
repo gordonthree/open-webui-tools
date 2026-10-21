@@ -277,5 +277,59 @@ class TestUser(unittest.TestCase):
         self.assertTrue(all("X-User-Id" not in h for h in fake.headers_seen))
 
 
+class TestRepeats(unittest.TestCase):
+    PLAN = "## Step 5: Beat map\n| beat | source |\n| 1 | the beam turns for her |"
+
+    def test_an_exact_repeat_is_skipped_but_looks_like_success(self):
+        t, fake = make({NOTES: "# Notes\n"})
+        first = run(t, NOTES, self.PLAN)
+        after_first = fake.files[NOTES]
+        posts = len([c for c in fake.calls if c[0] == "POST"])
+        second = run(t, NOTES, self.PLAN)
+        self.assertTrue(first["success"] and second["success"])
+        self.assertEqual(fake.files[NOTES], after_first)
+        self.assertEqual(len([c for c in fake.calls if c[0] == "POST"]), posts)
+        self.assertNotIn("error", second); self.assertNotIn("warning", second); self.assertNotIn("duplicate", second)
+        self.assertEqual(second["path"], NOTES); self.assertFalse(second["created"])
+        self.assertEqual(second["size_after"], len(after_first.encode()))
+
+    def test_a_repeat_with_different_surrounding_newlines_is_still_a_repeat(self):
+        t, fake = make({NOTES: "# Notes\n"})
+        run(t, NOTES, self.PLAN)
+        before = fake.files[NOTES]
+        run(t, NOTES, "\n\n" + self.PLAN + "\n\n\n")
+        self.assertEqual(fake.files[NOTES], before)
+
+    def test_different_text_is_added(self):
+        t, fake = make({NOTES: "# Notes\n"})
+        run(t, NOTES, self.PLAN); run(t, NOTES, self.PLAN + "\n| 2 | the tea is too hot |")
+        self.assertIn("the tea is too hot", fake.files[NOTES])
+
+    def test_the_same_text_earlier_in_the_file_is_not_a_repeat(self):
+        t, fake = make({NOTES: self.PLAN + "\n\n## Something later\nlots of other text here\n"})
+        run(t, NOTES, self.PLAN)
+        self.assertEqual(fake.files[NOTES].count(self.PLAN), 2)
+
+    def test_a_sentence_ending_the_same_way_is_not_a_repeat(self):
+        existing = "She walked all night and the beam turned for her across the water.\n"
+        t, fake = make({NOTES: existing})
+        run(t, NOTES, "the beam turned for her across the water.")   # 41 characters, but it matches only the end of a line, not a whole line
+        self.assertEqual(fake.files[NOTES].count("the beam turned"), 2)
+
+    def test_short_texts_are_always_added(self):
+        t, fake = make({NOTES: "x\n\n---\n"})
+        run(t, NOTES, "---")
+        self.assertEqual(fake.files[NOTES].count("---"), 2)
+
+    def test_the_check_can_cover_everything_or_be_unnecessary(self):
+        t, fake = make({NOTES: "x\n\n---\n"}, DEDUPE_MIN_CHARS=0)
+        run(t, NOTES, "---")
+        self.assertEqual(fake.files[NOTES].count("---"), 1)
+
+    def test_a_new_file_is_never_a_repeat(self):
+        t, fake = make()
+        self.assertTrue(run(t, ROOT + "/n/new.md", self.PLAN)["created"])
+
+
 if __name__ == "__main__":
     unittest.main()
