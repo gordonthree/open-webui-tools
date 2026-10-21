@@ -93,9 +93,15 @@ def ask(messages, timeout=1500, poll=4):
             g = requests.get(f"{url}/api/v1/chats/{chat_id}", headers=H(key), timeout=30); g.raise_for_status()
             m = (((g.json().get("chat") or {}).get("history") or {}).get("messages") or {}).get(asst_id) or {}
             if m.get("done"):
-                text = re.sub(r"<details\b.*?</details>", "", m.get("content") or "", flags=re.S | re.I)
+                raw = m.get("content") or ""
+                thinking = "\n\n".join(re.findall(r"<details\b.*?</details>", raw, flags=re.S | re.I) + re.findall(r"<think>.*?</think>", raw, flags=re.S))
+                for o in m.get("output") or []:  # newer Open WebUI keeps the reasoning as output items, not in the content
+                    if o.get("type") == "reasoning":
+                        parts = o.get("content") or o.get("reasoning_details") or []
+                        thinking += "\n\n" + (parts if isinstance(parts, str) else "".join(p.get("text", "") for p in parts if isinstance(p, dict)))
+                text = re.sub(r"<details\b.*?</details>", "", raw, flags=re.S | re.I)
                 text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
-                return {"text": text, "usage": m.get("usage"), "seconds": round(time.time() - t, 1), "error": m.get("error")}
+                return {"text": text, "thinking": thinking, "usage": m.get("usage"), "seconds": round(time.time() - t, 1), "error": m.get("error")}
         raise TimeoutError("turn did not finish")
     finally:
         try:

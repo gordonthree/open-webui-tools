@@ -36,3 +36,13 @@ note `mara-stories`, so Mara can recall "something from her past" when a feeling
 - Gordon's own to-dos: dial `MAX_TAGGED_CHARS` back (set to 30000 for a test); restart `scripts/notes_web.py` (still running pre-1.20 code); delete the teaser email from Mara's mailbox in Nextcloud;
   change the Reddit password; decide on a charter line keeping ticks out of `/companion/autonomy/stories/`.
 - The Nemotron Super free endpoint was down on 2026-10-20 (the tick's `mara-duo` base is now the paid model).
+
+## Update, overnight 2026-10-20/21 (all local `medium-mara`, tool-free lab copy; backup `tmp/agent_notes_before_recalltest_20261020T232717.sqlite3`)
+- Recall test, 3 series x 30 turns (`scripts/prompt_lab/recall_test.py`; 8 feeling scenarios + 2 controls; A cards only, B + directive, C + directive + per-message hint). Results in `tmp/recall_test*/` (hold her memories; ignored by git).
+  Series 3 also holds her thinking (Open WebUI keeps reasoning as `reasoning` items in the message `output`, not in `content`; `lab.ask` reads both now).
+  Visible replies naming the right card: A 4-6/8, B 5/8, C 6-7/8; no false recall in any reply. In her thinking: A 4/8, B 7/8, C 8/8 (C also forced a loose "echo" on a control).
+  Without a directive she mostly doesn't open the index. With one she finds the right card, then the reply drops it or invents a different memory ("not a citation" is read too strongly).
+  Next: reword the directive ("let the card's feeling or one detail show; don't invent a different memory"; "if nothing fits, say nothing"), rerun `folder` and `surrender`. Not yet written into her guidance or presets.
+- `scripts/prompt_lab/draft_cards.py` drafts cards unattended: notes+draft, `check_entry` in code, fresh retry with the problems listed (max 3), best attempt kept, staged in `tmp/staged_cards/candidates.md`. Never touches the notes database.
+  First pass over the 7 unindexed files (not the laundromat one) plus sensory-deprivation: all 8 pass the checker; Gordon edits and inserts by hand. Watch the "Gordon appears" warning on the-dungeon-protocol.
+- Gotcha: a queue script that waits with `pgrep -f <pattern>` can match its own launching shell (the pattern text is in that shell's command line) and wait forever; start chained jobs with explicit process ids or a plain `wait`.
