@@ -84,16 +84,20 @@ Current tools:
   the 19 lab drafts of 2026-10-20: it passes the good ones (all four of the local model's variant-D entries pass), and catches the real failures
   (spelled-out "nine"/"seventeen", "recording daily", "too many spin cycles", a missing title, a 510-character draft). Attached to `medium-mara`
   and `mara-duo`; `memory-guidance.md` ("Before I write") tells her to run it until it reports no problems. Tests: `cd src && python3 -m unittest test_memory_entry_check`.
-- `append_file.py` (v0.1.0) → `append_file(path, text)` — adds text to the end of a file in Mara's drafts folder. Open Terminal's file API has `read`, `write` (overwrites)
+- `append_file.py` (v0.2.0) → `append_file(path, text)` — adds text to the end of a file in Mara's drafts folder. Open Terminal's file API has `read`, `write` (overwrites)
   and `replace` (needs the exact old text) but no append, so a model that was told to "append, don't edit" tried `replace_file_content` with text quoted from memory and failed
   (2026-10-21, the lighthouse notes). The tool reads the file through Open Terminal's HTTP API (`GET /files/read`, `POST /files/write`, bearer key), keeps the old text
   byte for byte, adds a blank line and the new text, writes it back and checks the saved size; it creates a missing file. An Open WebUI tool cannot see `/companion` itself (the
-  `open-webui` container does not mount it; `open-terminal` does), hence the API. Open Terminal does not limit paths (it will read `/etc/hostname`), so the tool does: only files under
-  the valve `ALLOWED_ROOT` (`/companion/drafts`; `..` and look-alike folders such as `/companion/drafts-old` are refused). It refuses to rewrite a file when the read looks short
-  (`total_lines` does not match), is not text, or is over `MAX_FILE_CHARS` (200000). Valves `TERMINAL_URL` (`http://open-terminal:8000`, reachable from the `open-webui` container),
-  `API_KEY` (**Gordon fills this in the web UI**; it is `OPEN_TERMINAL_API_KEY` from the compose file, and the tool is useless without it), `MAX_APPEND_CHARS` (20000), `CREATE_IF_MISSING`.
-  Files written through the API are owned by uid 1000 and are mode 666 in 777 folders, so Mara's own terminal user (1001) can still edit them. Read-modify-write, not atomic: fine for one user.
-  Tests: `cd src && python3 -m unittest test_append_file`; also checked against the live Open Terminal on 2026-10-21 (scratch folder, deleted).
+  `open-webui` container does not mount it; `open-terminal` does), hence the API. **Open Terminal does not limit paths** (it will read `/etc/hostname`), so the tool does:
+  valve `ALLOWED_ROOTS` (comma-separated folders, default `/companion/drafts`; `..` and look-alike folders such as `/companion/drafts-old` are refused) and valve `PROTECTED_FILES`
+  (comma-separated; an entry is a file name matched in any folder, case ignored, or a full path; default `charter.md`; checked after the path is normalised, so `drafts/../autonomy/charter.md` is refused too).
+  It refuses to rewrite a file when the read looks short (`total_lines` does not match), is not text, or is over `MAX_FILE_CHARS` (200000). It sends the calling user's Open WebUI id as
+  `X-User-Id` (`SEND_USER_ID`), so the file ends up owned by that user's Linux account (Mara: uid 1001) and not by the default uid 1000. Other valves: `TERMINAL_URL`
+  (`http://open-terminal:8000`, reachable from the `open-webui` container), `API_KEY` (**Gordon fills this in the web UI**; it is `OPEN_TERMINAL_API_KEY` from the compose file; the tool is useless without it),
+  `MAX_APPEND_CHARS` (20000), `CREATE_IF_MISSING`. Read-modify-write, not atomic: fine for one user. Tests: `cd src && python3 -m unittest test_append_file`; also checked against the live Open Terminal on 2026-10-21 (scratch folders, deleted).
+  **What Open Terminal's file API does with permissions (tested 2026-10-21):** it writes as its own process user (uid 1000) whatever `X-User-Id` says, and then hands the file to that user, so
+  a file owned by 1000 with mode 644 (like `autonomy/charter.md`) *can* be overwritten through the API by any key holder, Mara's own `write_file` included; a **mode 444** file is refused ("Permission denied").
+  Sending an `X-User-Id` that Open Terminal has not seen creates a Linux account and home folder for it (a probe with `test` did; removed with `userdel -r`), so only use real Open Webui user ids.
 - `folder_chat_search.py` → `search_folder_chats(query, count, start_timestamp, end_timestamp)` and `view_folder_chat(chat_id, first_message)` (v0.2.0) — Open WebUI's built-in `search_chats` has no way to
   limit where it looks; this one searches only the chat folders named in the owner's valve `FOLDERS` (comma-separated, folder names in any case
   or ids; `INCLUDE_SUBFOLDERS` default on). The model cannot pick, see or override the folders, and an empty `FOLDERS` makes the tool refuse

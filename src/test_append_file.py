@@ -27,6 +27,7 @@ class FakeTerminal:
         self.files = dict(files or {})
         self.key = key
         self.calls = []
+        self.headers_seen = []
         self.write_size_offset = 0   # to simulate a bad write
         self.truncate_reads = False  # to simulate a read that returns less than the file
         self.fail_writes = False
@@ -38,6 +39,7 @@ class FakeTerminal:
 
     def get(self, url, params=None, headers=None, timeout=None):
         self.calls.append(("GET", url, params))
+        self.headers_seen.append(dict(headers or {}))
         if self.down:
             raise real_requests.ConnectionError("down")
         if not self._auth(headers or {}):
@@ -52,6 +54,7 @@ class FakeTerminal:
 
     def post(self, url, json=None, headers=None, timeout=None):
         self.calls.append(("POST", url, json))
+        self.headers_seen.append(dict(headers or {}))
         if not self._auth(headers or {}):
             return Resp(401, {"detail": "Invalid API key"})
         if self.fail_writes:
@@ -70,29 +73,29 @@ def make(files=None, **valves):
     return t, fake
 
 
-def run(t, path, text):
-    return json.loads(asyncio.run(t.append_file(path, text)))
+def run(t, path, text, user=None):
+    return json.loads(asyncio.run(t.append_file(path, text, __user__=user)))
 
 
 class TestPaths(unittest.TestCase):
     def test_accepts_files_under_the_root(self):
-        self.assertEqual(a.clean_path(NOTES, ROOT), (NOTES, None))
-        self.assertEqual(a.clean_path(ROOT + "/x.md", ROOT)[0], ROOT + "/x.md")
+        self.assertEqual(a.clean_path(NOTES, [ROOT]), (NOTES, None))
+        self.assertEqual(a.clean_path(ROOT + "/x.md", [ROOT])[0], ROOT + "/x.md")
 
     def test_normalises_dots_that_stay_inside(self):
-        self.assertEqual(a.clean_path(ROOT + "/lighthouse/../lighthouse/./n.md", ROOT)[0], ROOT + "/lighthouse/n.md")
+        self.assertEqual(a.clean_path(ROOT + "/lighthouse/../lighthouse/./n.md", [ROOT])[0], ROOT + "/lighthouse/n.md")
 
     def test_refuses_traversal_out_of_the_root(self):
         for bad in (ROOT + "/../autonomy/stories/dreams/the-lighthouse.md", ROOT + "/lighthouse/../../charter.md", "/etc/hostname"):
-            self.assertIsNone(a.clean_path(bad, ROOT)[0], bad)
+            self.assertIsNone(a.clean_path(bad, [ROOT])[0], bad)
 
     def test_refuses_a_sibling_that_shares_the_prefix(self):
-        self.assertIsNone(a.clean_path("/companion/drafts-old/x.md", ROOT)[0])
-        self.assertIsNone(a.clean_path("/companion/drafts2/x.md", ROOT)[0])
+        self.assertIsNone(a.clean_path("/companion/drafts-old/x.md", [ROOT])[0])
+        self.assertIsNone(a.clean_path("/companion/drafts2/x.md", [ROOT])[0])
 
     def test_refuses_the_root_a_folder_and_relative_or_empty_paths(self):
         for bad in (ROOT, ROOT + "/", ROOT + "/lighthouse/", "lighthouse/notes.md", "", "   ", None):
-            self.assertIsNone(a.clean_path(bad, ROOT)[0], repr(bad))
+            self.assertIsNone(a.clean_path(bad, [ROOT])[0], repr(bad))
 
 
 class TestJoin(unittest.TestCase):
@@ -194,6 +197,84 @@ class TestRefusals(unittest.TestCase):
         t, fake = make({NOTES: "x\n"}); fake.write_size_offset = 3
         r = run(t, NOTES, "y")
         self.assertTrue(r["success"]); self.assertIn("warning", r)
+
+
+class TestFolders(unittest.TestCase):
+    def test_parse_list(self):
+        self.assertEqual(a.parse_list(" /a/b , ,/c/d,"), ["/a/b", "/c/d"])
+        self.assertEqual(a.parse_list(""), [])
+        self.assertEqual(a.parse_list(None), [])
+
+    def test_several_folders(self):
+        roots = ["/companion/drafts", "/companion/collaboration"]
+        self.assertEqual(a.clean_path("/companion/collaboration/plan.md", roots)[0], "/companion/collaboration/plan.md")
+        self.assertEqual(a.clean_path("/companion/drafts/x.md", roots)[0], "/companion/drafts/x.md")
+        self.assertIsNone(a.clean_path("/companion/dreams/x.md", roots)[0])
+        self.assertIn("/companion/collaboration/", a.clean_path("/companion/dreams/x.md", roots)[1])
+
+    def test_traversal_between_allowed_folders_is_still_checked(self):
+        roots = ["/companion/drafts"]
+        self.assertIsNone(a.clean_path("/companion/drafts/../collaboration/x.md", roots)[0])
+
+    def test_no_usable_folder_means_nothing_is_allowed(self):
+        self.assertIsNone(a.clean_path(NOTES, [])[0])
+        self.assertIsNone(a.clean_path(NOTES, ["drafts"])[0])
+
+    def test_valve_with_a_list_end_to_end(self):
+        other = "/companion/collaboration/plan.md"
+        t, fake = make({other: "p\n"}, ALLOWED_ROOTS="/companion/drafts, /companion/collaboration")
+        self.assertTrue(run(t, other, "q")["success"])
+        self.assertFalse(run(t, "/companion/dreams/x.md", "q")["success"])
+
+
+class TestProtected(unittest.TestCase):
+    def test_a_name_matches_in_any_folder_and_any_case(self):
+        p = ["charter.md"]
+        for f in ("/companion/autonomy/charter.md", "/companion/drafts/charter.md", "/companion/drafts/Charter.MD"):
+            self.assertTrue(a.is_protected(f, p), f)
+        self.assertFalse(a.is_protected("/companion/drafts/charter.md.bak", p))
+        self.assertFalse(a.is_protected("/companion/drafts/my-charter.md", p))
+
+    def test_a_full_path_matches_only_that_file(self):
+        p = ["/companion/drafts/lighthouse/final.md"]
+        self.assertTrue(a.is_protected("/companion/drafts/lighthouse/final.md", p))
+        self.assertFalse(a.is_protected("/companion/drafts/other/final.md", p))
+
+    def test_protected_file_inside_an_allowed_folder_is_refused_without_any_call(self):
+        f = ROOT + "/charter.md"
+        t, fake = make({f: "keep\n"})
+        r = run(t, f, "x")
+        self.assertFalse(r["success"]); self.assertIn("protected", r["error"])
+        self.assertEqual(fake.calls, []); self.assertEqual(fake.files[f], "keep\n")
+
+    def test_a_dotted_route_to_a_protected_file_is_refused(self):
+        f = ROOT + "/charter.md"
+        t, fake = make({f: "keep\n"})
+        self.assertFalse(run(t, ROOT + "/lighthouse/../charter.md", "x")["success"])
+        self.assertEqual(fake.files[f], "keep\n")
+
+    def test_the_list_is_a_valve_and_can_be_empty_or_longer(self):
+        f = ROOT + "/charter.md"
+        t, fake = make({f: "a\n", ROOT + "/seed.md": "s\n"}, PROTECTED_FILES="")
+        self.assertTrue(run(t, f, "x")["success"])
+        t, fake = make({f: "a\n", ROOT + "/seed.md": "s\n"}, PROTECTED_FILES="charter.md, seed.md")
+        self.assertFalse(run(t, ROOT + "/seed.md", "x")["success"])
+
+
+class TestUser(unittest.TestCase):
+    def test_the_callers_id_is_sent_as_x_user_id(self):
+        t, fake = make({NOTES: "x\n"})
+        run(t, NOTES, "y", user={"id": "c63c2a9b-uuid", "name": "Gordon"})
+        self.assertTrue(fake.headers_seen)
+        self.assertTrue(all(h.get("X-User-Id") == "c63c2a9b-uuid" for h in fake.headers_seen))
+
+    def test_no_user_no_header_and_the_valve_can_switch_it_off(self):
+        t, fake = make({NOTES: "x\n"})
+        run(t, NOTES, "y")
+        self.assertTrue(all("X-User-Id" not in h for h in fake.headers_seen))
+        t, fake = make({NOTES: "x\n"}, SEND_USER_ID=False)
+        run(t, NOTES, "y", user={"id": "abc"})
+        self.assertTrue(all("X-User-Id" not in h for h in fake.headers_seen))
 
 
 if __name__ == "__main__":
