@@ -645,6 +645,23 @@ directly through ComfyUI's own UI, or from before job logging existed. `--dry-ru
 without writing. Bounded by the server's own history retention (cleared on restart), same as
 `retrieve_image`'s `history=<count>` mode.
 
+### Sample file server (scripts/serve_samples.py)
+
+A tiny read-only web server for listening to and downloading generated audio (or any file) from a browser, instead of
+copying files off the server by hand. Standard library only; tests in `scripts/test_serve_samples.py`.
+
+```
+python3 scripts/serve_samples.py                  # serves tmp/samples on 127.0.0.1:8899
+python3 scripts/serve_samples.py --dir DIR --port 9000
+ssh -L 8899:127.0.0.1:8899 <this-host>            # from another machine, then open http://127.0.0.1:8899/
+```
+
+It listens on localhost only unless `--host 0.0.0.0` is given (there is no login, so only on a trusted network). The index
+lists every file under the folder, newest first, with a player and a download link for audio; a text file named like an audio
+file (`clip.mp3` + `clip.txt`) is shown under its player as a caption. Range requests work, so long recordings can be
+sought. Only GET and HEAD are accepted, and any path that leaves the folder, including through a symlink, gets a 404.
+`tmp/` is gitignored scratch space, so samples put there are never committed.
+
 ### Notes web interface (scripts/notes_web.py)
 
 A standalone LAN web UI for the `agent_notes` database, run from the docker host with no OWUI
