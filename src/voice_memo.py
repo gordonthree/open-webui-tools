@@ -12,6 +12,7 @@ import asyncio
 import difflib
 import json
 import mimetypes
+import posixpath
 import re
 from datetime import datetime
 from pathlib import Path
@@ -267,6 +268,135 @@ def add_lead_in(mp3: bytes, ms: int) -> bytes:
     return first * max(0, round(ms / 1000 / seconds)) + mp3
 
 
+def resolve_voice(voice: Any, default: str) -> Tuple[str, str]:
+    """A usable Fish voice id and, if the model passed something invalid, a note saying the default was used."""
+    voice = "" if is_unset(voice) else str(voice).strip()
+    note = ""
+    if voice and not _VOICE_ID_RE.match(voice.lower()):
+        note = f"\nNote: voice {voice!r} is not a valid voice id (32 hex characters), so the default voice was used."
+        voice = ""
+    return (voice.lower() or default), note
+
+
+_FRONT_MATTER_RE = re.compile(r"\A---\n.*?\n---\n", re.S)
+_FENCE_RE = re.compile(r"^(```|~~~).*?(?:^\1[^\n]*$|\Z)", re.S | re.M)
+_HTML_RE = re.compile(r"<!--.*?-->|</?[A-Za-z][^>\n]{0,80}>", re.S)
+_RULE_RE = re.compile(r"^\s*(?:[-*_]\s*){3,}$", re.M)
+_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$", re.M)
+
+
+def speakable_text(raw: str) -> str:
+    """Plain words to read aloud from a text or Markdown file.
+
+    Drops front matter, code blocks, HTML-style tags (such as a stray </think>), images, heading and list marks,
+    and Markdown emphasis; keeps link text. Paragraph breaks (blank lines) are kept.
+    """
+    t = (raw or "").replace("\r\n", "\n").replace("\r", "\n")
+    t = _FRONT_MATTER_RE.sub("", t, count=1)
+    t = _FENCE_RE.sub("", t)
+    t = _HTML_RE.sub("", t)
+    t = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", t)
+    t = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", t)
+    t = _TABLE_SEP_RE.sub("", t)
+    t = _RULE_RE.sub("", t)
+    t = re.sub(r"^[ \t]*#{1,6}[ \t]*", "", t, flags=re.M)
+    t = re.sub(r"^[ \t]*>[ \t]?", "", t, flags=re.M)
+    t = re.sub(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+", "", t, flags=re.M)
+    t = t.replace("|", ", ")
+    t = re.sub(r"(\*\*|__)(.+?)\1", r"\2", t, flags=re.S)
+    t = re.sub(r"\*([^*\n]+)\*", r"\1", t)
+    t = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"\1", t)
+    t = t.replace("`", "")
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r" ?\n ?", "\n", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
+def split_for_speech(text: str, limit: int) -> List[str]:
+    """Cut text into pieces of at most `limit` characters, at paragraph ends, else sentence ends, else spaces."""
+    limit = max(200, int(limit))
+    pieces: List[str] = []
+    for para in re.split(r"\n\s*\n", text):
+        para = re.sub(r"\s*\n\s*", " ", para).strip()
+        if not para:
+            continue
+        if len(para) <= limit:
+            pieces.append(para)
+            continue
+        current = ""
+        for sentence in re.split(r"(?<=[.!?\u2026])\s+", para):
+            while len(sentence) > limit:
+                cut = sentence.rfind(" ", 0, limit)
+                cut = cut if cut > limit // 2 else limit
+                if current:
+                    pieces.append(current)
+                    current = ""
+                pieces.append(sentence[:cut].strip())
+                sentence = sentence[cut:].strip()
+            if current and len(current) + 1 + len(sentence) > limit:
+                pieces.append(current)
+                current = sentence
+            else:
+                current = f"{current} {sentence}".strip()
+        if current:
+            pieces.append(current)
+    # Pack neighbouring short pieces together so a file of many short paragraphs is a few requests, not dozens.
+    packed: List[str] = []
+    for piece in pieces:
+        if packed and len(packed[-1]) + 2 + len(piece) <= limit:
+            packed[-1] = f"{packed[-1]}\n\n{piece}"
+        else:
+            packed.append(piece)
+    return packed
+
+
+class TerminalError(RuntimeError):
+    def __init__(self, message: str, status: int = 0):
+        super().__init__(message)
+        self.status = status
+
+
+def terminal_read(valves: "Tools.Valves", path: str, start_line: int, end_line: int, user_id: str) -> Dict[str, Any]:
+    """Read a file through Open Terminal's HTTP API. Returns its JSON: {"path", "content", "total_lines"}.
+
+    Sending the Open WebUI user's id makes the terminal resolve ~ and relative paths in that user's own home folder.
+    """
+    headers = {"Authorization": f"Bearer {valves.OPEN_TERMINAL_API_KEY.strip()}"}
+    if user_id:
+        headers["X-User-Id"] = user_id
+    params: Dict[str, Any] = {"path": path, "end_line": end_line}
+    if start_line > 1:
+        params["start_line"] = start_line
+    try:
+        r = requests.get(
+            f"{valves.OPEN_TERMINAL_URL.rstrip('/')}/files/read",
+            headers=headers,
+            params=params,
+            timeout=valves.REQUEST_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as e:
+        raise TerminalError(f"Could not reach Open Terminal at {valves.OPEN_TERMINAL_URL}: {e}", -1)
+    if r.status_code >= 400:
+        detail = ""
+        try:
+            detail = str(r.json().get("detail", ""))
+        except Exception:
+            detail = (r.text or "")[:200]
+        raise TerminalError(f"Open Terminal HTTP {r.status_code}: {detail}", r.status_code)
+    try:
+        data = r.json()
+        data["content"]
+    except (ValueError, KeyError, TypeError):
+        raise TerminalError("Open Terminal did not return text for that file.", 415)
+    return data
+
+
+def path_allowed(path: str, prefixes: List[str]) -> bool:
+    """True if an absolute path, once cleaned of '..', is inside one of the allowed folders."""
+    clean = posixpath.normpath(path)
+    return any(clean == p or clean.startswith(p.rstrip("/") + "/") for p in prefixes)
+
+
 _SPEAKER_LINE_RE = re.compile(r"^([A-Za-z][A-Za-z0-9 .'\-]{0,29}?)\s*[:\uff1a]\s*\**\s*(.*)$")
 
 
@@ -370,6 +500,22 @@ class Tools:
             default=250,
             description="Milliseconds of silence put in front of each recording, so the first word is not clipped while a player or earbuds wake up. Fish's audio starts almost instantly. 0 = off.",
         )
+        OPEN_TERMINAL_URL: str = Field(
+            default="http://open-terminal:8000",
+            description="Address of the Open Terminal server, as seen from the Open WebUI container. Used by record_voice_file.",
+        )
+        OPEN_TERMINAL_API_KEY: str = Field(
+            default="",
+            description="Open Terminal's API key (OPEN_TERMINAL_API_KEY in the compose .env). Needed by record_voice_file. Anyone who can call that tool can then read files the terminal can read, within ALLOWED_FILE_PATHS.",
+        )
+        ALLOWED_FILE_PATHS: str = Field(
+            default="/companion,/home",
+            description="Comma-separated folders record_voice_file may read. A path outside them is refused.",
+        )
+        MAX_FILE_CHARS: int = Field(
+            default=9000,
+            description="Most characters of a file record_voice_file speaks in one call (the file is cut at a line break and the result says where to continue). MAX_CHARS is the size of each speech request within that.",
+        )
         MAX_CHARS: int = Field(default=3000, description="Longest memo text accepted, in characters.")
         UPLOAD_TO_OPEN_WEBUI: bool = Field(
             default=True,
@@ -451,6 +597,7 @@ class Tools:
             "while the user is logged in to Open WebUI.\n"
             "- record_conversation(script, title): records several people talking as ONE clip, each in their own voice. `script` has one line per turn, written \"Name: words\" (for example \"Mara: Hi!\" then \"Hannah: Hello!\"). "
             "Voices are set by the SPEAKER_VOICES valve: " + (", ".join(self._speaker_names()) or "none set") + ". Any other name gets the default voice. Use it instead of several record_voice_memo calls when a conversation should be one recording.\n"
+            "- record_voice_file(path, title, start_line): reads a text, Markdown, PDF or Word file from the terminal aloud, in the default voice, as one recording. `path` is as the terminal shows it, such as /companion/story.md or ~/companion/story.md. A long file is recorded in parts; if the result says the file continues, call it again with the start_line it gives.\n"
             "- list_voice_memos(limit): shows recent memos with their links, newest first.\n"
             "- show_last_memo(): shows the newest memo's text, the text actually spoken (with the tags that were added), and its link. Use it when the user asks what was said or which tags were used.\n"
             "- If recording fails, the error says what to do. Do not retry more than once; tell the user instead."
@@ -481,12 +628,7 @@ class Tools:
                 "What to do: shorten the text, or split it into several memos with separate calls."
             )
         title = "" if is_unset(title) else title.strip()
-        voice_note = ""
-        voice = "" if is_unset(voice) else voice.strip()
-        if voice and not _VOICE_ID_RE.match(voice.lower()):
-            voice_note = f"\nNote: voice {voice!r} is not a valid voice id (32 hex characters), so the default voice was used."
-            voice = ""
-        voice = (voice.lower() or v.DEFAULT_VOICE)
+        voice, voice_note = resolve_voice(voice, v.DEFAULT_VOICE)
 
         await _emit(__event_emitter__, {"type": "status", "data": {"description": "Recording voice memo...", "done": False}})
         spoken, _why = await asyncio.to_thread(add_expression_tags, v, text)
@@ -684,6 +826,158 @@ class Tools:
             note,
             __event_emitter__,
         )
+
+    @staticmethod
+    def _file_fail(e: "TerminalError", path: str) -> str:
+        status = e.status
+        if status in (401, 403):
+            hint = "Open Terminal refused access (wrong API key, or the file belongs to another user). This is a configuration problem. Tell the user; retrying will not help."
+        elif status == 404:
+            hint = (
+                f"No file was found at {path}. Check the exact path in the terminal first (list the folder), then call again with the "
+                "full path. Use the path as the terminal shows it, such as /companion/story.md or ~/companion/story.md."
+            )
+        elif status == 415:
+            hint = "That file is not text, so it cannot be read aloud. Choose a text, Markdown, PDF or Word file."
+        elif status == -1:
+            hint = "Open Terminal could not be reached. This is a configuration problem. Tell the user; retrying will not help."
+        elif status >= 500:
+            hint = "A temporary problem in Open Terminal. Retry once; if it fails again, tell the user."
+        else:
+            return f"Error: {e}"
+        return f"Error: {e}\nWhat to do: {hint}"
+
+    async def record_voice_file(
+        self,
+        path: str,
+        title: str = "",
+        voice: str = "",
+        start_line: str = "1",
+        __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[dict], Any]] = None,
+    ) -> str:
+        """
+        Read a file from the terminal aloud: record its text as a spoken audio file and give the user a link to listen to it. Use the file's path as the terminal shows it, such as /companion/story.md or ~/companion/story.md.
+
+        :param path: Path of the text, Markdown, PDF or Word file in the terminal.
+        :param title: Optional short title, used in the file name and the link. Omit for the file's name.
+        :param voice: Almost always omit this (pass ""). Only a 32-character hex Fish Audio voice id the user gave you is valid; never invent a voice name, it is ignored.
+        :param start_line: Line to start reading from (default 1). Only use it to continue a long file; the result says which line to use.
+        :return: A message containing a Markdown link; put that link in your reply so the user can play the recording.
+        """
+        v = self.valves
+        path = ("" if is_unset(path) else str(path)).strip()
+        if not path:
+            return "Error: path is empty.\nWhat to do: call again with the file's full path, for example /companion/story.md."
+        if not (v.OPEN_TERMINAL_API_KEY or "").strip():
+            return (
+                "Error: the OPEN_TERMINAL_API_KEY valve is not set, so files cannot be read.\n"
+                "What to do: this is a configuration problem. Tell the user; retrying will not help."
+            )
+        prefixes = [p.strip().rstrip("/") or "/" for p in (v.ALLOWED_FILE_PATHS or "").split(",") if p.strip()]
+        refusal = (
+            f"Error: reading {{}} is not allowed. Only files under {', '.join(prefixes) or 'no folder'} can be read aloud.\n"
+            "What to do: use a file in one of those folders, or tell the user the file is outside the allowed folders."
+        )
+        if path.startswith("/") and not path_allowed(path, prefixes):
+            return refusal.format(path)
+        try:
+            start = max(1, int(str(start_line).strip())) if not is_unset(start_line) else 1
+        except ValueError:
+            start = 1
+        voice, voice_note = resolve_voice(voice, v.DEFAULT_VOICE)
+        title = "" if is_unset(title) else title.strip()
+        user_id = str((__user__ or {}).get("id") or "")
+
+        await _emit(__event_emitter__, {"type": "status", "data": {"description": "Reading the file...", "done": False}})
+        try:
+            data = await asyncio.to_thread(terminal_read, v, path, start, start + 3999, user_id)
+        except TerminalError as e:
+            await _emit(__event_emitter__, {"type": "status", "data": {"description": "Could not read the file", "done": True}})
+            return self._file_fail(e, path)
+        resolved = str(data.get("path") or path)
+        if not path_allowed(resolved, prefixes):
+            await _emit(__event_emitter__, {"type": "status", "data": {"description": "File not allowed", "done": True}})
+            return refusal.format(resolved)
+
+        total = int(data.get("total_lines") or 0)
+        lines = str(data.get("content") or "").split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        if not any(ln.strip() for ln in lines):
+            msg = (
+                f"Error: the file has only {total} lines, so there is nothing at line {start}.\nWhat to do: call again without start_line."
+                if total and start > total
+                else "Error: the file is empty.\nWhat to do: tell the user; there is nothing to record."
+            )
+            await _emit(__event_emitter__, {"type": "status", "data": {"description": "Nothing to record", "done": True}})
+            return msg
+
+        cap = max(500, int(v.MAX_FILE_CHARS))
+        taken: List[str] = []
+        size = 0
+        for ln in lines:
+            if size + len(ln) + 1 > cap:
+                break
+            taken.append(ln)
+            size += len(ln) + 1
+        if not taken:
+            await _emit(__event_emitter__, {"type": "status", "data": {"description": "Line too long", "done": True}})
+            return (
+                f"Error: line {start} alone is {len(lines[0])} characters; the limit is {cap}.\n"
+                "What to do: tell the user the file has a very long line and ask them to break it into paragraphs."
+            )
+        if len(taken) < len(lines):  # cut part-way: prefer to stop at a blank line near the end
+            for i in range(len(taken) - 1, max(len(taken) * 3 // 4 - 1, 0), -1):
+                if not taken[i].strip():
+                    taken = taken[: i + 1]
+                    break
+        last = start + len(taken) - 1
+        if total:
+            last = min(last, total)
+        next_line = last + 1
+        has_more = (next_line <= total) if total else (len(taken) < len(lines))
+
+        text = speakable_text("\n".join(taken))
+        if not text:
+            await _emit(__event_emitter__, {"type": "status", "data": {"description": "Nothing to say", "done": True}})
+            more = f" Try start_line={next_line}." if has_more else ""
+            return f"Error: that part of the file has no words to speak (only code or formatting).{more}\nWhat to do: tell the user, or continue from the next line."
+
+        pieces = split_for_speech(text, v.MAX_CHARS)
+        parts: List[bytes] = []
+        spoken_pieces: List[str] = []
+        for i, piece in enumerate(pieces, 1):
+            await _emit(
+                __event_emitter__,
+                {"type": "status", "data": {"description": f"Recording part {i} of {len(pieces)}...", "done": False}},
+            )
+            spoken, _why = await asyncio.to_thread(add_expression_tags, v, piece)
+            try:
+                audio, _ctype = await asyncio.to_thread(synthesize, v, spoken, voice)
+            except MemoError as e:
+                await _emit(__event_emitter__, {"type": "status", "data": {"description": "Recording failed", "done": True}})
+                return self._fail(MemoError(f"part {i} of {len(pieces)}: {e}", e.status, e.provider))
+            parts.append(audio)
+            spoken_pieces.append(spoken)
+
+        stem = posixpath.splitext(posixpath.basename(resolved))[0] or "file"
+        reply = await self._finish(
+            join_mp3(parts),
+            title or stem,
+            "\n\n".join(pieces),
+            "\n\n".join(spoken_pieces),
+            {"voice": voice, "source": resolved, "first_line": start, "last_line": last, "total_lines": total},
+            voice_note,
+            __event_emitter__,
+        )
+        reply += f"\nSource: {resolved}, lines {start}-{last}" + (f" of {total}." if total else ".")
+        if has_more:
+            reply += (
+                f"\nThe file continues: only lines {start}-{last} were recorded (the limit is {cap} characters per recording). "
+                f"To record the rest, call record_voice_file again with the same path and start_line={next_line}."
+            )
+        return reply
 
     async def list_voice_memos(self, limit: str = "10") -> str:
         """

@@ -578,6 +578,268 @@ class LeadInTests(unittest.TestCase):
         self.assertEqual(next(Path(tmp.name).glob("*.mp3")).read_bytes(), self.clip())
 
 
+class FakeTerminal:
+    """Stands in for requests.get against Open Terminal's /files/read."""
+
+    def __init__(self, content="", path="/companion/story.md", total=None, status=200, payload=None):
+        self.content, self.path, self.status, self.payload = content, path, status, payload
+        self.total = total if total is not None else len(content.splitlines())
+        self.calls = []
+
+    def __call__(self, url, **kw):
+        self.calls.append((url, kw))
+        if self.status != 200:
+            return Resp(self.status, payload={"detail": "File not found" if self.status == 404 else "nope"})
+        if self.payload is not None:
+            return Resp(200, payload=self.payload)
+        start = int(kw["params"].get("start_line", 1))
+        end = int(kw["params"].get("end_line", 10**9))
+        lines = self.content.splitlines()[start - 1 : end]
+        return Resp(200, payload={"path": self.path, "content": "\n".join(lines) + ("\n" if lines else ""), "total_lines": self.total})
+
+
+class SeqSpeech(FakeNet):
+    """Speech fake that numbers its clips so join order can be checked."""
+
+    def __call__(self, url, **kw):
+        if url.endswith(("/audio/speech", "/v1/tts")):
+            self.calls.append((url, kw))
+            n = len(self.speech())
+            return Resp(200, b"\xff\xfbC%d|" % n, headers={"Content-Type": "audio/mpeg"})
+        return super().__call__(url, **kw)
+
+    def speech(self):
+        return [kw for u, kw in self.calls if u.endswith(("/audio/speech", "/v1/tts"))]
+
+
+class FileTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.tool.valves.OPEN_TERMINAL_API_KEY = "term-key"
+
+    def read(self, terminal, speech=None, *args, user=None, **kw):
+        speech = speech or SeqSpeech()
+        user = {"id": "user-1"} if user is None else user
+        with mock.patch.object(mod.requests, "get", terminal), mock.patch.object(mod.requests, "post", speech):
+            out = asyncio.run(self.tool.record_voice_file(*args, __user__=user, **kw))
+        return out, speech
+
+    def meta(self):
+        return json.loads(next(Path(self.tool.valves.MEMO_DIR).glob("*.json")).read_text())
+
+    def test_reads_cleans_speaks_and_links(self):
+        term = FakeTerminal("# Title\n\nSome **bold** words and a [link](http://x.y).\n\n</think>\n\n```py\nprint(1)\n```\nThe end.\n")
+        out, speech = self.read(term, None, "/companion/story.md")
+        self.assertEqual(speech.speech()[0]["json"]["input"], "Title\n\nSome bold words and a link.\n\nThe end.")
+        self.assertIn("[Play story](/api/v1/files/abc123/content)", out)
+        self.assertIn("Source: /companion/story.md, lines 1-10 of 10.", out)
+        meta = self.meta()
+        self.assertEqual((meta["source"], meta["first_line"], meta["last_line"]), ("/companion/story.md", 1, 10))
+
+    def test_terminal_request_shape_and_user_header(self):
+        term = FakeTerminal("Hello there.\n")
+        self.read(term, None, "~/companion/a.md", user={"id": "owui-user-7"})
+        url, kw = term.calls[0]
+        self.assertEqual(url, "http://open-terminal:8000/files/read")
+        self.assertEqual(kw["headers"], {"Authorization": "Bearer term-key", "X-User-Id": "owui-user-7"})
+        self.assertEqual(kw["params"]["path"], "~/companion/a.md")
+        self.assertNotIn("start_line", kw["params"])
+
+    def test_no_user_means_no_user_header(self):
+        term = FakeTerminal("Hello there.\n")
+        with mock.patch.object(mod.requests, "get", term), mock.patch.object(mod.requests, "post", SeqSpeech()):
+            asyncio.run(self.tool.record_voice_file("/companion/a.md"))
+        self.assertNotIn("X-User-Id", term.calls[0][1]["headers"])
+
+    def test_long_text_is_split_spoken_in_order_and_joined(self):
+        para = "Sentence number one is here. " * 40  # ~1160 chars each
+        text = "\n\n".join([para.strip()] * 5)
+        self.tool.valves.MAX_CHARS = 2500
+        out, speech = self.read(FakeTerminal(text + "\n"), None, "/companion/s.md")
+        calls = speech.speech()
+        self.assertGreater(len(calls), 1)
+        self.assertTrue(all(len(c["json"]["input"]) <= 2500 for c in calls))
+        mp3 = next(Path(self.tool.valves.MEMO_DIR).glob("*.mp3")).read_bytes()
+        for i in range(1, len(calls) + 1):
+            self.assertIn(b"\xff\xfbC%d|" % i, mp3)
+        self.assertLess(mp3.index(b"C1|"), mp3.index(b"C2|"))
+
+    def test_file_over_the_cap_stops_at_a_line_and_says_where_to_continue(self):
+        lines = [f"Line {i} has some words in it." for i in range(1, 101)]
+        self.tool.valves.MAX_FILE_CHARS = 500
+        out, speech = self.read(FakeTerminal("\n".join(lines) + "\n"), None, "/companion/long.md")
+        spoken_words = " ".join(c["json"]["input"] for c in speech.speech())
+        self.assertIn("Line 1 ", spoken_words)
+        self.assertNotIn("Line 100 ", spoken_words)
+        meta = self.meta()
+        self.assertIn(f"start_line={meta['last_line'] + 1}", out)
+        self.assertIn("The file continues", out)
+
+    def test_continuing_passes_start_line(self):
+        term = FakeTerminal("\n".join(f"Line {i} words." for i in range(1, 11)) + "\n")
+        out, _ = self.read(term, None, "/companion/x.md", start_line="4")
+        self.assertEqual(term.calls[0][1]["params"]["start_line"], 4)
+        self.assertIn("lines 4-10 of 10", out)
+        self.assertNotIn("The file continues", out)
+
+    def test_bad_start_line_falls_back_to_one_and_past_end_is_explained(self):
+        term = FakeTerminal("One.\nTwo.\n")
+        self.read(term, None, "/companion/x.md", start_line="abc")
+        self.assertNotIn("start_line", term.calls[0][1]["params"])
+        out, speech = self.read(FakeTerminal("", total=2), None, "/companion/x.md", start_line="9")
+        self.assertIn("only 2 lines", out)
+        self.assertEqual(speech.speech(), [])
+
+    def test_one_huge_line_is_refused_with_advice(self):
+        self.tool.valves.MAX_FILE_CHARS = 500
+        out, speech = self.read(FakeTerminal("word " * 400 + "\n"), None, "/companion/x.md")
+        self.assertIn("alone is", out)
+        self.assertIn("paragraphs", out)
+        self.assertEqual(speech.speech(), [])
+
+    def test_only_code_has_nothing_to_say(self):
+        out, speech = self.read(FakeTerminal("```\ncode\n```\n"), None, "/companion/x.md")
+        self.assertIn("no words to speak", out)
+        self.assertEqual(speech.speech(), [])
+
+    def test_empty_file(self):
+        out, _ = self.read(FakeTerminal("", total=0), None, "/companion/x.md")
+        self.assertIn("file is empty", out)
+
+    def test_paths_outside_allowed_folders_are_refused_before_any_request(self):
+        for bad in ("/etc/passwd", "/companion/../etc/passwd", "/root/.ssh/id_rsa", "/companionx/a.md"):
+            term = FakeTerminal("secret\n")
+            out, speech = self.read(term, None, bad)
+            self.assertIn("is not allowed", out, bad)
+            self.assertEqual(term.calls, [], bad)
+            self.assertEqual(speech.speech(), [], bad)
+
+    def test_resolved_path_outside_allowed_folders_is_refused_after_reading(self):
+        term = FakeTerminal("secret\n", path="/etc/shadow")
+        out, speech = self.read(term, None, "~/innocent.md")
+        self.assertIn("is not allowed", out)
+        self.assertEqual(speech.speech(), [])
+
+    def test_home_style_paths_are_allowed_when_terminal_resolves_them_inside_home(self):
+        term = FakeTerminal("Hello.\n", path="/home/u36ca2354/companion/a.md")
+        out, _ = self.read(term, None, "~/companion/a.md")
+        self.assertIn("Recorded", out)
+        self.assertIn("Source: /home/u36ca2354/companion/a.md", out)
+
+    def test_errors_say_what_to_do(self):
+        out, _ = self.read(FakeTerminal(status=404), None, "/companion/missing.md")
+        self.assertIn("No file was found at /companion/missing.md", out)
+        self.assertIn("~/companion/story.md", out)
+        out, _ = self.read(FakeTerminal(status=401), None, "/companion/a.md")
+        self.assertIn("configuration problem", out)
+        out, _ = self.read(FakeTerminal(status=415), None, "/companion/a.png")
+        self.assertIn("not text", out)
+        out, _ = self.read(FakeTerminal(payload={"nothing": 1}), None, "/companion/a.md")
+        self.assertIn("did not return text", out)
+
+    def test_unreachable_terminal_and_missing_key(self):
+        def down(url, **kw):
+            raise mod.requests.ConnectionError("refused")
+
+        out, _ = self.read(down, None, "/companion/a.md")
+        self.assertIn("could not be reached", out)
+        self.tool.valves.OPEN_TERMINAL_API_KEY = ""
+        out, _ = self.read(FakeTerminal("x\n"), None, "/companion/a.md")
+        self.assertIn("OPEN_TERMINAL_API_KEY", out)
+        self.assertIn("configuration problem", out)
+
+    def test_empty_path(self):
+        out, _ = self.read(FakeTerminal("x\n"), None, "  ")
+        self.assertIn("path is empty", out)
+
+    def test_voice_validation_matches_the_memo_tool(self):
+        out, speech = self.read(FakeTerminal("Hello there.\n"), None, "/companion/a.md", voice="hannah-lee")
+        self.assertEqual(speech.speech()[0]["json"]["voice"], self.tool.valves.DEFAULT_VOICE)
+        self.assertIn("not a valid voice id", out)
+        out, speech = self.read(FakeTerminal("Hello there.\n"), None, "/companion/a.md", voice="DEADBEEF" * 4)
+        self.assertEqual(speech.speech()[0]["json"]["voice"], "deadbeef" * 4)
+
+    def test_formatter_tags_each_part(self):
+        self.tool.valves.FORMATTER_MODEL = "m"
+        speech = SeqSpeech(chat=chat_reply("[happy] Hello there."))
+        self.read(FakeTerminal("Hello there.\n"), speech, "/companion/a.md")
+        self.assertEqual(speech.speech()[0]["json"]["input"], "[happy] Hello there.")
+        self.assertEqual(self.meta()["spoken_text"], "[happy] Hello there.")
+
+    def test_speech_failure_names_the_part_and_saves_nothing(self):
+        speech = SeqSpeech(tts=Resp(429, payload={"error": {"message": "Too many requests", "code": 429}}))
+
+        def fail(url, **kw):
+            if url.endswith("/audio/speech"):
+                return speech.tts
+            return SeqSpeech.__call__(speech, url, **kw)
+
+        out, _ = self.read(FakeTerminal("Hello there.\n"), fail, "/companion/a.md")
+        self.assertIn("part 1 of 1", out)
+        self.assertIn("Retry once", out)
+        self.assertFalse(Path(self.tool.valves.MEMO_DIR).exists())
+
+    def test_blocking_calls_stay_off_the_event_loop(self):
+        import threading
+
+        seen = []
+        term, speech = FakeTerminal("Hello there.\n"), SeqSpeech()
+
+        def get(url, **kw):
+            seen.append(threading.current_thread() is threading.main_thread())
+            return term(url, **kw)
+
+        def post(url, **kw):
+            seen.append(threading.current_thread() is threading.main_thread())
+            return speech(url, **kw)
+
+        out, _ = self.read(get, post, "/companion/a.md")
+        self.assertEqual(len(seen), 3)  # read, speech, upload
+        self.assertFalse(any(seen))
+
+    def test_works_with_the_fish_backend(self):
+        self.tool.valves.FISH_API_KEY = "fish-key"
+        out, speech = self.read(FakeTerminal("Hello there.\n"), None, "/companion/a.md")
+        self.assertTrue(speech.speech()[0]["json"]["text"] == "Hello there.")
+        self.assertIn("Recorded", out)
+
+    def test_help_and_description_mention_the_tool(self):
+        self.assertIn("record_voice_file", asyncio.run(self.tool.voice_memo_help()))
+        self.assertIn("/companion/story.md", mod.Tools.record_voice_file.__doc__)
+
+
+class SpeakableTextTests(unittest.TestCase):
+    def test_markdown_front_matter_html_and_tables(self):
+        raw = "---\ntitle: x\n---\n# Head\n\n- one\n- two\n1. three\n> quoted *em* and _it_ and snake_case_name\n\n---\n| a | b |\n|---|---|\n| 1 | 2 |\n<b>bold</b> <!-- hidden --> ![img](x.png) end"
+        out = mod.speakable_text(raw)
+        for gone in ("title: x", "#", "- ", "**", "<b>", "hidden", "img", "|---", "|"):
+            self.assertNotIn(gone, out)
+        for kept in ("Head", "one", "two", "three", "quoted em and it and snake_case_name", "bold", "end"):
+            self.assertIn(kept, out)
+
+    def test_unclosed_code_fence_drops_the_rest(self):
+        self.assertEqual(mod.speakable_text("Before.\n\n```\ncode never closed"), "Before.")
+
+    def test_voice_tags_in_brackets_survive(self):
+        self.assertEqual(mod.speakable_text("[happy] Hello **there**."), "[happy] Hello there.")
+
+
+class SplitForSpeechTests(unittest.TestCase):
+    def test_pieces_respect_limit_and_lose_no_words(self):
+        text = "\n\n".join(("Word " * 30).strip() + "." for _ in range(12)) + "\n\n" + "x" * 900
+        pieces = mod.split_for_speech(text, 400)
+        self.assertTrue(all(len(p) <= 400 for p in pieces))
+        self.assertEqual(" ".join(" ".join(pieces).split()).replace(" ", ""), " ".join(text.split()).replace(" ", ""))
+
+    def test_short_paragraphs_are_packed_together(self):
+        pieces = mod.split_for_speech("A one.\n\nB two.\n\nC three.", 3000)
+        self.assertEqual(len(pieces), 1)
+
+    def test_paragraph_boundaries_preferred(self):
+        a, b = "A" * 300 + ".", "B" * 300 + "."
+        self.assertEqual(mod.split_for_speech(a + "\n\n" + b, 400), [a, b])
+
+
 class ListTests(Base):
     def test_empty_then_listing(self):
         self.assertIn("No voice memos", asyncio.run(self.tool.list_voice_memos()))
