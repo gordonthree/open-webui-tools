@@ -194,6 +194,18 @@ def _clean_formatter_output(out: str) -> str:
     return out
 
 
+FORMATTER_NOTES_MAX_CHARS = 1500
+
+
+def formatter_system_prompt(valves: "Tools.Valves") -> str:
+    """The formatter's system prompt: the custom or built-in text, then this server's voice notes if any."""
+    prompt = (valves.FORMATTER_PROMPT or "").strip() or DEFAULT_FORMATTER_PROMPT
+    notes = (valves.FORMATTER_NOTES or "").strip()[:FORMATTER_NOTES_MAX_CHARS]
+    if not notes:
+        return prompt
+    return f"{prompt.rstrip()}\n\nNOTES ABOUT THE VOICE THAT WILL SPEAK THIS (follow these over the lists above)\n{notes}\n"
+
+
 # Text longer than this is tagged in pieces of about FORMATTER_PIECE_CHARS: a long passage is more likely to be
 # reworded or to time out, and a failed piece then only loses its own tags.
 FORMATTER_PIECE_CHARS = 1200
@@ -226,7 +238,7 @@ def _tag_one(valves: "Tools.Valves", text: str) -> Tuple[str, str]:
     body = {
         "model": model,
         "messages": [
-            {"role": "system", "content": (valves.FORMATTER_PROMPT or "").strip() or DEFAULT_FORMATTER_PROMPT},
+            {"role": "system", "content": formatter_system_prompt(valves)},
             {"role": "user", "content": text},
         ],
         "temperature": 0.3,
@@ -492,6 +504,10 @@ class Tools:
         FORMATTER_PROMPT: str = Field(
             default="",
             description="System prompt for the formatter model. Empty = the built-in prompt with the Fish Audio tag guide.",
+        )
+        FORMATTER_NOTES: str = Field(
+            default="",
+            description="Short notes added to the end of the formatter's prompt about the voice that will speak, e.g. which moods it carries well and which to avoid. Set a different text on each server. Up to 1500 characters. Empty = none.",
         )
         FORMATTER_MIN_WORD_MATCH: float = Field(
             default=0.9,

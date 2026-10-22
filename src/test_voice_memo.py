@@ -938,6 +938,55 @@ class InlineHeadingTests(unittest.TestCase):
             self.assertEqual(mod.speakable_text(keep), keep)
 
 
+class FormatterNotesTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.tool.valves.FORMATTER_MODEL = "m"
+
+    def system_prompt(self, fake):
+        return next(kw["json"]["messages"][0]["content"] for url, kw in fake.calls if url.endswith("/chat/completions"))
+
+    def record(self):
+        fake = FakeNet(chat=chat_reply("[calm] Hello there."))
+        self.run_tool(fake, self.tool.record_voice_memo, "Hello there.", "T")
+        return fake
+
+    def test_notes_follow_the_built_in_prompt(self):
+        self.tool.valves.FORMATTER_NOTES = "This voice is soft. Avoid [angry] and [excited]."
+        prompt = self.system_prompt(self.record())
+        self.assertTrue(prompt.startswith(mod.DEFAULT_FORMATTER_PROMPT.rstrip()))
+        self.assertTrue(prompt.rstrip().endswith("This voice is soft. Avoid [angry] and [excited]."))
+        self.assertIn("NOTES ABOUT THE VOICE", prompt)
+
+    def test_notes_also_follow_a_custom_prompt(self):
+        self.tool.valves.FORMATTER_PROMPT = "Custom rules."
+        self.tool.valves.FORMATTER_NOTES = "Prefer calm."
+        prompt = self.system_prompt(self.record())
+        self.assertTrue(prompt.startswith("Custom rules."))
+        self.assertTrue(prompt.rstrip().endswith("Prefer calm."))
+
+    def test_empty_or_blank_notes_change_nothing(self):
+        for notes in ("", "   \n "):
+            self.tool.valves.FORMATTER_NOTES = notes
+            self.assertEqual(self.system_prompt(self.record()), mod.DEFAULT_FORMATTER_PROMPT)
+
+    def test_notes_are_capped(self):
+        self.tool.valves.FORMATTER_NOTES = "x" * 5000
+        prompt = self.system_prompt(self.record())
+        notes_part = prompt.split("follow these over the lists above)\n", 1)[1]
+        self.assertEqual(notes_part.count("x"), mod.FORMATTER_NOTES_MAX_CHARS)
+
+    def test_notes_reach_every_piece_of_a_long_text(self):
+        self.tool.valves.FORMATTER_NOTES = "Avoid [angry]."
+        self.tool.valves.MAX_CHARS = 6000
+        text = "\n\n".join(("Alpha sentence goes here and says things. " * 17).strip() for _ in range(4))
+        fake = FakeNet(chat=chat_reply("[calm] Alpha."))
+        self.run_tool(fake, self.tool.record_voice_memo, text, "T")
+        prompts = [kw["json"]["messages"][0]["content"] for url, kw in fake.calls if url.endswith("/chat/completions")]
+        self.assertGreater(len(prompts), 1)
+        self.assertTrue(all("Avoid [angry]." in p for p in prompts))
+
+
 class ListTests(Base):
     def test_empty_then_listing(self):
         self.assertIn("No voice memos", asyncio.run(self.tool.list_voice_memos()))
