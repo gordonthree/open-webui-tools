@@ -142,5 +142,24 @@ class ListFilesTests(unittest.TestCase):
         self.assertEqual(mod.human_size(5 * 1024 * 1024), "5.0 MB")
 
 
+class DefaultsTests(unittest.TestCase):
+    def test_listens_on_every_interface_by_default_and_can_be_narrowed(self):
+        args = mod.build_parser().parse_args([])
+        self.assertEqual((args.host, args.port), ("0.0.0.0", 8899))
+        self.assertEqual(mod.build_parser().parse_args(["--host", "127.0.0.1"]).host, "127.0.0.1")
+
+    def test_tailscale_address_is_empty_when_the_command_is_missing_or_fails(self):
+        from unittest import mock
+
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertEqual(mod.tailscale_address(), "")
+        failed = mock.Mock(returncode=1, stdout="")
+        with mock.patch("subprocess.run", return_value=failed):
+            self.assertEqual(mod.tailscale_address(), "")
+        ok = mock.Mock(returncode=0, stdout="100.64.0.7\n")
+        with mock.patch("subprocess.run", return_value=ok):
+            self.assertEqual(mod.tailscale_address(), "100.64.0.7")
+
+
 if __name__ == "__main__":
     unittest.main()

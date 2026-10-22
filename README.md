@@ -651,12 +651,13 @@ A tiny read-only web server for listening to and downloading generated audio (or
 copying files off the server by hand. Standard library only; tests in `scripts/test_serve_samples.py`.
 
 ```
-python3 scripts/serve_samples.py                  # serves tmp/samples on 127.0.0.1:8899
+python3 scripts/serve_samples.py                  # serves tmp/samples on 0.0.0.0:8899 and prints its Tailscale address
 python3 scripts/serve_samples.py --dir DIR --port 9000
-ssh -L 8899:127.0.0.1:8899 <this-host>            # from another machine, then open http://127.0.0.1:8899/
+python3 scripts/serve_samples.py --host 127.0.0.1 # this machine only (then: ssh -L 8899:127.0.0.1:8899 <this-host>)
 ```
 
-It listens on localhost only unless `--host 0.0.0.0` is given (there is no login, so only on a trusted network). The index
+It listens on every interface by default, so it is reachable from the LAN and over Tailscale; there is no login, so keep the
+port off the Internet. The index
 lists every file under the folder, newest first, with a player and a download link for audio; a text file named like an audio
 file (`clip.mp3` + `clip.txt`) is shown under its player as a caption. Range requests work, so long recordings can be
 sought. Only GET and HEAD are accepted, and any path that leaves the folder, including through a symlink, gets a 404.

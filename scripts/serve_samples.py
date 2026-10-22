@@ -3,14 +3,12 @@
 Serve a folder of audio samples (and other files) over HTTP, so they can be played or downloaded from a browser
 instead of hunting through a server's file system. Read-only, standard library only.
 
-    python3 scripts/serve_samples.py                 # serves tmp/samples on 127.0.0.1:8899
+    python3 scripts/serve_samples.py                 # serves tmp/samples on 0.0.0.0:8899
     python3 scripts/serve_samples.py --dir ~/clips --port 9000
 
-By default it listens on 127.0.0.1 only. From another machine, use an SSH tunnel and open the tunnelled address:
-
-    ssh -L 8899:127.0.0.1:8899 <this-host>        then browse to http://127.0.0.1:8899/
-
-Use --host 0.0.0.0 only on a network you trust: there is no login.
+By default it listens on every network interface (0.0.0.0), so it is reachable from the LAN and over a Tailscale
+network. There is no login: do not forward the port to the Internet. To keep it to this machine only, pass
+--host 127.0.0.1 and reach it through an SSH tunnel (ssh -L 8899:127.0.0.1:8899 <this-host>).
 
 The index page lists every file under the folder, newest first. Audio files get a player and a download link; a
 text file with the same name as an audio file (clip.mp3 + clip.txt) is shown under its player as a caption.
@@ -32,6 +30,8 @@ from urllib.parse import quote, unquote, urlsplit, parse_qs
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_DIR = REPO / "tmp" / "samples"
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 8899
 AUDIO_SUFFIXES = {".mp3", ".wav", ".ogg", ".opus", ".m4a", ".flac", ".aac", ".webm"}
 CHUNK = 64 * 1024
 
@@ -220,21 +220,40 @@ def make_server(root: Path, host: str, port: int) -> ThreadingHTTPServer:
     return ThreadingHTTPServer((host, port), handler)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--dir", default=str(DEFAULT_DIR), help="folder to serve (default: tmp/samples in the repo)")
-    ap.add_argument("--port", type=int, default=8899)
-    ap.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1; 0.0.0.0 = every interface)")
-    args = ap.parse_args(argv)
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--host", default=DEFAULT_HOST, help="address to listen on (default 0.0.0.0 = every interface; 127.0.0.1 = this machine only)")
+    return ap
+
+
+def tailscale_address() -> str:
+    """This machine's Tailscale IPv4 address, or "" if Tailscale is not installed or not running."""
+    import subprocess
+
+    try:
+        out = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.split()[0] if out.returncode == 0 and out.stdout.split() else ""
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
     root = Path(args.dir).expanduser()
     root.mkdir(parents=True, exist_ok=True)
     server = make_server(root, args.host, args.port)
-    shown = "127.0.0.1" if args.host in ("0.0.0.0", "") else args.host
-    print(f"Serving {root.resolve()} at http://{shown}:{server.server_address[1]}/  (Ctrl+C to stop)")
+    port = server.server_address[1]
+    print(f"Serving {root.resolve()}  (Ctrl+C to stop)")
     if args.host in ("127.0.0.1", "localhost"):
-        print(f"From another machine: ssh -L {server.server_address[1]}:127.0.0.1:{server.server_address[1]} <this-host>, then open the same address.")
+        print(f"This machine only: http://127.0.0.1:{port}/   (from elsewhere: ssh -L {port}:127.0.0.1:{port} <this-host>)")
     else:
-        print("Listening beyond localhost with no login: use only on a trusted network.")
+        print(f"Listening on {args.host}:{port} with no login; keep the port off the Internet.")
+        ts = tailscale_address()
+        if ts:
+            print(f"Tailscale: http://{ts}:{port}/")
+        print(f"This machine: http://127.0.0.1:{port}/")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
