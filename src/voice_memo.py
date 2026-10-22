@@ -194,14 +194,33 @@ def _clean_formatter_output(out: str) -> str:
     return out
 
 
-def add_expression_tags(valves: "Tools.Valves", text: str) -> Tuple[str, str]:
-    """Ask the formatter model to add expression tags. Returns (text to speak, reason it was left alone or "").
+# Text longer than this is tagged in pieces of about FORMATTER_PIECE_CHARS: a long passage is more likely to be
+# reworded or to time out, and a failed piece then only loses its own tags.
+FORMATTER_PIECE_CHARS = 1200
 
-    Never raises: any problem hands back the original text, so a memo is not lost because of the formatter.
+
+def add_expression_tags(valves: "Tools.Valves", text: str) -> Tuple[str, str]:
+    """Add expression tags to `text`. Returns (text to speak, why some or all of it was left alone, or "").
+
+    Never raises: any problem hands back the original words, so a recording is not lost because of the formatter.
     """
-    model = (valves.FORMATTER_MODEL or "").strip()
-    if not model or not valves.OPENROUTER_API_KEY:
+    if not (valves.FORMATTER_MODEL or "").strip() or not valves.OPENROUTER_API_KEY:
         return text, "formatter off"
+    if len(text) <= FORMATTER_PIECE_CHARS * 5 // 4:
+        return _tag_one(valves, text)
+    pieces = split_for_speech(text, FORMATTER_PIECE_CHARS)
+    results = [_tag_one(valves, piece) for piece in pieces]
+    counts: Dict[str, int] = {}
+    for _out, why in results:
+        if why:
+            counts[why] = counts.get(why, 0) + 1
+    joined = "\n\n".join(out for out, _why in results)
+    return joined, "; ".join(f"{n} of {len(pieces)} parts: {why}" for why, n in counts.items())
+
+
+def _tag_one(valves: "Tools.Valves", text: str) -> Tuple[str, str]:
+    """One formatter call on one piece of text."""
+    model = (valves.FORMATTER_MODEL or "").strip()
     if _TAG_RE.search(text):
         return text, "already tagged"
     body = {
@@ -299,6 +318,7 @@ def speakable_text(raw: str) -> str:
     t = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", t)
     t = _TABLE_SEP_RE.sub("", t)
     t = _RULE_RE.sub("", t)
+    t = re.sub(r"(?<=[.!?\u2026\"\u201d\u2019)])#{1,6}[ \t]+", "\n\n", t)  # files joined without a newline: "...end.# Next"
     t = re.sub(r"^[ \t]*#{1,6}[ \t]*", "", t, flags=re.M)
     t = re.sub(r"^[ \t]*>[ \t]?", "", t, flags=re.M)
     t = re.sub(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+", "", t, flags=re.M)
@@ -638,7 +658,9 @@ class Tools:
             await _emit(__event_emitter__, {"type": "status", "data": {"description": "Voice memo failed", "done": True}})
             return self._fail(e)
 
-        return await self._finish(audio, title, text, spoken, {"voice": voice}, voice_note, __event_emitter__)
+        return await self._finish(
+            audio, title, text, spoken, {"voice": voice, "formatter": _why or "ok"}, voice_note, __event_emitter__
+        )
 
     async def _finish(
         self,
@@ -780,6 +802,7 @@ class Tools:
         await _emit(__event_emitter__, {"type": "status", "data": {"description": "Preparing conversation...", "done": False}})
         tagged = await asyncio.gather(*(asyncio.to_thread(add_expression_tags, v, words) for _n, words, _vc in resolved))
         spoken_turns: List[Tuple[str, str]] = [(n, t[0]) for (n, _w, _vc), t in zip(resolved, tagged)]
+        format_notes = sorted({t[1] for t in tagged if t[1]})
 
         # With a Fish key, one request can carry every speaker: <|speaker:N|> tags in the text and a list of voices.
         order: List[str] = []
@@ -822,7 +845,7 @@ class Tools:
             title or "conversation",
             text,
             spoken_text,
-            {"voice": "multiple", "speakers": used, "mode": "one request" if native else "joined clips"},
+            {"voice": "multiple", "speakers": used, "mode": "one request" if native else "joined clips", "formatter": "; ".join(format_notes) or "ok"},
             note,
             __event_emitter__,
         )
@@ -947,12 +970,15 @@ class Tools:
         pieces = split_for_speech(text, v.MAX_CHARS)
         parts: List[bytes] = []
         spoken_pieces: List[str] = []
+        format_notes: List[str] = []
         for i, piece in enumerate(pieces, 1):
             await _emit(
                 __event_emitter__,
                 {"type": "status", "data": {"description": f"Recording part {i} of {len(pieces)}...", "done": False}},
             )
             spoken, _why = await asyncio.to_thread(add_expression_tags, v, piece)
+            if _why and _why not in format_notes:
+                format_notes.append(_why)
             try:
                 audio, _ctype = await asyncio.to_thread(synthesize, v, spoken, voice)
             except MemoError as e:
@@ -967,7 +993,7 @@ class Tools:
             title or stem,
             "\n\n".join(pieces),
             "\n\n".join(spoken_pieces),
-            {"voice": voice, "source": resolved, "first_line": start, "last_line": last, "total_lines": total},
+            {"voice": voice, "source": resolved, "first_line": start, "last_line": last, "total_lines": total, "formatter": "; ".join(format_notes) or "ok"},
             voice_note,
             __event_emitter__,
         )
@@ -1026,6 +1052,7 @@ class Tools:
                 f"Voice: {m.get('voice', '?')}  Model: {m.get('model', '?')}  Characters: {m.get('chars', '?')}",
                 f"Text given:\n{m.get('text', '')}",
                 f"Text spoken (tags added automatically):\n{spoken}" if spoken else "Text spoken: the same as the text given (no tags were added automatically).",
+                f"Tag formatter: {m['formatter']}" if m.get("formatter") else "Tag formatter: (not recorded for this memo)",
             ]
             if m.get("url"):
                 lines.append(f"[Play]({m['url']})" + (f"  Full link: {base}{m['url']}" if base else ""))

@@ -840,6 +840,104 @@ class SplitForSpeechTests(unittest.TestCase):
         self.assertEqual(mod.split_for_speech(a + "\n\n" + b, 400), [a, b])
 
 
+class FormatterPiecesTests(Base):
+    """Long text is tagged in pieces, and the reason a piece was left alone is saved with the memo."""
+
+    def setUp(self):
+        super().setUp()
+        self.tool.valves.FORMATTER_MODEL = "m"
+        self.tool.valves.MAX_CHARS = 6000
+
+    def long_text(self, marker=""):
+        paras = [("Alpha sentence goes here and says things. " * 17).strip() for _ in range(4)]
+        if marker:
+            paras[2] = paras[2] + " " + marker
+        return "\n\n".join(paras)
+
+    def run_with(self, text, fail_marker=None):
+        speech = SeqSpeech()
+        chat_inputs = []
+
+        def post(url, **kw):
+            if url.endswith("/chat/completions"):
+                said = kw["json"]["messages"][1]["content"]
+                chat_inputs.append(said)
+                if fail_marker and fail_marker in said:
+                    return chat_reply("completely different words about nothing at all")
+                return chat_reply("[calm] " + said)
+            return speech(url, **kw)
+
+        with mock.patch.object(mod.requests, "post", post):
+            asyncio.run(self.tool.record_voice_memo(text, "T"))
+        return chat_inputs, speech
+
+    def meta(self):
+        return json.loads(next(Path(self.tool.valves.MEMO_DIR).glob("*.json")).read_text())
+
+    def test_long_text_is_tagged_in_several_calls_each_small(self):
+        inputs, speech = self.run_with(self.long_text())
+        self.assertGreaterEqual(len(inputs), 3)
+        self.assertTrue(all(len(i) <= mod.FORMATTER_PIECE_CHARS for i in inputs))
+        spoken = speech.speech()[0]["json"]["input"]
+        self.assertEqual(spoken.count("[calm]"), len(inputs))
+        self.assertEqual(self.meta()["formatter"], "ok")
+
+    def test_short_text_still_uses_one_call(self):
+        inputs, _ = self.run_with("Just a short message here.")
+        self.assertEqual(len(inputs), 1)
+
+    def test_one_failed_piece_loses_only_its_own_tags_and_is_reported(self):
+        inputs, speech = self.run_with(self.long_text("FAILME"), fail_marker="FAILME")
+        spoken = speech.speech()[0]["json"]["input"]
+        self.assertEqual(spoken.count("[calm]"), len(inputs) - 1)
+        self.assertIn("FAILME", spoken)
+        self.assertEqual(self.meta()["formatter"], f"1 of {len(inputs)} parts: formatter changed the words")
+
+    def test_formatter_off_is_recorded(self):
+        self.tool.valves.FORMATTER_MODEL = ""
+        self.run_with("Just a short message here.")
+        self.assertEqual(self.meta()["formatter"], "formatter off")
+
+    def test_show_last_memo_prints_the_formatter_line(self):
+        self.run_with(self.long_text("FAILME"), fail_marker="FAILME")
+        out = asyncio.run(self.tool.show_last_memo())
+        self.assertIn("Tag formatter: 1 of", out)
+        self.assertIn("formatter changed the words", out)
+
+    def test_old_memos_without_the_field_are_labelled(self):
+        d = Path(self.tool.valves.MEMO_DIR)
+        d.mkdir(parents=True)
+        (d / "20200101-000000-old.json").write_text(json.dumps({"title": "Old", "text": "x", "url": None}))
+        self.assertIn("Tag formatter: (not recorded", asyncio.run(self.tool.show_last_memo()))
+
+    def test_file_reading_records_the_formatter_reason(self):
+        self.tool.valves.OPEN_TERMINAL_API_KEY = "k"
+        term = FakeTerminal(self.long_text("FAILME").replace("\n\n", "\n\n") + "\n")
+
+        def post(url, **kw):
+            if url.endswith("/chat/completions"):
+                said = kw["json"]["messages"][1]["content"]
+                if "FAILME" in said:
+                    return chat_reply("completely different words about nothing at all")
+                return chat_reply("[calm] " + said)
+            return SeqSpeech()(url, **kw)
+
+        with mock.patch.object(mod.requests, "get", term), mock.patch.object(mod.requests, "post", post):
+            asyncio.run(self.tool.record_voice_file("/companion/a.md"))
+        self.assertIn("parts: formatter changed the words", self.meta()["formatter"])
+
+
+class InlineHeadingTests(unittest.TestCase):
+    def test_hash_after_a_sentence_end_is_a_heading_and_starts_a_new_paragraph(self):
+        out = mod.speakable_text("That's enough for tonight.# The House That Holds - Act 2\n\nThe house says yes.# Act 3")
+        self.assertNotIn("#", out)
+        self.assertEqual(out, "That's enough for tonight.\n\nThe House That Holds - Act 2\n\nThe house says yes.\n\nAct 3")
+
+    def test_real_hashes_in_words_are_kept(self):
+        for keep in ("I wrote it in C# last year.", "See Issue #5 for details.", "Press # to continue."):
+            self.assertEqual(mod.speakable_text(keep), keep)
+
+
 class ListTests(Base):
     def test_empty_then_listing(self):
         self.assertIn("No voice memos", asyncio.run(self.tool.list_voice_memos()))
