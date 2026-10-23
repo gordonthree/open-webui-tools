@@ -159,6 +159,44 @@ class Delivery(unittest.TestCase):
             self.assertEqual(path.read_text(), (Path(d) / "archive" / "world-brief-2026-10-24.md").read_text())
             self.assertEqual(os.stat(path).st_mode & 0o666, 0o666)
 
+    def test_digest_is_short_real_and_points_at_the_file(self):
+        text = wb.digest_text(good_brief(), self.day)
+        self.assertLessEqual(len(text), 500)
+        self.assertTrue(text.startswith("World today (2026-10-24): Prize; Novel; Crows; Rewilding."))
+        self.assertIn("Heavy, only named: a war in Sudan and an Ebola outbreak.", text)
+        self.assertIn("/companion/world/world-brief.md (read_file)", text)
+
+    def test_digest_never_cuts_a_headline(self):
+        brief = good_brief().replace("- Prize:", "- " + "Quite a long headline " * 5 + ":")
+        text = wb.digest_text(brief, self.day)
+        self.assertNotIn("...", text)
+        self.assertNotIn("Quite a long headline", text)
+
+    def test_entries_written_by_an_agent_are_never_taken_for_the_pinned_ones(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = str(Path(d) / "n.sqlite3")
+            notes.create_note_db(db, "shared-history", "World briefing is a phrase an agent might write itself", "log", "Tester")
+            self.assertIn("created and pinned", wb.update_hint(db, self.day))
+
+    def test_digest_drops_headlines_to_fit(self):
+        long = good_brief().replace("- Prize:", "- " + "Very long headline word " * 12 + ":")
+        self.assertLessEqual(len(wb.digest_text(long, self.day)), 500)
+
+    def test_two_pinned_entries_each_created_once_then_edited(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = str(Path(d) / "n.sqlite3")
+            notes.create_note_db(db, "shared-history", "first entry", "log", "Tester")
+            m1 = wb.update_hint(db, self.day, good_brief())
+            m2 = wb.update_hint(db, self.day + dt.timedelta(days=1), good_brief())
+            self.assertEqual(m1.count("created and pinned"), 2)
+            self.assertEqual(m2.count("updated #"), 2)
+            conn = sqlite3.connect(db)
+            rows = conn.execute("SELECT note_text, pinned FROM note_data WHERE note_text LIKE 'World %' ORDER BY entry_no").fetchall()
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(all(r[1] == 1 for r in rows))
+            self.assertTrue(rows[0][0].startswith("World briefing") and rows[1][0].startswith("World today (2026-10-25)"))
+            self.assertEqual(conn.execute("SELECT count(*) FROM note_data").fetchone()[0], 3)
+
     def test_hint_created_pinned_once_then_edited_in_place(self):
         with tempfile.TemporaryDirectory() as d:
             db = str(Path(d) / "n.sqlite3")
@@ -166,7 +204,7 @@ class Delivery(unittest.TestCase):
             msg1 = wb.update_hint(db, self.day)
             msg2 = wb.update_hint(db, self.day + dt.timedelta(days=1))
             self.assertIn("created and pinned", msg1)
-            self.assertIn("updated entry", msg2)
+            self.assertIn("updated #", msg2)
             conn = sqlite3.connect(db)
             rows = conn.execute("SELECT entry_no, note_text, pinned FROM note_data WHERE note_text LIKE 'World briefing%'").fetchall()
             self.assertEqual(len(rows), 1)
