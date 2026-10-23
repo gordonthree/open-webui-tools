@@ -1,7 +1,7 @@
 """
 title: Web Research
 author: Gordon
-version: 0.2.0
+version: 0.2.1
 description: Looks something up on the web by operating a real browser step by step (search, open, click, type, read on) and returns a short answer with the pages it came from. It can also look at a screenshot of a page with a vision model, and show_screenshot posts a picture of what the browser saw into the chat. A cloud model does the browsing, so the calling model only asks one question. The browser is the isolated one in the research-browser project (docker/research-browser); it reads pages but does not submit forms or log in. Needs SERVICE_KEY, OPEN_WEBUI_API_KEY and the research-service container.
 """
 
@@ -406,14 +406,14 @@ class Tools:
 
     async def show_screenshot(self, url: str = "", __user__: Optional[dict] = None, __event_emitter__: Optional[Callable] = None) -> Dict[str, Any]:
         """
-        Show Gordon a picture of what the research browser saw, so he can check odd results himself. With no address it shows the last page
+        Show the person you are talking with a picture of what the research browser saw, so they can check odd results themselves. With no address it shows the last page
         of your most recent web research; with an address it opens that page and shows it. The picture appears in the chat on its own, you
         do not need to describe it unless asked.
         :param url: Optional web address to open and show; leave empty for the last page the research browser looked at.
         """
         v = self.valves
         if not v.SERVICE_KEY or not v.OPEN_WEBUI_API_KEY:
-            return {"error": "Web research is not set up yet (key valves are empty). Tell Gordon."}
+            return {"error": "Web research is not set up yet (key valves are empty). Tell its owner."}
         user = str((__user__ or {}).get("id") or "anonymous")
         if url.strip():
             session = f"s{int(time.time())}"
@@ -432,8 +432,10 @@ class Tools:
         if not path:
             return {"error": "The picture was taken but could not be stored in Open WebUI (check OPEN_WEBUI_API_KEY)."}
         if __event_emitter__:
-            await __event_emitter__({"type": "message", "data": {"content": f"\n\n![What the browser saw]({path})\n\n*{where[:150]}*\n"}})
-        return {"shown": True, "page": where, "note": "The picture is now visible to Gordon in the chat. It is a snapshot of the page as the browser saw it."}
+            # A `files` event, like the image tools: Open WebUI saves it with the message. A `message` event is appended to the saved text,
+            # but the model's own reply then replaces that text, so the picture vanished.
+            await __event_emitter__({"type": "files", "data": {"files": [{"type": "image", "url": path}]}})
+        return {"shown": True, "page": where, "note": "The picture is now shown in the chat, attached to your reply. It is a snapshot of the page as the browser saw it."}
 
     async def research(self, question: str, start_url: str = "", __user__: Optional[dict] = None, __event_emitter__: Optional[Callable] = None) -> Dict[str, Any]:
         """
@@ -447,11 +449,11 @@ class Tools:
         if not question:
             return {"error": "Ask a question to research."}
         if not v.SERVICE_KEY or not v.OPEN_WEBUI_API_KEY:
-            return {"error": "Web research is not set up yet (key valves are empty). Tell Gordon."}
+            return {"error": "Web research is not set up yet (key valves are empty). Tell its owner."}
         now = time.time()
         spent_today = sum(c for _, c in read_ledger(v.LEDGER_PATH, now))
         if v.DAILY_BUDGET_USD > 0 and spent_today >= v.DAILY_BUDGET_USD:
-            return {"error": "Today's web research budget is used up. Try again tomorrow or ask Gordon."}
+            return {"error": "Today's web research budget is used up. Try again tomorrow or ask its owner."}
 
         async def status(text: str, done: bool = False) -> None:
             if __event_emitter__:

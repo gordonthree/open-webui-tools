@@ -357,7 +357,7 @@ class ShowScreenshot(unittest.IsolatedAsyncioTestCase):
         tool._upload = lambda png, name: "/api/v1/files/abc/content"
         return tool
 
-    async def test_last_page_is_posted_as_an_image_message(self):
+    async def test_last_page_is_attached_as_an_image_file(self):
         tool, events = self.tool(), []
 
         async def emit(e):
@@ -365,8 +365,8 @@ class ShowScreenshot(unittest.IsolatedAsyncioTestCase):
         out = await tool.show_screenshot(__user__={"id": "u"}, __event_emitter__=emit)
         self.assertEqual(tool.shots, [True])
         self.assertTrue(out["shown"])
-        self.assertEqual(events[0]["type"], "message")
-        self.assertIn("![What the browser saw](/api/v1/files/abc/content)", events[0]["data"]["content"])
+        self.assertEqual(events[0], {"type": "files", "data": {"files": [{"type": "image", "url": "/api/v1/files/abc/content"}]}})
+        self.assertNotIn("Gordon", json.dumps(out))
 
     async def test_url_opens_shoots_and_always_closes(self):
         tool = self.tool()
