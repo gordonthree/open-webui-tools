@@ -56,6 +56,7 @@ from push_tool import DEFAULT_SECRETS_FILE, configured_servers, parse_secrets, s
 PAGE = 10
 MAX_RATINGS = 8
 TURN_TIMEOUT_SECONDS = 300
+RECHECK_TIMEOUT_SECONDS = 1500  # a whole evening can mean 20+ tool calls on a slow local model
 POLL_SECONDS = 3
 MAX_FAILURES_IN_A_ROW = 4
 RATE_LIMIT_WAIT_SECONDS = 150
@@ -219,11 +220,12 @@ def reply_number(reply: str) -> Optional[int]:
     return int(found[-1]) if found else None
 
 
-def run_chunk(url: str, key: str, model: str, tool_ids: List[str], prompt: str, keep_chats: bool) -> "tuple[str, Any]":
+def run_chunk(url: str, key: str, model: str, tool_ids: List[str], prompt: str, keep_chats: bool,
+              timeout: float = TURN_TIMEOUT_SECONDS) -> "tuple[str, Any]":
     chat_id, asst_id = create_backing_chat(url, key, model, "rating pass", prompt)
     try:
         start_turn(url, key, model, chat_id, asst_id, tool_ids, [{"role": "user", "content": prompt}])
-        deadline = time.monotonic() + TURN_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout
         while True:
             time.sleep(POLL_SECONDS)
             msg = read_turn(url, key, chat_id, asst_id)
@@ -233,7 +235,7 @@ def run_chunk(url: str, key: str, model: str, tool_ids: List[str], prompt: str, 
             if msg.get("done"):
                 return strip_details(msg.get("content") or ""), msg.get("output") or []
             if time.monotonic() > deadline:
-                raise AgentError(f"no reply within {TURN_TIMEOUT_SECONDS} seconds")
+                raise AgentError(f"no reply within {timeout:.0f} seconds")
     finally:
         if not keep_chats:
             delete_chat(url, key, chat_id)
@@ -359,7 +361,7 @@ def recheck(url: str, key: str, args, tool_ids: list, groups: List["tuple[str, L
         prompt = build_recheck_prompt(day, items, args.min_weight)
         for attempt in range(1, MAX_FAILURES_IN_A_ROW + 1):
             try:
-                reply, output = run_chunk(url, key, args.model, tool_ids, prompt, args.keep_chats)
+                reply, output = run_chunk(url, key, args.model, tool_ids, prompt, args.keep_chats, RECHECK_TIMEOUT_SECONDS)
                 break
             except (AgentError, requests.RequestException) as ex:
                 wait = RATE_LIMIT_WAIT_SECONDS if is_rate_limit(str(ex)) else args.delay * 2

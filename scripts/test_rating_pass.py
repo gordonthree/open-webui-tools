@@ -65,7 +65,7 @@ class LoopTests(unittest.TestCase):
         args = ["rating_pass.py", "--model", "m", "--note", "n", "--delay", "0", *extra]
         calls = []
 
-        def fake_chunk(url, key, model, tools, prompt, keep):
+        def fake_chunk(url, key, model, tools, prompt, keep, timeout=None):
             calls.append(prompt)
             item = outputs.pop(0)
             if isinstance(item, Exception):
@@ -193,7 +193,7 @@ class RecheckTests(unittest.TestCase):
     def test_main_runs_one_chat_per_group(self):
         prompts = []
 
-        def fake_chunk(url, key, model, tools, prompt, keep):
+        def fake_chunk(url, key, model, tools, prompt, keep, timeout=None):
             prompts.append(prompt)
             return "1", []
 
