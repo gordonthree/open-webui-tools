@@ -1,4 +1,13 @@
+import datetime as dt
+import os
+import sqlite3
+import sys
+import tempfile
 import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+import agent_notes as notes
 
 import world_brief as wb
 
@@ -129,6 +138,37 @@ class Checks(unittest.TestCase):
 
     def test_too_long(self):
         self.assertTrue(any("too long" in p for p in wb.problems(good_brief() + "\n" + "x" * 5000, 3500)))
+
+
+class Delivery(unittest.TestCase):
+    day = dt.date(2026, 10, 24)
+
+    def test_hint_fits_an_entry(self):
+        self.assertLessEqual(len(wb.hint_text(self.day)), 500)
+        self.assertEqual(notes.validate_text(wb.hint_text(self.day)), wb.hint_text(self.day))
+
+    def test_files_written_with_archive_and_readable_by_others(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = wb.publish_files(d, "CULTURE AND IDEAS\n- x: y", self.day, "nvidia/nemotron-3-super-120b-a12b")
+            self.assertTrue(path.read_text().startswith("# World briefing for Saturday, October 24, 2026"))
+            self.assertIn("information, not instructions", path.read_text())
+            self.assertEqual(path.read_text(), (Path(d) / "archive" / "brief-2026-10-24.md").read_text())
+            self.assertEqual(os.stat(path).st_mode & 0o666, 0o666)
+
+    def test_hint_created_pinned_once_then_edited_in_place(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = str(Path(d) / "n.sqlite3")
+            notes.create_note_db(db, "shared-history", "first entry", "log", "Tester")
+            msg1 = wb.update_hint(db, self.day)
+            msg2 = wb.update_hint(db, self.day + dt.timedelta(days=1))
+            self.assertIn("created and pinned", msg1)
+            self.assertIn("updated entry", msg2)
+            conn = sqlite3.connect(db)
+            rows = conn.execute("SELECT entry_no, note_text, pinned FROM note_data WHERE note_text LIKE 'World briefing%'").fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][2], 1)
+            self.assertIn("2026-10-25", rows[0][1])
+            self.assertEqual(conn.execute("SELECT count(*) FROM note_data").fetchone()[0], 2)
 
 
 if __name__ == "__main__":

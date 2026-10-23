@@ -938,6 +938,27 @@ for now).
 Note on OWUI's API: `GET /api/v1/chats/` returns only summary fields (no `folder_id`), so folder
 membership has to be asked for via `GET /api/v1/chats/folder/{id}` or the full `GET /api/v1/chats/{id}`.
 
+## World briefing (daily, for Mara)
+
+`scripts/world_brief.py` writes a neutral daily "1000 ft view" of world events, culture, science and ideas for the agents. Design,
+model comparison and rationale: `docs/world-awareness-design.md`. Tests: `cd scripts && python3 -m unittest test_world_brief`.
+
+- **Pipeline.** Fetches BBC, NPR, Guardian, Positive News, Quanta and Aeon RSS plus Wikipedia's Current Events and most-viewed pages; code trims,
+  de-duplicates, caps each feed and splits hard news into a calm list and a heavy list (keywords; heavy ranked by how many feeds covered the story);
+  `nvidia/nemotron-3-super-120b-a12b` through the local Open WebUI API (`or.` connection, `--no-reasoning` is needed or its thinking fills the reply) picks,
+  rewords and writes the heavy-things line and two questions; code strips markdown, runs a validator (sections, alarm words, casualty figures, headline words
+  such as "mystery" in the hard-news sections, repeats, length) with one retry, and prints the most-viewed list with Wikipedia's own short descriptions.
+  The summarizer has no tools, so web text never shares a context with email/file/notes tools. About $0.001-0.002 per run.
+- **Delivery.** `python3 scripts/world_brief.py --no-reasoning --publish` writes `companion-docs/world/brief.md` (the agents see it as
+  `/companion/world/brief.md`, read with `read_file`, so there is no knowledge-base sync delay) and a dated copy in `world/archive/` (which the oikb sync does index),
+  then keeps **one pinned entry** in Mara's `shared-history` note (author "World Brief", text starts "World briefing") up to date: created and pinned the first time,
+  edited in place daily. Pinned entries are always returned by tagged reads and cannot be changed by the models. It refuses to publish (exit 2, yesterday's brief stays)
+  when the validator still fails or fewer than 8 of 13 sources answered. Valves are options: `--dest`, `--notes-db`, `--no-hint`, `--model`.
+  Mara only for now; Hannah's server has its own database and would need its own copy and slant.
+- **Schedule (not installed by the tool).** Suggested crontab line, daily at 06:30: `30 6 * * * cd /home/gordon/dev/open-webui-tools && python3 scripts/world_brief.py --no-reasoning --publish >> tmp/world_brief.log 2>&1`.
+- **Known limits.** The model sometimes copies a source description instead of rewording it; obituaries can appear under culture; small embellishments are possible
+  (no grounding check yet). A free model can be rate-limited upstream (`ask()` retries 429/502/503 with 20/40/80 s waits).
+
 ## Status notes
 
 ### 2026-10-14

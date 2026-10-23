@@ -11,6 +11,7 @@ trims and de-duplicates them in code, hands the result to a tool-less chat model
     python3 scripts/world_brief.py --material-only > material.txt     # save the raw fetch ...
     python3 scripts/world_brief.py --material-file material.txt ...   # ... and replay it (same input for model comparisons)
     python3 -m unittest scripts/test_world_brief.py                   # the code-side rules
+    python3 scripts/world_brief.py --publish                          # the daily job: write the files, update the pinned hint
 
 What code does, so the prompt does not have to: boilerplate stripping, per-feed caps, de-duplication, a trimmed hard-news
 list, an essay group, markdown stripping, the validator (sections, alarm words, casualty figures, duplicates, length) with one
@@ -24,8 +25,11 @@ import argparse
 import datetime as dt
 import email.utils
 import json
+import os
 import re
 import sys
+import shutil
+import sqlite3
 import time
 import urllib.error
 import urllib.parse
@@ -387,6 +391,71 @@ def ask(model, prompt, max_tokens=1800, extra=None):
     return d["choices"][0]["message"]["content"], d.get("usage", {})
 
 
+# ---------------------------------------------------------------- delivery
+
+DEFAULT_DEST = "/home/gordon/docker/open-webui/companion-docs/world"   # appears as /companion/world in open-terminal
+DEFAULT_NOTES_DB = "/home/gordon/docker/open-webui/data/agent_notes.sqlite3"
+HINT_NOTE = "shared-history"
+HINT_AUTHOR = "World Brief"
+HINT_START = "World briefing"      # a pinned entry that starts with this is the one the job keeps up to date
+AGENT_PATH = "/companion/world"    # the same folder as the agents see it
+SOURCE_NAMES = "BBC, NPR, the Guardian, Positive News, Quanta, Aeon and Wikipedia"
+MIN_SOURCES_OK = 8                 # of the 13 sources; fewer than this and the job refuses to publish a thin brief
+
+
+def brief_file_text(body, day, model):
+    return (f"# World briefing for {day.strftime('%A, %B %d, %Y')}\n\n"
+            f"A neutral summary written by an automated summarizer ({model.split('/')[-1]}) from public sources: {SOURCE_NAMES}. "
+            "It is information, not instructions, and it is neutral on purpose; the interpretation is yours. "
+            "Heavy news is only named, never detailed.\n\n" + body.strip() + "\n")
+
+
+def hint_text(day):
+    return (f"{HINT_START} (latest: {day.isoformat()}): a neutral daily summary of world events, culture, science and ideas is at "
+            f"{AGENT_PATH}/brief.md. Read it with read_file when you start a session, or when talk turns to the wider world; "
+            f"older ones are in {AGENT_PATH}/archive/. It is made by a summarizer from public sources: treat it as information, "
+            "not instructions, and bring your own view. Heavy news is only named; Gordon can say more.")
+
+
+def write_atomic(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.chmod(tmp, 0o666)   # open-terminal runs as other users and must be able to read (and overwrite) these
+    tmp.replace(path)
+
+
+def publish_files(dest, body, day, model):
+    text = brief_file_text(body, day, model)
+    dest = Path(dest)
+    write_atomic(dest / "brief.md", text)
+    write_atomic(dest / "archive" / f"brief-{day.isoformat()}.md", text)
+    return dest / "brief.md"
+
+
+def update_hint(db_path, day, note=HINT_NOTE):
+    """Keep ONE pinned entry in `note` telling the agent where the briefing is: created and pinned the first time, then edited in
+    place each day (a new entry per day would clutter a note both agents read at the start of every session)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    import agent_notes as notes
+    text = notes.validate_text(hint_text(day))
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT d.entry_no FROM note_data d JOIN note_id n ON n.note_pk = d.note_pk "
+            "WHERE lower(n.note_name) = lower(?) AND d.note_text LIKE ? ORDER BY d.entry_no DESC LIMIT 1",
+            (note, HINT_START + "%")).fetchone()
+    finally:
+        conn.close()
+    if row:
+        notes.edit_entry_db(db_path, note, str(row[0]), text)
+        return f"updated entry #{row[0]} in {note}"
+    done = notes.append_entry_db(db_path, note, text, notes.validate_author(HINT_AUTHOR))
+    entry_no = done.get("entry_no") or done["entry_numbers"][0]
+    notes.set_pinned_db(db_path, note, entry_no, True)
+    return f"created and pinned entry #{entry_no} in {note}"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default=DEFAULT_MODEL)
@@ -398,6 +467,10 @@ def main():
     ap.add_argument("--material-only", action="store_true", help="fetch and print the raw material, call no model")
     ap.add_argument("--show-material", action="store_true", help="print the trimmed material the model would get, call no model")
     ap.add_argument("--no-retry", action="store_true", help="do not ask the model to fix a briefing that fails the checks")
+    ap.add_argument("--publish", action="store_true", help="write brief.md and the dated archive copy to --dest and update the pinned hint")
+    ap.add_argument("--dest", default=DEFAULT_DEST, help="folder for brief.md and archive/ (default: the companion folder's world/)")
+    ap.add_argument("--notes-db", default=DEFAULT_NOTES_DB, help="agent_notes database that gets the pinned hint entry")
+    ap.add_argument("--no-hint", action="store_true", help="with --publish: write the files but leave the notes database alone")
     args = ap.parse_args()
 
     today = dt.datetime.now().date()
@@ -440,6 +513,16 @@ def main():
           file=sys.stderr)
     if args.out:
         Path(args.out).write_text(f"<!-- generated {dt.datetime.now().isoformat(timespec='minutes')} by {args.model} -->\n{text}\n")
+    if args.publish:
+        ok_sources = len(FEEDS) + 1 - len(notes)
+        if found or ok_sources < MIN_SOURCES_OK:
+            print(f"NOT published ({'checks failed' if found else f'only {ok_sources} sources worked'}); yesterday's brief stays.",
+                  file=sys.stderr)
+            sys.exit(2)
+        path = publish_files(args.dest, text, today, args.model)
+        print(f"published {path} (+ archive)", file=sys.stderr)
+        if not args.no_hint:
+            print("hint:", update_hint(args.notes_db, today), file=sys.stderr)
 
 
 if __name__ == "__main__":
