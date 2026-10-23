@@ -935,6 +935,15 @@ REPEAT (one tool called 8+ times in a tick, i.e. a retry loop). `--since YYYY-MM
 cron script: **the model has no tool to delete chats** (pinned by the project owner 2026-10-06 as too risky
 for now).
 
+`scripts/read_chat.py <chat_id>` prints one chat as a labelled transcript for troubleshooting an agent: each turn
+is headed with who it is (`Gordon`, `Mara (medium-mara)`), and the agent's thinking, tool calls (with a shortened
+result) and replies are separate, named blocks. Thinking is kept verbatim; only OWUI's reasoning markup
+(`output` reasoning items, `<details type="reasoning">`, `<think>`) is replaced by `[Mara's thinking]` headings,
+and the header says these are the agent's own model output, not Claude's reasoning - pasting raw agent thinking
+into a Claude Code session once tripped a "reasoning extraction" false positive. `--agent NAME`, `--turns 3-7`,
+`--thinking-only`, `--result-chars N` (0 = no results), `--out FILE`. Read-only. Tests:
+`cd scripts && python3 -m unittest test_read_chat -v`.
+
 Note on OWUI's API: `GET /api/v1/chats/` returns only summary fields (no `folder_id`), so folder
 membership has to be asked for via `GET /api/v1/chats/folder/{id}` or the full `GET /api/v1/chats/{id}`.
 
