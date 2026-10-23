@@ -949,13 +949,13 @@ model comparison and rationale: `docs/world-awareness-design.md`. Tests: `cd scr
   rewords and writes the heavy-things line and two questions; code strips markdown, runs a validator (sections, alarm words, casualty figures, headline words
   such as "mystery" in the hard-news sections, repeats, length) with one retry, and prints the most-viewed list with Wikipedia's own short descriptions.
   The summarizer has no tools, so web text never shares a context with email/file/notes tools. About $0.001-0.002 per run.
-- **Delivery.** `python3 scripts/world_brief.py --no-reasoning --publish` writes `companion-docs/world/brief.md` (the agents see it as
-  `/companion/world/brief.md`, read with `read_file`, so there is no knowledge-base sync delay) and a dated copy in `world/archive/` (which the oikb sync does index),
+- **Delivery.** `python3 scripts/world_brief.py --no-reasoning --publish` writes `companion-docs/world/world-brief.md` (the agents see it as
+  `/companion/world/world-brief.md`, read with `read_file`, so there is no knowledge-base sync delay) and a dated copy in `world/archive/world-brief-YYYY-MM-DD.md` (which the oikb sync does index),
   then keeps **one pinned entry** in Mara's `shared-history` note (author "World Brief", text starts "World briefing") up to date: created and pinned the first time,
   edited in place daily. Pinned entries are always returned by tagged reads and cannot be changed by the models. It refuses to publish (exit 2, yesterday's brief stays)
   when the validator still fails or fewer than 8 of 13 sources answered. Valves are options: `--dest`, `--notes-db`, `--no-hint`, `--model`.
   Mara only for now; Hannah's server has its own database and would need its own copy and slant.
-- **Schedule (not installed by the tool).** Suggested crontab line, daily at 06:30: `30 6 * * * cd /home/gordon/dev/open-webui-tools && python3 scripts/world_brief.py --no-reasoning --publish >> tmp/world_brief.log 2>&1`.
+- **Schedule.** Gordon's crontab line (installed 2026-10-23, use the absolute `/usr/bin/python3`: it has pydantic, `/home/gordon/venv` does not; the secrets path is absolute so no `cd` is needed): `30 6 * * * /usr/bin/python3 /home/gordon/dev/open-webui-tools/scripts/world_brief.py --no-reasoning --publish >> /home/gordon/docker/open-webui/companion-docs/world/world_brief.log 2>&1`.
 - **Known limits.** The model sometimes copies a source description instead of rewording it; obituaries can appear under culture; small embellishments are possible
   (no grounding check yet). A free model can be rate-limited upstream (`ask()` retries 429/502/503 with 20/40/80 s waits).
 

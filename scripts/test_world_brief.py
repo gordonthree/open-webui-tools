@@ -143,6 +143,9 @@ class Checks(unittest.TestCase):
 class Delivery(unittest.TestCase):
     day = dt.date(2026, 10, 24)
 
+    def test_hint_names_the_published_file(self):
+        self.assertIn("/companion/world/world-brief.md", wb.hint_text(self.day))
+
     def test_hint_fits_an_entry(self):
         self.assertLessEqual(len(wb.hint_text(self.day)), 500)
         self.assertEqual(notes.validate_text(wb.hint_text(self.day)), wb.hint_text(self.day))
@@ -150,9 +153,10 @@ class Delivery(unittest.TestCase):
     def test_files_written_with_archive_and_readable_by_others(self):
         with tempfile.TemporaryDirectory() as d:
             path = wb.publish_files(d, "CULTURE AND IDEAS\n- x: y", self.day, "nvidia/nemotron-3-super-120b-a12b")
+            self.assertEqual(path.name, "world-brief.md")
             self.assertTrue(path.read_text().startswith("# World briefing for Saturday, October 24, 2026"))
             self.assertIn("information, not instructions", path.read_text())
-            self.assertEqual(path.read_text(), (Path(d) / "archive" / "brief-2026-10-24.md").read_text())
+            self.assertEqual(path.read_text(), (Path(d) / "archive" / "world-brief-2026-10-24.md").read_text())
             self.assertEqual(os.stat(path).st_mode & 0o666, 0o666)
 
     def test_hint_created_pinned_once_then_edited_in_place(self):
