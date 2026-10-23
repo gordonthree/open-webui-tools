@@ -1,0 +1,87 @@
+# Research browser for the agents (Mara/Hannah): a Chromium you can also drive by hand in a web desktop, to set cookies
+# and pass "are you human" checks. Borrowed from docker-server's chromium (lscr.io/linuxserver/chromium, shm 1g, seccomp
+# unconfined, bind-mounted /config), plus isolation:
+#   - the browser lives on `browsernet`, an internal network with NO route to the internet or the LAN;
+#   - its only way out is `egress-proxy` (squid), which refuses private/LAN/Tailscale/loopback addresses and every port but 80/443;
+#   - CDP (browser automation) is only reachable on `browsernet` (container `cdp`), never published on the host;
+#   - the web desktop is published by `ui` on 127.0.0.1 and the Tailscale address only, behind a login.
+# The existing `chromium` container (~/docker/chromium) is Gordon's own and is not touched by this project.
+name: research-browser
+services:
+  browser:
+    image: lscr.io/linuxserver/chromium:latest
+    container_name: research-browser
+    hostname: research-browser
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+      - TITLE=Research browser
+      - CUSTOM_USER=${BROWSER_UI_USER}
+      - PASSWORD=${BROWSER_UI_PASSWORD}
+      - CHROME_CLI=--remote-debugging-port=9222 --proxy-server=http://egress-proxy:3128 about:blank
+    volumes:
+      - ./config:/config
+    shm_size: "1gb"
+    restart: unless-stopped
+    networks: [browsernet]
+
+  cdp:
+    # Chromium's debugging port listens on 127.0.0.1 inside the browser; this shares its network namespace and re-exposes
+    # it on browsernet only (no `ports:`), so the research service can attach and nothing else can.
+    image: alpine/socat:latest
+    container_name: research-browser-cdp
+    network_mode: "service:browser"
+    command: TCP-LISTEN:9223,fork,reuseaddr TCP:127.0.0.1:9222
+    depends_on: [browser]
+    restart: unless-stopped
+
+  ui:
+    # Plain TCP forwarder so the web desktop can be published while the browser itself stays on the internal network.
+    image: alpine/socat:latest
+    container_name: research-browser-ui
+    entrypoint: ["/bin/sh", "-c", "socat TCP-LISTEN:3000,fork,reuseaddr TCP:browser:3000 & exec socat TCP-LISTEN:3001,fork,reuseaddr TCP:browser:3001"]
+    ports:
+      - "127.0.0.1:3100:3000"
+      - "100.86.205.41:3100:3000"
+      - "127.0.0.1:3101:3001"
+      - "100.86.205.41:3101:3001"
+    depends_on: [browser]
+    restart: unless-stopped
+    networks: [browsernet, front]
+
+  egress-proxy:
+    image: ubuntu/squid:latest
+    container_name: research-browser-proxy
+    volumes:
+      - ./squid.conf:/etc/squid/squid.conf:ro
+      - ./blocked-domains.txt:/etc/squid/blocked-domains.txt:ro
+    restart: unless-stopped
+    networks: [browsernet, front]
+
+  service:
+    # Safe browser actions (open/read/click/type/screenshot) for the Open WebUI tool; no LLM and no credentials of its own.
+    # Reachable by Open WebUI as http://research-service:8890 (it joins open-webui_default); also on 127.0.0.1:8890 for testing.
+    build: /home/gordon/dev/open-webui-tools/docker/research-browser/service
+    container_name: research-service
+    environment:
+      - RESEARCH_API_KEY=${RESEARCH_API_KEY}
+      - CDP_URL=http://research-browser:9223
+      - READ_ONLY=1
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:8890:8890"
+    depends_on: [browser, cdp]
+    restart: unless-stopped
+    networks: [browsernet, openwebui]
+
+networks:
+  browsernet:
+    internal: true
+  front: {}
+  openwebui:
+    name: open-webui_default
+    external: true

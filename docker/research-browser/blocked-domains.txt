@@ -1,0 +1,2 @@
+# Domains the agents' browser must never visit, one per line (a leading dot also blocks subdomains). Edit, then:
+#   docker exec research-browser-proxy squid -k reconfigure

@@ -51,6 +51,7 @@ DEFAULT_SECRETS_FILE = REPO_ROOT / "secrets.md"
 BACKUP_DIR = REPO_ROOT / "tmp"
 
 TOOL_NAMES = ["comfy_sdxl_direct", "comfy_sdxl_graph", "comfy_sdxl_retrieve", "comfy_sdxl_poses", "agent_notes", "nextcloud_mail", "voice_memo", "openrouter_image", "drum_machine", "describe_image", "folder_chat_search", "memory_entry_check", "append_file", "agent_notes_curation"]
+EXPLICIT_TOOLS = ["research_browser"]  # tools that are pushed only when named, never by 'all' (they give an agent a new capability: Gordon decides where)
 FUNCTION_NAMES = ["agent_duo", "vision_describe"]  # Open WebUI Functions (Pipes), pushed via /api/v1/functions/ - not part of 'all'
 
 _KV_RE = re.compile(r"^([A-Za-z0-9_]+):\s*(.+?)\s*$")
@@ -227,7 +228,7 @@ def resolve_tool_id(values: dict, server: str, tool_name: str, base_url: str, ap
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("tools", nargs="+", help=f"One or more of {TOOL_NAMES + FUNCTION_NAMES}, or 'all' (the tools).")
+    parser.add_argument("tools", nargs="+", help=f"One or more of {TOOL_NAMES + EXPLICIT_TOOLS + FUNCTION_NAMES}, or 'all' (the tools, not the explicit-only ones or the functions).")
     parser.add_argument("--server", action="append", metavar="NAME", help="Server to push to: local (the default), a name configured as OWUI_<NAME>_URL/_KEY, or 'all'. May be repeated.")
     parser.add_argument("--secrets-file", type=Path, default=DEFAULT_SECRETS_FILE)
     parser.add_argument("--create", action="store_true", help="Create a tool or Function that doesn't exist on the server yet (otherwise that is an error).")
@@ -240,9 +241,9 @@ def main() -> None:
         names = TOOL_NAMES
     else:
         names = args.tools
-        unknown = [n for n in names if n not in TOOL_NAMES + FUNCTION_NAMES]
+        unknown = [n for n in names if n not in TOOL_NAMES + EXPLICIT_TOOLS + FUNCTION_NAMES]
         if unknown:
-            parser.error(f"Unknown tool name(s) {unknown}; choose from {TOOL_NAMES + FUNCTION_NAMES} or 'all'.")
+            parser.error(f"Unknown tool name(s) {unknown}; choose from {TOOL_NAMES + EXPLICIT_TOOLS + FUNCTION_NAMES} or 'all'.")
 
     values = parse_secrets(args.secrets_file)
     extras = configured_servers(values)

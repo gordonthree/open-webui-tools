@@ -961,6 +961,14 @@ model comparison and rationale: `docs/world-awareness-design.md`. Tests: `cd scr
 - **Known limits.** The model sometimes copies a source description instead of rewording it; obituaries can appear under culture; small embellishments are possible
   (no grounding check yet). A free model can be rate-limited upstream (`ask()` retries 429/502/503 with 20/40/80 s waits).
 
+## Web research (research_browser tool and the research-browser containers)
+
+Mara and Hannah get the web through one tool, `research(question)` in `src/research_browser.py`: a cloud model (Nemotron) operates an isolated Chromium
+step by step and returns a short, sourced answer, so the local model only asks a question. Everything - the isolated browser with a web desktop Gordon can
+use to set cookies and pass robot checks, the egress filter, the service, security measures, tests, costs and what is not done yet - is documented in
+`docker/research-browser/README.md`. Built 2026-10-23; **not deployed to Open WebUI yet** (`push_tool.py research_browser --create`, fill the two key valves, attach to a model).
+Tests: `cd src && python3 -m unittest test_research_browser`.
+
 ## Status notes
 
 ### 2026-10-14

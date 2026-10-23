@@ -88,5 +88,12 @@ class PushTests(unittest.TestCase):
         self.assertEqual(pt.TOOL_NAMES[-1], "agent_notes_curation")
 
 
+class ExplicitOnly(unittest.TestCase):
+    def test_research_browser_is_known_but_not_part_of_all(self):
+        self.assertNotIn("research_browser", pt.TOOL_NAMES)
+        self.assertIn("research_browser", pt.EXPLICIT_TOOLS)
+        self.assertFalse(set(pt.EXPLICIT_TOOLS) & set(pt.FUNCTION_NAMES))
+
+
 if __name__ == "__main__":
     unittest.main()
