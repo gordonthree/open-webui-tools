@@ -418,34 +418,6 @@ def hint_text(day):
             "not instructions, and bring your own view. Heavy news is only named; Gordon can say more.")
 
 
-DIGEST_START = "World today"      # the second pinned entry: a few real headlines, rebuilt every day
-DIGEST_LIMIT = 490
-
-
-def item_title(line):
-    return line.lstrip("- ").split(": ", 1)[0].strip()
-
-
-def digest_text(brief, day):
-    """A short pinned digest of the day's brief, built in code from its own item titles and heavy line, so an agent that never opens
-    the file still knows what is in it (Mara's session-start routine reads the notes but nothing tells her to open the file)."""
-    secs = split_sections(brief)
-    titles = []
-    for key, n in (("CULTURE AND IDEAS", 3), ("SCIENCE AND DISCOVERY", 1), ("GOOD NEWS", 1)):
-        short = [item_title(l) for l in secs.get(key, []) if l.startswith("- ") and len(item_title(l)) <= 80]  # never cut a headline
-        titles += short[:n]
-    heavy = " ".join(secs.get("HEAVY THINGS RIGHT NOW", []))
-    heavy = re.sub(r"\s*Ask for more detail.*$", "", re.sub(r"^Right now there is\s*", "", heavy)).strip(" .")
-    tail = f" More, and what people are looking up, in {AGENT_PATH}/{BRIEF_FILE} (read_file)."
-    head = f"{DIGEST_START} ({day.isoformat()}): "
-    heavy_part = f" Heavy, only named: {heavy[:150].rsplit(' ', 1)[0] if len(heavy) > 150 else heavy}." if heavy else ""
-    text = head + "; ".join(titles) + "." + heavy_part + tail
-    while len(text) > DIGEST_LIMIT and len(titles) > 1:     # drop headlines from the end until it fits
-        titles.pop()
-        text = head + "; ".join(titles) + "." + heavy_part + tail
-    return text
-
-
 def write_atomic(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -474,26 +446,21 @@ def _pinned_entry(db_path, note, prefix):
     return row[0] if row else None
 
 
-def update_hint(db_path, day, brief="", note=HINT_NOTE):
-    """Keep TWO pinned entries in `note`, each created and pinned the first time and then edited in place every day (a new entry per
-    day would clutter a note both agents read at the start of every session): the hint (where the briefing is and what to do with it)
-    and, when the brief's text is given, a short digest of it."""
+def update_hint(db_path, day, note=HINT_NOTE):
+    """Keep ONE pinned entry in `note` telling the agent where the briefing is: created and pinned the first time, then edited in
+    place each day (a new entry per day would clutter a note both agents read at the start of every session). Only a pinned entry
+    is ever taken for it, never something an agent wrote."""
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
     import agent_notes as notes
-    done = []
-    wanted = [(HINT_START, hint_text(day))] + ([(DIGEST_START, digest_text(brief, day))] if brief else [])
-    for prefix, raw in wanted:
-        text = notes.validate_text(raw)
-        entry_no = _pinned_entry(db_path, note, prefix)
-        if entry_no:
-            notes.edit_entry_db(db_path, note, str(entry_no), text)
-            done.append(f"updated #{entry_no} ({prefix})")
-        else:
-            made = notes.append_entry_db(db_path, note, text, notes.validate_author(HINT_AUTHOR))
-            entry_no = made.get("entry_no") or made["entry_numbers"][0]
-            notes.set_pinned_db(db_path, note, entry_no, True)
-            done.append(f"created and pinned #{entry_no} ({prefix})")
-    return f"{', '.join(done)} in {note}"
+    text = notes.validate_text(hint_text(day))
+    entry_no = _pinned_entry(db_path, note, HINT_START)
+    if entry_no:
+        notes.edit_entry_db(db_path, note, str(entry_no), text)
+        return f"updated entry #{entry_no} in {note}"
+    made = notes.append_entry_db(db_path, note, text, notes.validate_author(HINT_AUTHOR))
+    entry_no = made.get("entry_no") or made["entry_numbers"][0]
+    notes.set_pinned_db(db_path, note, entry_no, True)
+    return f"created and pinned entry #{entry_no} in {note}"
 
 
 def main():
@@ -510,15 +477,13 @@ def main():
     ap.add_argument("--publish", action="store_true", help="write world-brief.md and the dated archive copy to --dest and update the pinned hint")
     ap.add_argument("--dest", default=DEFAULT_DEST, help="folder for world-brief.md and archive/ (default: the companion folder's world/)")
     ap.add_argument("--notes-db", default=DEFAULT_NOTES_DB, help="agent_notes database that gets the pinned hint entry")
-    ap.add_argument("--hint-only", action="store_true", help="rebuild the pinned entries from the already published brief in --dest; no fetch, no model call")
+    ap.add_argument("--hint-only", action="store_true", help="only refresh the pinned hint entry; no fetch, no model call")
     ap.add_argument("--no-hint", action="store_true", help="with --publish: write the files but leave the notes database alone")
     args = ap.parse_args()
 
     today = dt.datetime.now().date()
     if args.hint_only:
-        published = (Path(args.dest) / BRIEF_FILE).read_text()
-        print("hint:", update_hint(args.notes_db, today, published), file=sys.stderr)
-        print(digest_text(published, today))
+        print("hint:", update_hint(args.notes_db, today), file=sys.stderr)
         return
     if args.material_file:
         raw, _, top = Path(args.material_file).read_text().partition(TOP_MARK)
@@ -568,7 +533,7 @@ def main():
         path = publish_files(args.dest, text, today, args.model)
         print(f"published {path} (+ archive)", file=sys.stderr)
         if not args.no_hint:
-            print("hint:", update_hint(args.notes_db, today, text), file=sys.stderr)
+            print("hint:", update_hint(args.notes_db, today), file=sys.stderr)
 
 
 if __name__ == "__main__":

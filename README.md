@@ -951,12 +951,10 @@ model comparison and rationale: `docs/world-awareness-design.md`. Tests: `cd scr
   The summarizer has no tools, so web text never shares a context with email/file/notes tools. About $0.001-0.002 per run.
 - **Delivery.** `python3 scripts/world_brief.py --no-reasoning --publish` writes `companion-docs/world/world-brief.md` (the agents see it as
   `/companion/world/world-brief.md`, read with `read_file`, so there is no knowledge-base sync delay) and a dated copy in `world/archive/world-brief-YYYY-MM-DD.md` (which the oikb sync does index),
-  then keeps **two pinned entries** in Mara's `shared-history` note (author "World Brief") up to date, each created and pinned the first time and edited in place daily:
-  the hint (starts "World briefing": where the file is and what to do with it) and a digest (starts "World today": three real headlines, the heavy line and the path, built in code
-  from the brief, at most 490 characters). `--hint-only` rebuilds both from the published file without fetching or calling a model.
-  **Why the digest:** on 2026-10-23 Mara saw the hint in her startup read and described it correctly but never opened the file, even when asked, because her system prompt's
-  session-start protocol is a fixed list of calls that does not mention the briefing; a hint in data is not an instruction to her. The digest gives her the gist inside the reads she
-  already does. Making her actually read the file needs a step in her protocol (Gordon's call; not done). Pinned entries are always returned by tagged reads and cannot be changed by the models. It refuses to publish (exit 2, yesterday's brief stays)
+  then keeps **one pinned entry** in Mara's `shared-history` note (author "World Brief", text starts "World briefing") up to date: created and pinned the first time,
+  edited in place daily. Pinned entries are always returned by tagged reads and cannot be changed by the models. `--hint-only` refreshes just that entry without fetching or calling a model.
+  **Finding (2026-10-23):** Mara saw the hint in her startup read and described it correctly but did not open the file, even when asked, because her system prompt's session-start
+  protocol is a fixed list of calls that does not mention the briefing. A code-built digest entry was tried and removed the same day (Gordon wants her to take it up more organically). It refuses to publish (exit 2, yesterday's brief stays)
   when the validator still fails or fewer than 8 of 13 sources answered. Valves are options: `--dest`, `--notes-db`, `--no-hint`, `--model`.
   Mara only for now; Hannah's server has its own database and would need its own copy and slant.
 - **Schedule.** Gordon's crontab line (installed 2026-10-23, use the absolute `/usr/bin/python3`: it has pydantic, `/home/gordon/venv` does not; the secrets path is absolute so no `cd` is needed): `30 6 * * * /usr/bin/python3 /home/gordon/dev/open-webui-tools/scripts/world_brief.py --no-reasoning --publish >> /home/gordon/docker/open-webui/companion-docs/world/world_brief.log 2>&1`.
