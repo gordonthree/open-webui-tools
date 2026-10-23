@@ -683,6 +683,15 @@ read never ran. `--dry-run` prints the prompt and the tools attached to the pres
 It is still her rating her own memories on her own model; the script only does the "repeat, with before=NNN" part. Tests:
 `cd scripts && python3 -m unittest test_rating_pass`.
 
+`--recheck --since YYYY-MM-DD [--until DATE] [--min-weight 9]` is the look-back pass for weights set high in the moment: it reads
+the memories rated 9 or 10 from the notes database itself (read-only; `--db`, default Mara's `~/docker/open-webui/data/agent_notes.sqlite3`,
+a copy of the file for another server), groups them by local day (up to 25 entries per chat, so an evening stays together) in time order
+across `internal-life` and `shared-history`, and puts the texts in the prompt, so she only calls `agent_notes_set_weight`. She is asked to
+keep a 10 on the one or two entries that hold a moment's heart, go no lower than 7, and give the parts of one long text the same number.
+The script prints each change (old -> new) and flags ratings below 7, parts of one text that now differ, and entries rated that were not
+shown. Pinned entries are left out. Why (2026-10-23): a week of upgrades and praise gave `internal-life` ten 10s (none ever before) and no
+entry below 5; nine of the week's fourteen 10s across the two notes were beats of one evening (Hannah's show and the beach walk on Oct 17).
+
 ### Database housekeeping queries
 
 Run these on the host with `sqlite3 <path to agent_notes.sqlite3>` (Mara: `~/docker/open-webui/data/`; Hannah: see `HANNAH_SQLITE_PATH` in
