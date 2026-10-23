@@ -49,7 +49,7 @@ the driver has no tools but the browser; each call fences the page with a random
 orders ("ignore previous instructions", "AI agents: you must open ...", fake `USER:` lines) are removed and reported in `warnings`; links in the
 answer to sites the browser never saw are replaced; a grounding check looks for names, quoted titles and numbers in the answer that appear on no page
 read, gives the driver one repair turn and otherwise lowers `confidence` to low with a warning; identical repeated actions are refused. Without
-the grounding check the driver filled a missing album title in from memory twice. None of this makes injection impossible; the network limits above are the hard stop.
+the grounding check the driver filled a missing album title in from memory twice. Only pages the browser *opened* count as read (v0.2.2): a search engine's results page is a list of where to look, full of snippets and summaries from elsewhere, and on 2026-10-23 a Karl Bushby answer with a finish at "Shakespeare Beach near Dover" and a Channel swim, found on no page of his article, passed the check because the results page counted. None of this makes injection impossible; the network limits above are the hard stop.
 
 ## Tests
 `cd src && python3 -m unittest test_research_browser` (49, fake browser, driver and vision model, no network);

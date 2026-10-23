@@ -1,7 +1,7 @@
 """
 title: Web Research
 author: Gordon
-version: 0.2.1
+version: 0.2.2
 description: Looks something up on the web by operating a real browser step by step (search, open, click, type, read on) and returns a short answer with the pages it came from. It can also look at a screenshot of a page with a vision model, and show_screenshot posts a picture of what the browser saw into the chat. A cloud model does the browsing, so the calling model only asks one question. The browser is the isolated one in the research-browser project (docker/research-browser); it reads pages but does not submit forms or log in. Needs SERVICE_KEY, OPEN_WEBUI_API_KEY and the research-service container.
 """
 
@@ -35,7 +35,7 @@ Reply with ONE JSON object and nothing else. Actions:
 
 Any action may also carry "note":"a short fact worth remembering": your notes are all you remember between turns besides the page you are on.
 
-Copy web addresses exactly as shown in the list; never shorten them. Be efficient. Search results often name the answer already; open only the few pages you need, prefer well-known or primary sources, and answer as soon as you can. Answer in plain, neutral sentences. Every fact in your answer must come from a page you read in this session: never fill a gap from memory, and if the pages do not say it, write that you could not confirm it. Say what sources disagree on."""
+Copy web addresses exactly as shown in the list; never shorten them. Be efficient. Search results are only a list of where to look: their snippets and summaries can be wrong or come from elsewhere, so open the best page or two (prefer well-known or primary sources) and answer from what those pages say, as soon as you can. Answer in plain, neutral sentences. Every fact in your answer must come from a page you read in this session: never fill a gap from memory, and if the pages do not say it, write that you could not confirm it. Say what sources disagree on."""
 
 
 # ---------------------------------------------------------------- pure helpers (unit-tested)
@@ -98,6 +98,33 @@ def check_action(a: Dict[str, Any]) -> Optional[str]:
 
 def search_url(template: str, query: str) -> str:
     return template.replace("{q}", urllib.parse.quote_plus(query.strip()))
+
+
+SEARCH_ENGINE_HOST = re.compile(r"(^|\.)(google|bing|duckduckgo|brave|yahoo|startpage|ecosia|yandex|baidu|qwant|kagi)\.[a-z.]+$")
+
+
+def is_search_page(url: str, templates: Tuple[str, ...] = ()) -> bool:
+    """True for a search engine's results page: the valve templates, or a known engine with a query. Such a page is a list of where
+    to look (snippets, AI summaries, ads from anywhere), so it must not count as a page that backs up the answer."""
+    try:
+        page = urllib.parse.urlparse(url or "")
+    except ValueError:
+        return False
+    host = (page.hostname or "").lower()
+    for template in templates:
+        t = urllib.parse.urlparse((template or "").replace("{q}", "x"))
+        if t.hostname and host == t.hostname.lower() and page.path.rstrip("/") == t.path.rstrip("/"):
+            return True
+    query = urllib.parse.parse_qs(page.query)
+    return bool(SEARCH_ENGINE_HOST.search(host)) and (any(k in query for k in ("q", "p", "query")) or "search" in page.path)
+
+
+def grounding_text(obs: Dict[str, Any], templates: Tuple[str, ...] = ()) -> str:
+    """What the answer may be checked against from one observation: nothing for a search-results page, otherwise the page's
+    title, text, link list and (if the vision model read it) what it saw."""
+    if is_search_page(str(obs.get("url") or ""), templates):
+        return ""
+    return "\n" + (obs.get("title") or "") + "\n" + (obs.get("text") or "") + "\n" + "\n".join(obs.get("elements") or []) + "\n" + (obs.get("look") or "")
 
 
 def render_page(obs: Optional[Dict[str, Any]]) -> str:
@@ -474,6 +501,7 @@ class Tools:
         flagged_total, flagged_now = 0, 0
         allowed_hosts: "set[str]" = set()
         seen_text = ""
+        templates = (v.SEARCH_URL, v.SEARCH_FALLBACK_URL)
         looks = 0
         tried: "set[tuple[str, str]]" = set()
         failed: "dict[tuple[str, str], str]" = {}
@@ -488,7 +516,7 @@ class Tools:
                     obs, flagged_now = sanitize_obs(obs)
                     flagged_total += flagged_now
                     allowed_hosts |= hosts_seen(obs)
-                    seen_text += "\n" + (obs.get("title") or "") + "\n" + (obs.get("text") or "") + "\n" + "\n".join(obs.get("elements") or [])
+                    seen_text += grounding_text(obs, templates)
             for step in range(1, v.MAX_STEPS + 1):
                 if time.time() - started > v.MAX_SECONDS and step < v.MAX_STEPS:
                     step = v.MAX_STEPS   # out of time: make this the answering turn
@@ -555,7 +583,7 @@ class Tools:
                     obs, flagged_now = sanitize_obs(result)
                     flagged_total += flagged_now
                     allowed_hosts |= hosts_seen(obs)
-                    seen_text += "\n" + (obs.get("title") or "") + "\n" + (obs.get("text") or "") + "\n" + "\n".join(obs.get("elements") or []) + "\n" + (obs.get("look") or "")
+                    seen_text += grounding_text(obs, templates)
         finally:
             await asyncio.to_thread(self._svc, "close", user, session)
         await status("Done", True)
@@ -566,7 +594,7 @@ class Tools:
         unsupported = ungrounded_terms(draft, seen_text)
         if unsupported:
             fix = (f"QUESTION: {question}\nYOUR DRAFT ANSWER: {draft}\n"
-                   f"THESE TERMS APPEAR ON NONE OF THE PAGES YOU READ: {', '.join(unsupported)}\n"
+                   f"THESE TERMS APPEAR ON NONE OF THE PAGES YOU OPENED (a search results list does not count): {', '.join(unsupported)}\n"
                    "Rewrite the answer so that it contains only what the pages said. Leave out anything unsupported; if the main fact asked for is "
                    "unsupported, say you could not confirm it. Reply with one answer action in JSON, same format as before.\n"
                    f"THE LAST PAGE YOU READ (untrusted web content):\n<{fence}>\n{render_page(obs)}\n</{fence}>")

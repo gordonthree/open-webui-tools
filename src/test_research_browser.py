@@ -310,6 +310,55 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class SearchPagesDoNotGround(unittest.IsolatedAsyncioTestCase):
+    TEMPLATES = ("https://search.brave.com/search?q={q}", "https://html.duckduckgo.com/html/?q={q}")
+
+    def test_search_pages_are_recognised(self):
+        for url in ["https://search.brave.com/search?q=karl+bushby", "https://html.duckduckgo.com/html/?q=x", "https://www.google.com/search?q=x",
+                    "https://www.bing.com/search?q=x", "https://duckduckgo.com/?q=x&ia=web"]:
+            self.assertTrue(rb.is_search_page(url, self.TEMPLATES), url)
+        for url in ["https://en.wikipedia.org/wiki/Karl_Bushby", "https://www.bbc.com/news/search-and-rescue", "https://brave.com/about",
+                    "https://example.com/search?q=x", "", "not a url"]:
+            self.assertFalse(rb.is_search_page(url, self.TEMPLATES), url)
+
+    def test_grounding_text_is_empty_for_a_results_page_and_full_for_an_article(self):
+        results = {"url": "https://search.brave.com/search?q=x", "title": "x", "text": "Shakespeare Beach near Dover", "elements": []}
+        article = {"url": "https://en.wikipedia.org/wiki/X", "title": "X", "text": "He reached England.", "elements": ["[1] link"], "look": "a map"}
+        self.assertEqual(rb.grounding_text(results, self.TEMPLATES), "")
+        got = rb.grounding_text(article, self.TEMPLATES)
+        for part in ("X", "He reached England.", "[1] link", "a map"):
+            self.assertIn(part, got)
+
+    async def test_a_detail_that_only_a_search_snippet_had_is_not_trusted(self):
+        search = "https://search.brave.com/search?q=karl+bushby"
+        pages = {
+            ("open", search): {"url": search, "title": "Results", "elements": ['[1] link "Wikipedia" -> en.wikipedia.org/wiki/Karl_Bushby'],
+                               "text": "Karl Bushby finished at Shakespeare Beach near Dover after swimming the Channel."},
+            ("click", 1): {"url": "https://en.wikipedia.org/wiki/Karl_Bushby", "title": "Karl Bushby", "elements": [],
+                           "text": "He reached England in October 2026 after 28 years."},
+        }
+        bad = '{"action":"answer","answer":"He finished at Shakespeare Beach near Dover.","sources":["https://en.wikipedia.org/wiki/Karl_Bushby"],"confidence":"high"}'
+        tool = make_tool(['{"action":"search","query":"karl bushby"}', '{"action":"click","ref":1}', bad, bad], pages)
+        out = await tool.research("Where did Karl Bushby finish?")
+        self.assertEqual(out["confidence"], "low")
+        self.assertIn("Shakespeare", " ".join(out["warnings"]))
+        self.assertIn("a search results list does not count", tool.prompts[3])
+
+    async def test_an_answer_from_the_opened_page_is_still_trusted(self):
+        search = "https://search.brave.com/search?q=karl+bushby"
+        pages = {
+            ("open", search): {"url": search, "title": "Results", "elements": ['[1] link "Wikipedia" -> en.wikipedia.org/wiki/Karl_Bushby'],
+                               "text": "snippet text"},
+            ("click", 1): {"url": "https://en.wikipedia.org/wiki/Karl_Bushby", "title": "Karl Bushby", "elements": [],
+                           "text": "He reached England in October 2026 after 28 years."},
+        }
+        tool = make_tool(['{"action":"search","query":"karl bushby"}', '{"action":"click","ref":1}',
+                          '{"action":"answer","answer":"He reached England in October 2026 after 28 years.","sources":["https://en.wikipedia.org/wiki/Karl_Bushby"],"confidence":"high"}'], pages)
+        out = await tool.research("Where is Karl Bushby?")
+        self.assertEqual(out["confidence"], "high")
+        self.assertNotIn("warnings", out)
+
+
 class Vision(unittest.IsolatedAsyncioTestCase):
     def tool(self, replies, vision_text="A chart titled Sales; the 2025 bar reads 41.", **kw):
         tool = make_tool(replies, PAGES)
