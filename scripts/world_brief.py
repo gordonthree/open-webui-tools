@@ -93,6 +93,8 @@ Rules:
 - Report each claim at the strength the source gives it. Where something is disputed, say so.
 - Report what was released, won, found or published. Leave out reviews and opinion pieces.
 - Say only what the item itself says. Do not add causes, consequences or details.
+- Items end with their age in square brackets, such as [3 days ago]. For an item 3 or more days old, end its line with that age in
+  parentheses, as written, so it does not read as current; leave the age out for anything newer. Never write a calendar date.
 
 Sections, in this order, each label alone on its line:
 CULTURE AND IDEAS (5-6 items: books, arts, music, film, language, history)
@@ -112,6 +114,117 @@ Keep the whole briefing under {limit} characters.
 """
 
 TOP_MARK = "\n=====TOP-PAGES=====\n"
+
+
+# ---------------------------------------------------------------- relative time (code, not prompt)
+# The agents do not need calendar dates, and a story's date read as "now" makes an old item look current. So every item carries its
+# age in plain words, and any day-level date in the text is rewritten the same way, before the model sees it and again on what it wrote.
+
+MONTHS = {m: i for i, names in enumerate(
+    ["Jan january", "Feb february", "Mar march", "Apr april", "May", "Jun june", "Jul july", "Aug august", "Sep sept september",
+     "Oct october", "Nov november", "Dec december"], 1) for m in names.lower().split()}
+_MON = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|Sept?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?"
+_ORD = r"(?:st|nd|rd|th)?"
+DAY_MONTH = re.compile(r"(?:\b(?:on|On)\s+)?(?:\b(?:Mon|Tues?|Wed(?:nes)?|Thu(?:rs?)?|Fri|Sat(?:ur)?|Sun)(?:day)?,?\s+)?\b(\d{1,2})(?!\d)" + _ORD +
+                       r"\s+(?:of\s+)?(" + _MON + r")(?:,?\s+(\d{4}))?\b")
+MONTH_DAY = re.compile(r"(?:\b(?:on|On)\s+)?(?:\b(?:Mon|Tues?|Wed(?:nes)?|Thu(?:rs?)?|Fri|Sat(?:ur)?|Sun)(?:day)?,?\s+)?\b(" + _MON + r")\s+(\d{1,2})(?!\d)" + _ORD +
+                       r"(?:,?\s+(\d{4})\b)?")
+ISO_DATE = re.compile(r"(?:\b(?:on|On)\s+)?\b(\d{4})-(\d{2})-(\d{2})\b")
+SLASH_DATE = re.compile(r"(?:\b(?:on|On)\s+)?\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
+AGE_TAG = re.compile(r"\[((?:today|yesterday|tomorrow|[^\]]*\b(?:ago|from now)))\]")
+
+
+def age_phrase(day, today):
+    """A date as plain words relative to today: "yesterday", "3 days ago", "a few weeks ago"; a date still to come says "from now"."""
+    delta = (day - today).days
+    if delta == 0:
+        return "today"
+    if abs(delta) == 1:
+        return "yesterday" if delta < 0 else "tomorrow"
+    n = abs(delta)
+    if n < 7:
+        words = f"{n} days"
+    elif n < 14:
+        words = "about a week"
+    elif n < 42:
+        words = "a few weeks"
+    elif n < 90:
+        words = "a couple of months"
+    elif n < 365:
+        words = f"{round(n / 30.4)} months"
+    elif n < 730:
+        words = "over a year"
+    else:
+        words = f"{n // 365} years"
+    return f"{words} ago" if delta < 0 else f"{words} from now"
+
+
+def _nearest(month, day, today):
+    """A date given without a year: the year that puts it closest to today."""
+    best = None
+    for year in (today.year - 1, today.year, today.year + 1):
+        try:
+            cand = dt.date(year, month, day)
+        except ValueError:
+            return None
+        if best is None or abs((cand - today).days) < abs((best - today).days):
+            best = cand
+    return best
+
+
+def relativize_text(text, today):
+    """Rewrite every day-level date in text ("on 5 October", "Oct. 5, 2026", "2026-10-05", "10/22/2026") as its age in words.
+    A date that is not a real one (31 February), or a numeric one that could be day-first or month-first, is left as it is.
+    Months and years alone ("June 2026", "in 1998") are left alone. Returns (new text, how many dates were rewritten)."""
+    count = 0
+
+    def swap(day):
+        nonlocal count
+        count += 1
+        return age_phrase(day, today)
+
+    def build(year, month, day):
+        try:
+            return dt.date(int(year), month, int(day)) if year else _nearest(month, int(day), today)
+        except ValueError:
+            return None
+
+    def dm(m):
+        d = build(m.group(3), MONTHS[m.group(2).rstrip(".").lower()], m.group(1))
+        return swap(d) if d else m.group(0)
+
+    def md(m):
+        d = build(m.group(3), MONTHS[m.group(1).rstrip(".").lower()], m.group(2))
+        return swap(d) if d else m.group(0)
+
+    def iso(m):
+        try:
+            return swap(dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+        except ValueError:
+            return m.group(0)
+
+    def slash(m):
+        a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if a <= 12 and b <= 12 and a != b:
+            return m.group(0)  # 3/4/2026: March 4th or 3 April? not guessed
+        try:
+            return swap(dt.date(y, a, b) if b > 12 or a == b else dt.date(y, b, a))
+        except ValueError:
+            return m.group(0)
+
+    for pattern, fn in ((DAY_MONTH, dm), (MONTH_DAY, md), (ISO_DATE, iso), (SLASH_DATE, slash)):
+        text = pattern.sub(fn, text)
+    return text, count
+
+
+FRESH_AGE = re.compile(r"[ \t]*\((?:today|yesterday|2 days ago)\)[ \t]*$", re.M)
+
+
+def tidy_age_tags(text):
+    """[3 days ago] -> (3 days ago): a model sometimes copies the material's square-bracket tag instead of writing it as a phrase.
+    The age is only worth saying for an item 3 or more days old, so (today), (yesterday) and (2 days ago) are taken off again here:
+    the model copies every tag whatever the prompt says."""
+    return FRESH_AGE.sub("", AGE_TAG.sub(lambda m: f"({m.group(1)})", text))
 
 
 # ---------------------------------------------------------------- fetching
@@ -139,24 +252,28 @@ def clean(text):
     return BOILERPLATE.sub("", re.sub(r"\s+", " ", text).strip())
 
 
-def feed_items(url, max_age_days, now=None):
-    """RSS items as "- title: description" lines, newest first as the feed gives them, skipping stale ones."""
+def feed_items(url, max_age_days, now=None, today=None):
+    """RSS items as "- title: description [age]" lines, newest first as the feed gives them, skipping stale ones. The age is the
+    item's own publish date in plain words ("yesterday", "3 days ago"); an item with no usable date has none."""
     now = now or dt.datetime.now(dt.timezone.utc)
+    today = today or dt.datetime.now().date()
     out = []
     for item in ET.fromstring(get(url)).iter("item"):
         title = clean(item.findtext("title"))
         desc = clean(item.findtext("description"))[:240]
         if not title:
             continue
+        age = ""
         try:
             when = email.utils.parsedate_to_datetime(item.findtext("pubDate") or "")
             if when.tzinfo is None:
                 when = when.replace(tzinfo=dt.timezone.utc)
             if now - when > dt.timedelta(days=max_age_days):
                 continue
+            age = f" [{age_phrase(when.astimezone().date(), today)}]"
         except (TypeError, ValueError):
             pass  # no usable date: keep the item
-        out.append(drop_alarm_quotes(f"- {title}" + (f": {desc}" if desc else "")))
+        out.append(drop_alarm_quotes(f"- {title}" + (f": {desc}" if desc else "") + age))
     return out
 
 
@@ -199,7 +316,7 @@ def gather(today):
     feeds, notes = [], []
     for group, name, url, max_age in FEEDS:
         try:
-            feeds.append((group, name, feed_items(url, max_age)))
+            feeds.append((group, name, feed_items(url, max_age, today=today)))
         except Exception as e:  # one dead source must not sink the brief
             notes.append(f"{name}: {type(e).__name__}: {e}")
     try:
@@ -248,7 +365,7 @@ people world news""".split())
 
 
 def words(line):
-    title = line.lstrip("- ").split(":", 1)[0]
+    title = AGE_TAG.sub("", line).lstrip("- ").split(":", 1)[0]
     return {w for w in re.findall(r"[a-z]{4,}", title.lower()) if w not in STOP}
 
 
@@ -321,6 +438,14 @@ def strip_markup(text):
     text = re.sub(r"^\s*(?:\*|•|\d+[.)])\s+", "- ", text, flags=re.M)
     text = re.sub(r"(?<!\w)\*(?=\w)|(?<=\w)\*(?!\w)", "", text)  # *emphasis*
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def clean_output(text, today):
+    """Markup stripped, any calendar date the model still wrote turned into its age, square-bracket age tags into parentheses."""
+    text, n = relativize_text(strip_markup(text), today)
+    if n:
+        print(f"rewrote {n} calendar dates in the model's text as ages", file=sys.stderr)
+    return tidy_age_tags(text)
 
 
 def split_sections(text):
@@ -495,7 +620,9 @@ def main():
     if args.material_only:
         print(render(feeds) + TOP_MARK + top)
         return
-    material = render(select(feeds))
+    material, n_dates = relativize_text(render(select(feeds)), today)
+    if n_dates:
+        print(f"rewrote {n_dates} calendar dates in the material as ages", file=sys.stderr)
     if args.show_material:
         print(material)
         return
@@ -503,7 +630,7 @@ def main():
     print(f"material: {len(material)} chars (from {len(render(feeds))}); model: {args.model}", file=sys.stderr)
     extra = {"reasoning": {"enabled": False}} if args.no_reasoning else None
     text, usage = ask(args.model, prompt, args.max_tokens, extra)
-    text = strip_markup(text)
+    text = clean_output(text, today)
     found = problems(text, args.limit)
     if found and not args.no_retry:
         print("checks failed, asking once more:", *found, sep="\n  - ", file=sys.stderr)
@@ -511,14 +638,14 @@ def main():
         fix = (prompt + "\n\nA previous attempt at this briefing had these problems. Avoid them:\n" + "\n".join("- " + f for f in found))
         text2, usage2 = ask(args.model, fix, args.max_tokens, extra)
         usage = {k: usage.get(k, 0) + usage2.get(k, 0) for k in ("prompt_tokens", "completion_tokens", "cost")}
-        text = strip_markup(text2)
+        text = clean_output(text2, today)
         found = problems(text, args.limit)
     for f in found:
         print("WARNING:", f, file=sys.stderr)
     # the most-viewed list is printed literally by code: models invented trends from it
     if top.strip():
         text = (text.rstrip() + "\n\nWHAT PEOPLE ARE LOOKING UP (Wikipedia's most-viewed pages, with Wikipedia's own short description)\n"
-                + add_context(top.strip()))
+                + relativize_text(add_context(top.strip()), today)[0])
     print(text)
     print(f"\n[{len(text)} chars; tokens in/out {usage.get('prompt_tokens')}/{usage.get('completion_tokens')}; cost ${usage.get('cost')}]",
           file=sys.stderr)

@@ -967,6 +967,13 @@ model comparison and rationale: `docs/world-awareness-design.md`. Tests: `cd scr
   rewords and writes the heavy-things line and two questions; code strips markdown, runs a validator (sections, alarm words, casualty figures, headline words
   such as "mystery" in the hard-news sections, repeats, length) with one retry, and prints the most-viewed list with Wikipedia's own short descriptions.
   The summarizer has no tools, so web text never shares a context with email/file/notes tools. About $0.001-0.002 per run.
+- **Relative time (2026-10-23).** The briefing carries no calendar dates (Gordon: the agents' exact place on the human timeline does not matter
+  to his research, and a story's date read as "now" makes an old item look current). Code does it, not the prompt: each feed item gets its publish age
+  as `[yesterday]` / `[3 days ago]` / `[a few weeks ago]` (`age_phrase`); any day-level date in the text ("on 5 October", "Oct. 5, 2026", `2026-10-05`,
+  unambiguous `10/22/2026`) is rewritten as an age by `relativize_text`, both in the material and again on what the model wrote (`clean_output`), so a
+  stray date can never block publishing; the model is asked to keep an item's age in parentheses, and code removes `(today)`, `(yesterday)` and
+  `(2 days ago)` because it copies every tag. Months and years alone ("June 2026", "in 1998") and ambiguous numeric dates (3/4/2026) are left alone.
+  The heading still carries today's date, as the anchor.
 - **Delivery.** `python3 scripts/world_brief.py --no-reasoning --publish` writes `companion-docs/world/world-brief.md` (the agents see it as
   `/companion/world/world-brief.md`, read with `read_file`, so there is no knowledge-base sync delay) and a dated copy in `world/archive/world-brief-YYYY-MM-DD.md` (which the oikb sync does index),
   then keeps **one pinned entry** in Mara's `shared-history` note (author "World Brief", text starts "World briefing") up to date: created and pinned the first time,

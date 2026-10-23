@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import agent_notes as notes
@@ -138,6 +139,86 @@ class Checks(unittest.TestCase):
 
     def test_too_long(self):
         self.assertTrue(any("too long" in p for p in wb.problems(good_brief() + "\n" + "x" * 5000, 3500)))
+
+
+class RelativeTime(unittest.TestCase):
+    TODAY = dt.date(2026, 10, 23)
+
+    def phrase(self, y, m, d):
+        return wb.age_phrase(dt.date(y, m, d), self.TODAY)
+
+    def test_age_words(self):
+        self.assertEqual(self.phrase(2026, 10, 23), "today")
+        self.assertEqual(self.phrase(2026, 10, 22), "yesterday")
+        self.assertEqual(self.phrase(2026, 10, 24), "tomorrow")
+        self.assertEqual(self.phrase(2026, 10, 20), "3 days ago")
+        self.assertEqual(self.phrase(2026, 10, 14), "about a week ago")
+        self.assertEqual(self.phrase(2026, 10, 5), "a few weeks ago")
+        self.assertEqual(self.phrase(2026, 8, 20), "a couple of months ago")
+        self.assertEqual(self.phrase(2026, 5, 1), "6 months ago")
+        self.assertEqual(self.phrase(2025, 6, 1), "over a year ago")
+        self.assertEqual(self.phrase(2020, 1, 1), "6 years ago")
+        self.assertEqual(self.phrase(2026, 10, 27), "4 days from now")
+        self.assertEqual(self.phrase(2026, 11, 20), "a few weeks from now")
+
+    def rel(self, text):
+        return wb.relativize_text(text, self.TODAY)
+
+    def test_day_month_and_month_day_forms(self):
+        self.assertEqual(self.rel("He finished on 5 October."), ("He finished a few weeks ago.", 1))
+        self.assertEqual(self.rel("Finished Oct. 5, 2026."), ("Finished a few weeks ago.", 1))
+        self.assertEqual(self.rel("Opens on November 12th."), ("Opens a few weeks from now.", 1))
+        self.assertEqual(self.rel("Votes were cast on Tuesday 21 October."), ("Votes were cast 2 days ago.", 1))
+        self.assertEqual(self.rel("Since 22 October the line is shut."), ("Since yesterday the line is shut.", 1))
+
+    def test_numeric_forms(self):
+        self.assertEqual(self.rel("Born 2026-10-22."), ("Born yesterday.", 1))
+        self.assertEqual(self.rel("Filed 10/22/2026."), ("Filed yesterday.", 1))
+        self.assertEqual(self.rel("Filed 22/10/2026."), ("Filed yesterday.", 1))
+        self.assertEqual(self.rel("Filed 3/4/2026."), ("Filed 3/4/2026.", 0))  # day-first or month-first: not guessed
+
+    def test_year_picks_the_nearest_when_missing(self):
+        self.assertEqual(self.rel("Due 2 January.")[0], "Due a couple of months from now.")
+        self.assertEqual(self.rel("Born 1 December 1990.")[0], "Born 35 years ago.")
+
+    def test_things_that_are_not_day_dates_are_left_alone(self):
+        for text in ["Booker Prize 2026 shortlist", "Since June 2026 there is a pause", "In 1998 he left Chile", "May is a good month",
+                     "He may 5 times", "Room 12 on floor 5", "31 February is not a day", "Feb 30 is not either"]:
+            self.assertEqual(self.rel(text), (text, 0), text)
+
+    def test_bracket_tags_become_parentheses(self):
+        self.assertEqual(wb.tidy_age_tags("- Crows: they count [3 days ago]"), "- Crows: they count (3 days ago)")
+        self.assertEqual(wb.tidy_age_tags("- Wire: news [3 days ago] [2 sources]"), "- Wire: news (3 days ago) [2 sources]")
+
+    def test_ages_under_three_days_are_dropped(self):
+        text = "- A: one (today)\n- B: two (yesterday)\n- C: three (2 days ago) \n- D: four (3 days ago)\n- E: five [yesterday]"
+        self.assertEqual(wb.tidy_age_tags(text), "- A: one\n- B: two\n- C: three\n- D: four (3 days ago)\n- E: five")
+
+    def test_clean_output_rewrites_dates_and_tags(self):
+        out = wb.clean_output("- Walk: ended on 5 October [a few weeks ago]", self.TODAY)
+        self.assertEqual(out, "- Walk: ended a few weeks ago (a few weeks ago)")
+        self.assertEqual(wb.clean_output("- Walk: ended on 22 October (yesterday)", self.TODAY), "- Walk: ended yesterday")
+
+    def test_feed_items_carry_their_age(self):
+        rss = ("<rss><channel>"
+               "<item><title>Fresh</title><description>d</description><pubDate>Thu, 23 Oct 2026 08:00:00 +0000</pubDate></item>"
+               "<item><title>Older</title><pubDate>Mon, 20 Oct 2026 12:00:00 +0000</pubDate></item>"
+               "<item><title>Undated</title></item>"
+               "<item><title>Stale</title><pubDate>Mon, 01 Sep 2026 12:00:00 +0000</pubDate></item>"
+               "</channel></rss>")
+        now = dt.datetime(2026, 10, 23, 12, 0, tzinfo=dt.timezone.utc)
+        with mock.patch.object(wb, "get", return_value=rss):
+            lines = wb.feed_items("http://x", 14, now=now, today=self.TODAY)
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(lines[0].startswith("- Fresh: d [") and lines[0].endswith("]"))
+        self.assertIn("[3 days ago]", lines[1])
+        self.assertEqual(lines[2], "- Undated")
+
+    def test_age_tag_does_not_make_unrelated_stories_look_repeated(self):
+        a = wb.words("- Gold prices climb [yesterday]")
+        b = wb.words("- Storm hits coast [yesterday]")
+        self.assertFalse(wb.is_repeat(a, b, 2))
+        self.assertNotIn("yesterday", a)
 
 
 class Delivery(unittest.TestCase):
