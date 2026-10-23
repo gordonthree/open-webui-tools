@@ -52,13 +52,22 @@ read, gives the driver one repair turn and otherwise lowers `confidence` to low 
 the grounding check the driver filled a missing album title in from memory twice. None of this makes injection impossible; the network limits above are the hard stop.
 
 ## Tests
-`cd src && python3 -m unittest test_research_browser` (42, fake browser and driver, no network);
+`cd src && python3 -m unittest test_research_browser` (49, fake browser, driver and vision model, no network);
 `docker run --rm -v $PWD/docker/research-browser/service:/app -w /app research-browser-service python -m unittest test_app` (9, helpers).
 Live checks run 2026-10-23: isolation battery (no direct route; 14 internal targets refused; odd ports refused; CDP not reachable from Open WebUI or the
 host), web desktop login (401 without credentials, not answering on the LAN address), end-to-end research on real questions.
 
 ## Not done / decisions for Gordon
-- The tool is **not deployed**: it needs `python3 scripts/push_tool.py research_browser --create`, then `SERVICE_KEY` and `OPEN_WEBUI_API_KEY` in its valves, then attaching to a model.
+- The tool is **installed on Mara's server** (Gordon, 2026-10-23) and is being tried on a throwaway preset; not attached to Mara's agent yet. Updates: `python3 scripts/push_tool.py research_browser`.
 - Hannah's Open WebUI is on docker-server, so it cannot reach `research-service` on this host's Docker network; it would need the service published on the Tailscale address with the key.
-- No vision yet: a `look` action (screenshot -> `describe_image`) for charts and canvas pages.
+- `~/docker/chromium` (the old personal browser) was stopped at Gordon's request; it only needed a `docker compose pull`.
+
+## Vision and screenshots (v0.2.0, 2026-10-23)
+- **`look` action** for the driver: the service returns a JPEG of the current page (shrunk to 1280 px, via Pillow) and a vision model (valve
+  `VISION_MODEL`, default `or.mistralai/mistral-small-3.2-24b-instruct`, through the Open WebUI API) describes it; the text is scrubbed like page text
+  and shown to the driver as "what a vision model saw". At most `MAX_LOOKS` (2) per research; about $0.0002 each.
+- **`show_screenshot(url="")`** for the agent: posts a picture into the chat so Gordon can see what the browser saw. No address = the final page of
+  that user's latest research (the service keeps one PNG per user in memory, taken when a session closes; lost on a service restart); with an address it
+  opens the page, shoots it, closes it. The PNG is stored with Open WebUI's files API (`/api/v1/files/`) and shown with a `message` event, so the chat
+  holds a short link, not image data. Needs the `OPEN_WEBUI_API_KEY` valve. The file belongs to the key's owner.
 - `~/docker/chromium` (Gordon's personal browser) is published on 0.0.0.0:3000-3001 with **no login**.

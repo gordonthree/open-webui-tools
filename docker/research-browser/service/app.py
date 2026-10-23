@@ -271,6 +271,7 @@ class Req(BaseModel):
     submit: bool = False
     start: int = 0
     elements: int = MAX_ELEMENTS
+    jpeg: bool = False      # screenshot: smaller JPEG for a vision model instead of PNG
 
 
 async def snapshot(page, start=0, elements=MAX_ELEMENTS):
@@ -387,22 +388,55 @@ async def back(req: Req, user: str = Depends(auth)):
     return await run(user, req, "back", go)
 
 
+LAST_SHOTS = {}     # user -> (png bytes, url, time): the last page of that user's most recent session, for "show me what it saw"
+
+
+async def grab(page, jpeg=False):
+    if jpeg:       # for a vision model: shrunk, since cost grows with pixels and the browser window is large
+        from io import BytesIO
+        from PIL import Image
+        with Image.open(BytesIO(await page.screenshot(type="png", full_page=False))) as im:
+            im.thumbnail((1280, 1280))
+            out = BytesIO()
+            im.convert("RGB").save(out, "JPEG", quality=70)
+            return out.getvalue()
+    return await page.screenshot(type="png", full_page=False)
+
+
 @app.post("/screenshot")
 async def screenshot(req: Req, user: str = Depends(auth)):
     from fastapi.responses import Response
     try:
         s = await B.session(user, req.session, create=False)
         async with s["lock"]:
-            png = await s["page"].screenshot(type="png", full_page=False)
+            img = await grab(s["page"], req.jpeg)
         audit(user, req.session, "screenshot", url=s["page"].url)
-        return Response(content=png, media_type="image/png")
+        return Response(content=img, media_type="image/jpeg" if req.jpeg else "image/png", headers={"X-Page-Url": s["page"].url[:300].encode("ascii", "ignore").decode()})
     except Refused as e:
         return {"error": str(e)}
     except PlaywrightError as e:
         return {"error": f"The browser could not do that: {str(e).splitlines()[0][:200]}"}
 
 
+@app.post("/lastshot")
+async def lastshot(req: Req, user: str = Depends(auth)):
+    from fastapi.responses import Response
+    got = LAST_SHOTS.get(user)
+    if not got:
+        return {"error": "No browsing has happened recently, so there is nothing to show."}
+    audit(user, req.session, "lastshot", url=got[1])
+    return Response(content=got[0], media_type="image/png", headers={"X-Page-Url": got[1][:300].encode("ascii", "ignore").decode(), "X-Taken-At": str(int(got[2]))})
+
+
 @app.post("/close")
 async def close(req: Req, user: str = Depends(auth)):
+    s = B.sessions.get((user, req.session))
+    if s and not s["page"].is_closed():
+        try:
+            url = s["page"].url
+            if url and url != "about:blank":
+                LAST_SHOTS[user] = (await grab(s["page"]), url, time.time())
+        except PlaywrightError:
+            pass
     audit(user, req.session, "close")
     return {"closed": await B.close(user, req.session)}

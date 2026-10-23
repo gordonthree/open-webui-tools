@@ -966,8 +966,8 @@ model comparison and rationale: `docs/world-awareness-design.md`. Tests: `cd scr
 Mara and Hannah get the web through one tool, `research(question)` in `src/research_browser.py`: a cloud model (Nemotron) operates an isolated Chromium
 step by step and returns a short, sourced answer, so the local model only asks a question. Everything - the isolated browser with a web desktop Gordon can
 use to set cookies and pass robot checks, the egress filter, the service, security measures, tests, costs and what is not done yet - is documented in
-`docker/research-browser/README.md`. Built 2026-10-23; **not deployed to Open WebUI yet** (`push_tool.py research_browser --create`, fill the two key valves, attach to a model).
-Tests: `cd src && python3 -m unittest test_research_browser`.
+`docker/research-browser/README.md`. Built 2026-10-23; installed on Mara's server, not yet attached to an agent (`push_tool.py research_browser` to update). v0.2.0 adds a `look` action (screenshot read by a vision model) and `show_screenshot()` (posts the browser's view into the chat).
+Tests: `cd src && python3 -m unittest test_research_browser` (49).
 
 ## Status notes
 
