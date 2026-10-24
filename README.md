@@ -950,7 +950,7 @@ result) and replies are separate, named blocks. Thinking is kept verbatim; only 
 (`output` reasoning items, `<details type="reasoning">`, `<think>`) is replaced by `[Mara's thinking]` headings,
 and the header says these are the agent's own model output, not Claude's reasoning - pasting raw agent thinking
 into a Claude Code session once tripped a "reasoning extraction" false positive. `--agent NAME`, `--turns 3-7`,
-`--thinking-only`, `--result-chars N` (0 = no results), `--out FILE`. Read-only. Tests:
+`--thinking-only`, `--result-chars N` (0 = no results), `--out FILE`, `--server hannah` (her server's API key, which only opens chats of her own account), `--json-file F` (a chat dumped from the database as the API would return it, for a chat the key cannot open, e.g. one started from Gordon's own account: `docker exec open-webui python3` reading `webui.db` with `?mode=ro` over SSH). Read-only. Tests:
 `cd scripts && python3 -m unittest test_read_chat -v`.
 
 Note on OWUI's API: `GET /api/v1/chats/` returns only summary fields (no `folder_id`), so folder

@@ -28,7 +28,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cleanup_noop_chats import get_chat  # noqa: E402
-from push_tool import DEFAULT_SECRETS_FILE, parse_secrets, require  # noqa: E402
+from push_tool import DEFAULT_SECRETS_FILE, configured_servers, parse_secrets, require, server_connection  # noqa: E402
 from tick_report import message_chain  # noqa: E402
 
 # Older chats keep everything in `content`, with thinking and tool calls as <details> blocks.
@@ -182,14 +182,28 @@ def main(argv=None, session=None):
     ap.add_argument("--thinking-only", action="store_true", help="print only the agent's thinking")
     ap.add_argument("--result-chars", type=int, default=300, help="characters of each tool result (0 = none)")
     ap.add_argument("--out", type=Path, help="write the transcript to this file instead of stdout")
+    ap.add_argument("--json-file", type=Path, help="read the chat from a JSON file shaped like the API's reply (for a chat the API key cannot open, dumped from the database)")
+    ap.add_argument("--server", default="local", help="which OWUI server holds the chat: local (default) or one secrets.md configures, e.g. hannah")
     ap.add_argument("--secrets", type=Path, default=DEFAULT_SECRETS_FILE)
     args = ap.parse_args(argv)
 
+    if args.json_file:
+        text = render(json.loads(args.json_file.read_text(encoding="utf-8")), agent=args.agent, user=args.user,
+                      turns=args.turns, thinking_only=args.thinking_only, result_chars=args.result_chars)
+        if args.out:
+            args.out.write_text(text + "\n", encoding="utf-8")
+            print(f"Wrote {args.out}")
+        else:
+            print(text)
+        return 0
     secrets = parse_secrets(args.secrets)
-    base_url = require(secrets, "OWUI_BASE_URL").rstrip("/")
+    if args.server != "local" and args.server.lower() not in configured_servers(secrets):
+        ap.error(f"Unknown server {args.server!r}; secrets.md configures: {['local'] + configured_servers(secrets)}.")
+    base_url, key = server_connection(secrets, args.server.lower())
+    base_url = base_url.rstrip("/")
     if session is None:
         session = requests.Session()
-        session.headers["Authorization"] = f"Bearer {require(secrets, 'OWUI_API_KEY')}"
+        session.headers["Authorization"] = f"Bearer {key}"
     text = render(get_chat(session, base_url, args.chat_id), agent=args.agent, user=args.user,
                   turns=args.turns, thinking_only=args.thinking_only, result_chars=args.result_chars)
     if args.out:
