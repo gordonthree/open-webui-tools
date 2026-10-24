@@ -89,6 +89,7 @@ Each of these was rated {min_weight} or higher the moment you wrote it. In these
 
 - When several entries describe the same moment, keep a 10 on the one or two that hold its heart and let the rest be 8 or 9. They still belong to that moment; they don't all have to be it.
 - You may keep a 10, and you may leave any entry as it is: just don't call the tool for it.
+- A weight can only stay or go down here; never raise one.
 - These were all good moments. Lowering one keeps it warm, so go no lower than {floor}.
 - An entry marked "one text in N parts" is a single memory: give every part the same number.
 
@@ -334,19 +335,32 @@ def inspect_recheck(output: Any) -> List[dict]:
                 continue
             if isinstance(body, dict) and body.get("success") and "entry_no" in body:
                 changes.append({k: body.get(k) for k in ("note_name", "entry_no", "old_weight", "weight")})
-    return changes
+    return merge_repeats(changes)
+
+
+def merge_repeats(changes: List[dict]) -> List[dict]:
+    """One change per entry, from the weight it started at to the one it ended on; an entry that ended where it began is not a change."""
+    merged: dict = {}
+    for c in changes:
+        key = (str(c["note_name"]).lower(), int(c["entry_no"]))
+        merged[key] = {**c, "old_weight": merged[key]["old_weight"]} if key in merged else dict(c)
+    return [c for c in merged.values() if c["old_weight"] != c["weight"]]
 
 
 def recheck_problems(items: List[dict], changes: List[dict]) -> List[str]:
-    """What to look at after a chat: ratings below the floor, parts of one text left at different weights, entries not shown."""
+    """What to look at after a chat: ratings below the floor or raised, parts of one text left at different weights, entries not shown."""
     final = {(c["note_name"].lower(), int(c["entry_no"])): c["weight"] for c in changes}
+    old = {(c["note_name"].lower(), int(c["entry_no"])): c["old_weight"] for c in changes}
     shown = {(i["note"].lower(), n) for i in items for n in i["entries"]}
     problems = []
     for (note, no), w in sorted(final.items()):
         if (note, no) not in shown:
             problems.append(f"{note} #{no} was rated ({w}) but was not one of the entries shown")
-        elif w < RECHECK_FLOOR:
+            continue
+        if w < RECHECK_FLOOR:
             problems.append(f"{note} #{no} went down to {w}, below the floor of {RECHECK_FLOOR}")
+        if w > old[(note, no)]:
+            problems.append(f"{note} #{no} went UP from {old[(note, no)]} to {w}; this pass is only meant to lower")
     for i in items:
         if len(i["entries"]) > 1:
             weights = {final.get((i["note"].lower(), n), i["weight"]) for n in i["entries"]}

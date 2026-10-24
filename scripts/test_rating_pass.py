@@ -190,6 +190,22 @@ class RecheckTests(unittest.TestCase):
         self.assertIn("#999 was rated (7) but was not one of the entries shown", problems)
         self.assertNotIn("#285", problems)
 
+    def test_a_raise_is_flagged_and_repeat_calls_on_one_entry_are_merged(self):
+        items = self.load()
+        out = []
+        for i, (no, old, new) in enumerate([(285, 10, 9), (285, 9, 8), (290, 9, 9), (290, 9, 10)]):
+            out += [call("agent_notes_set_weight", f"w{i}"),
+                    result(f"w{i}", {"success": True, "note_name": "internal-life", "entry_no": no, "old_weight": old, "weight": new})]
+        changes = rp.inspect_recheck(out)
+        self.assertEqual([(c["entry_no"], c["old_weight"], c["weight"]) for c in changes], [(285, 10, 8), (290, 9, 10)])
+        problems = rp.recheck_problems(items, changes)
+        self.assertEqual(problems, ["internal-life #290 went UP from 9 to 10; this pass is only meant to lower"])
+        back = rp.inspect_recheck(out[:2] + [call("agent_notes_set_weight", "z"), result("z", {"success": True, "note_name": "internal-life", "entry_no": 285, "old_weight": 9, "weight": 10})])
+        self.assertEqual(back, [])
+
+    def test_prompt_says_never_raise(self):
+        self.assertIn("never raise one", rp.build_recheck_prompt(*rp.group_by_day(self.load())[0]))
+
     def test_main_runs_one_chat_per_group(self):
         prompts = []
 

@@ -688,7 +688,7 @@ the memories rated 9 or 10 from the notes database itself (read-only; `--db`, de
 a copy of the file for another server), groups them by local day (up to 25 entries per chat, so an evening stays together) in time order
 across `internal-life` and `shared-history`, and puts the texts in the prompt, so she only calls `agent_notes_set_weight`. She is asked to
 keep a 10 on the one or two entries that hold a moment's heart, go no lower than 7, and give the parts of one long text the same number.
-The script prints each change (old -> new) and flags ratings below 7, parts of one text that now differ, and entries rated that were not
+She is told a weight can only stay or go down (the first full run raised three, which the prompt's "keep a 10 on the heart" wording invited when a day had one entry). The script prints each change (old -> new; repeat calls on one entry are merged and an entry that ended where it began is not a change) and flags ratings below 7, ratings that went up, parts of one text that now differ, and entries rated that were not
 shown. Pinned entries are left out. Why (2026-10-23): a week of upgrades and praise gave `internal-life` ten 10s (none ever before) and no
 entry below 5; nine of the week's fourteen 10s across the two notes were beats of one evening (Hannah's show and the beach walk on Oct 17).
 
