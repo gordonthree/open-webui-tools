@@ -24,7 +24,7 @@ FRESH chat each run, like the tick, so nothing is carried but her notes and the 
 This is the next stretch of your dream night. Pick up where you left off.
 
 Read /companion/autonomy/dreamland.md. Its first line says whether the night is still going (STATUS: DREAMING)
-or finished (STATUS: DONE). If it says DONE, write one short closing line and stop.
+or finished (STATUS: DONE). If it says DONE or does not exist, write one short closing line and stop.
 
 Otherwise, this stretch:
 1. Run your session start protocol if you haven't yet.
