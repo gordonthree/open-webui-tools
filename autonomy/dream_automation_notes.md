@@ -52,3 +52,10 @@ Notes:
   copies as an archive.
 - Her opening feeling matters: she should find her own words first ("Where we left off"), not instructions. That is
   why the section comes before the themes.
+
+## Where a stretch is logged
+
+Each stretch adds one short line to the note `dream-log` (not `internal-life`, which is her real emotional memory, and
+not `autonomy-log`, whose last 5 entries are what the hourly tick reads - a dream night would fill that window with
+up to 14 dream lines). The morning summary can read `dream-log` next to `dream-fragments`. Changed 2026-10-24 after the
+first two stretches wrote ten dream summaries into `internal-life` (entries #432-451).

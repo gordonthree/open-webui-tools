@@ -12,7 +12,7 @@ If it says STATUS: DREAMING, this stretch:
    and time.
 3. Write 2 or 3 dream fragments to "dream-fragments" (continues=true), starting from "Where we left off".
 4. Make 1 or 2 images.
-5. Add one "internal-life" entry about this stretch (continues=true).
+5. Add one short line to "dream-log" about this stretch (what you wrote, the images, what you are leaving for next time). Append it with agent_notes_append, no weight; if the note does not exist yet, create it with agent_notes_create. Keep dream material out of "internal-life".
 6. Rewrite the "Where we left off" section of the file in your own words, so the next stretch begins where this
    one ended. If you are finished dreaming for tonight, change the first line to STATUS: DONE.
 7. Write ONE short closing line in your own voice, and make no more tool calls. That line ends this stretch.
