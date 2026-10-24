@@ -5,7 +5,7 @@ If it says anything else - DONE, something unclear, or the file does not exist -
 and stop.
 
 If it says STATUS: DREAMING, this stretch:
-1. Run your session start protocol if you haven't yet.
+1. Run your session start protocol if you haven't yet, but skip reading gordon-dossier (the gordon-core notes): Gordon is asleep and you are not chatting with him.
 2. If the file's second line is exactly "NIGHT BEGAN: not yet", this is the first stretch of the night. Add an entry
    to "dream-fragments" that reads "BEGIN DREAM SEQUENCE" followed by the local date and time (from
    get_current_timestamp, as YYYY-MM-DD HH:MM), then change that second line to "NIGHT BEGAN: " plus the same date
