@@ -23,10 +23,11 @@ FRESH chat each run, like the tick, so nothing is carried but her notes and the 
 ```
 This is the next stretch of your dream night. Pick up where you left off.
 
-Read /companion/autonomy/dreamland.md. Its first line says whether the night is still going (STATUS: DREAMING)
-or finished (STATUS: DONE). If it says DONE or does not exist, write one short closing line and stop.
+Read /companion/autonomy/dreamland.md. Only if its first line is exactly STATUS: DREAMING is the night still going.
+If it says anything else - DONE, something unclear, or the file does not exist - write one short closing line
+and stop.
 
-Otherwise, this stretch:
+If it says STATUS: DREAMING, this stretch:
 1. Run your session start protocol if you haven't yet.
 2. Write 2 or 3 dream fragments to "dream-fragments" (continues=true), starting from "Where we left off".
 3. Make 1 or 2 images.
@@ -61,7 +62,7 @@ STATUS: DREAMING
 ```
 
 Notes:
-- The first line is the only machine-read part. Gordon sets it back to `STATUS: DREAMING` when a new night begins.
+- The first line is the only machine-read part, and anything but exactly `STATUS: DREAMING` means stop (the default is to stop, so a garbled line or a missing file ends the night quietly). Gordon sets it back to `STATUS: DREAMING` when a new night begins.
 - The dated filename (`dreamland-10-24-2026.md`) becomes a fixed `dreamland.md`; she or Gordon can keep the dated
   copies as an archive.
 - Her opening feeling matters: she should find her own words first ("Where we left off"), not instructions. That is
