@@ -65,6 +65,26 @@ class HandlerTests(unittest.TestCase):
         for title in ("Last 24 hours", "Last 7 days", "Overall", "All notes"):
             self.assertIn(title, body)
 
+    def test_an_entry_shows_where_it_came_from_and_the_weights_page_groups_by_rater(self):
+        src = {"preset": "hannah-duo", "base_model": "nemotron-ultra", "source_chat": "chat-abc"}
+        web.notes.create_note_db(self.db, "Mem", ["a"], "", "Hannah", None, 9, src)
+        web.notes.append_entry_db(self.db, "Mem", ["b"], "Hannah", None, None, src)
+        web.notes.set_weight_db(self.db, "Mem", 2, 8, None, True, {"preset": "medium-mara", "base_model": "qwen"})
+        _, _, body = self.get("/note", name="Mem")
+        self.assertIn("via hannah-duo (nemotron-ultra)", body)
+        self.assertIn("<code>chat-abc</code>", body)
+        self.assertIn("rated by medium-mara (qwen)", body)
+        _, _, weights = self.get("/weights")
+        self.assertIn("By who rated", weights)
+        self.assertIn("hannah-duo (nemotron-ultra)", weights)
+        self.assertIn("medium-mara (qwen)", weights)
+
+    def test_an_entry_with_no_recorded_source_shows_nothing_extra(self):
+        self.post("/create", name="Old", text="written before")
+        _, _, body = self.get("/note", name="Old")
+        self.assertNotIn("via ", body)
+        self.assertNotIn("<code>", body)
+
     def test_weights_page_with_no_notes(self):
         self.assertIn("No entries in this period.", self.get("/weights")[2])
 

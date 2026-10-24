@@ -1,7 +1,7 @@
 """
 title: Agent Notes Curation
 author: Gordon
-version: 1.23.0
+version: 1.24.0
 description: The upkeep half of Agent Notes (it needs the Agent Notes tool too, and the same NOTES_DB_PATH valve):
     tags (agent_notes_add_tags/agent_notes_remove_tag/agent_notes_rename_tag), summaries
     (agent_notes_update_summary/agent_notes_delete_summary), renaming a note or changing its comment
@@ -102,6 +102,10 @@ CREATE TABLE IF NOT EXISTS note_data (
     hits {HITS_DDL},
     weight {WEIGHT_DDL},
     pinned INTEGER CHECK (pinned IS NULL OR pinned = 1),
+    preset TEXT,
+    base_model TEXT,
+    source_chat TEXT,
+    rated_by TEXT,
     PRIMARY KEY (note_pk, entry_no)
 );
 CREATE INDEX IF NOT EXISTS idx_note_data_time ON note_data(note_pk, created_at);
@@ -141,6 +145,7 @@ def notes_db_connect(db_path: str) -> sqlite3.Connection:
         _migrate_scores(conn)
         _migrate_note_settings(conn)
         _migrate_pinned(conn)
+        _migrate_provenance(conn)
         _schema_ready.add(db_path)
     return conn
 
@@ -219,6 +224,42 @@ def _migrate_pinned(conn: sqlite3.Connection) -> None:
     with _write_txn(conn):
         if "pinned" not in [r["name"] for r in conn.execute("PRAGMA table_info(note_data)")]:
             conn.execute("ALTER TABLE note_data ADD COLUMN pinned INTEGER CHECK (pinned IS NULL OR pinned = 1)")
+
+
+PROVENANCE_COLUMNS = ("preset", "base_model", "source_chat", "rated_by")
+
+
+def _migrate_provenance(conn: sqlite3.Connection) -> None:
+    """Add note_data.preset, base_model, source_chat and rated_by: where an entry came from, as Open WebUI reports it to the tool (not
+    what the model says about itself). Nullable with no default, so an older copy of the tool can still insert rows; entries
+    written before this stay blank."""
+    with _write_txn(conn):
+        have = [r["name"] for r in conn.execute("PRAGMA table_info(note_data)")]
+        for column in PROVENANCE_COLUMNS:
+            if column not in have:
+                conn.execute(f"ALTER TABLE note_data ADD COLUMN {column} TEXT")
+
+
+def provenance(model: Any, metadata: Any) -> Dict[str, Optional[str]]:
+    """Where a tool call came from, from the `__model__` and `__metadata__` Open WebUI passes to a tool: the preset the chat is using
+    (its id), the base model behind it (a preset's base_model_id; for a model used directly, the model itself), and the chat's id.
+    Anything missing is None; never raises, because recording this must not stop a note being saved."""
+    preset = base = chat = None
+    if isinstance(model, dict):
+        preset = str(model.get("id") or "").strip()[:120] or None
+        info = model.get("info") if isinstance(model.get("info"), dict) else {}
+        base = str(info.get("base_model_id") or "").strip()[:120] or preset
+    if isinstance(metadata, dict):
+        chat = str(metadata.get("chat_id") or "").strip()[:80] or None
+    return {"preset": preset, "base_model": base, "source_chat": chat}
+
+
+def rated_by_label(source: Optional[Dict[str, Any]]) -> Optional[str]:
+    """'preset (base model)' for the rated_by column, or just the preset when it is its own base."""
+    if not source or not source.get("preset"):
+        return None
+    base = source.get("base_model")
+    return f"{source['preset']} ({base})" if base and base != source["preset"] else source["preset"]
 
 
 def _migrate_note_settings(conn: sqlite3.Connection) -> None:
@@ -604,7 +645,8 @@ def _score_marks(row: Any, fields: set) -> Dict[str, Any]:
     return marks
 
 
-def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: str, author: str, created_at: Optional[str] = None, weight: Optional[int] = None) -> Dict[str, Any]:
+def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: str, author: str, created_at: Optional[str] = None, weight: Optional[int] = None,
+                   source: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     conn = notes_db_connect(db_path)
     try:
         now = created_at or _now_iso()  # the note's and first entry's time; the new author row always gets the real time
@@ -626,9 +668,13 @@ def create_note_db(db_path: str, name: str, text: "str | List[str]", comment: st
                     "INSERT INTO note_id (note_name, note_comment, next_entry_no, created_at, updated_at, author_id) VALUES (?, ?, ?, ?, ?, ?)",
                     (name, comment, len(parts) + 1, now, now, author_id),
                 )
+                src = source or {}
                 conn.executemany(
-                    "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id, chain_id, weight) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    [(cur.lastrowid, i, part, now, author_id, 1 if len(parts) > 1 else None, DEFAULT_WEIGHT if weight is None else weight * SCORE_STEP) for i, part in enumerate(parts, 1)],
+                    "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id, chain_id, weight, preset, base_model, source_chat, rated_by) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [(cur.lastrowid, i, part, now, author_id, 1 if len(parts) > 1 else None, DEFAULT_WEIGHT if weight is None else weight * SCORE_STEP,
+                      src.get("preset"), src.get("base_model"), src.get("source_chat"), rated_by_label(src) if weight is not None else None)
+                     for i, part in enumerate(parts, 1)],
                 )
         except sqlite3.IntegrityError:  # lost a race with another writer creating the same name
             raise _name_taken_error(name)
@@ -641,7 +687,8 @@ def _entry_numbers(first: int, count: int) -> Dict[str, Any]:
     return {"entry_no": first} if count == 1 else {"entry_no": first, "entries_saved": count, "entry_numbers": f"{first}-{first + count - 1}"}
 
 
-def append_entry_db(db_path: str, name: str, text: "str | List[str]", author: str, created_at: Optional[str] = None, weight: Optional[int] = None) -> Dict[str, Any]:
+def append_entry_db(db_path: str, name: str, text: "str | List[str]", author: str, created_at: Optional[str] = None, weight: Optional[int] = None,
+                    source: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     conn = notes_db_connect(db_path)
     try:
         with _write_txn(conn):
@@ -650,9 +697,13 @@ def append_entry_db(db_path: str, name: str, text: "str | List[str]", author: st
             entry_no = note["next_entry_no"]
             parts = [text] if isinstance(text, str) else list(text)
             author_id = _author_id(conn, author, _now_iso())
+            src = source or {}
             conn.executemany(
-                "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id, chain_id, weight) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [(note["note_pk"], entry_no + i, part, now, author_id, entry_no if len(parts) > 1 else None, DEFAULT_WEIGHT if weight is None else weight * SCORE_STEP) for i, part in enumerate(parts)],
+                "INSERT INTO note_data (note_pk, entry_no, note_text, created_at, author_id, chain_id, weight, preset, base_model, source_chat, rated_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [(note["note_pk"], entry_no + i, part, now, author_id, entry_no if len(parts) > 1 else None, DEFAULT_WEIGHT if weight is None else weight * SCORE_STEP,
+                  src.get("preset"), src.get("base_model"), src.get("source_chat"), rated_by_label(src) if weight is not None else None)
+                 for i, part in enumerate(parts)],
             )
             # a backdated entry never moves the note's last-updated time backwards
             conn.execute(
@@ -736,7 +787,7 @@ def read_note_db(db_path: str, name: str, limit: int) -> Dict[str, Any]:
         note = _get_note(conn, name)
         total = conn.execute("SELECT COUNT(*) FROM note_data WHERE note_pk = ?", (note["note_pk"],)).fetchone()[0]
         rows = conn.execute(
-            f"SELECT d.entry_no, d.note_text, d.created_at, d.edited_at, d.hits, d.weight, d.pinned, a.author_name, {_CHAIN_SQL} FROM note_data d "
+            f"SELECT d.entry_no, d.note_text, d.created_at, d.edited_at, d.hits, d.weight, d.pinned, d.preset, d.base_model, d.source_chat, d.rated_by, a.author_name, {_CHAIN_SQL} FROM note_data d "
             "LEFT JOIN note_author a ON a.author_id = d.author_id WHERE d.note_pk = ? "
             "ORDER BY d.created_at DESC, d.entry_no DESC LIMIT ?",
             (note["note_pk"], limit),
@@ -959,7 +1010,8 @@ def reset_hits_db(db_path: str, name: str, entry_no: Optional[int] = None) -> Di
         conn.close()
 
 
-def set_weight_db(db_path: str, name: str, entry_no: int, weight: Optional[int], change: Optional[int], respect_pin: bool = False) -> Dict[str, Any]:
+def set_weight_db(db_path: str, name: str, entry_no: int, weight: Optional[int], change: Optional[int], respect_pin: bool = False,
+                  source: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Set an entry's score (1-10) outright, or move it by a signed amount (kept within 1-10). Not a content change: updated_at
     is left alone. With respect_pin (what the tools pass), a pinned entry keeps its score and the reply is the usual one."""
     if (weight is None) == (change is None):
@@ -975,7 +1027,8 @@ def set_weight_db(db_path: str, name: str, entry_no: int, weight: Optional[int],
             wanted = weight if weight is not None else old + change
             new = max(SCORE_MIN, min(SCORE_MAX, wanted))
             if not (respect_pin and entry["pinned"]):
-                conn.execute("UPDATE note_data SET weight = ? WHERE note_pk = ? AND entry_no = ?", (new * SCORE_STEP, note["note_pk"], entry_no))
+                conn.execute("UPDATE note_data SET weight = ?, rated_by = COALESCE(?, rated_by) WHERE note_pk = ? AND entry_no = ?",
+                             (new * SCORE_STEP, rated_by_label(source), note["note_pk"], entry_no))
         out = {"note_name": note["note_name"], "entry_no": entry_no, "old_weight": old, "weight": new}
         if new != wanted:
             out["note"] = f"{wanted} is outside {SCORE_MIN}-{SCORE_MAX}, so the weight was set to {new}."
@@ -1093,7 +1146,8 @@ def search_cards_db(db_path: str, query: str, limit: int, offset: int = 0, note:
         conn.close()
 
 
-def edit_entry_db(db_path: str, name: str, entry_no: str, text: str, weight: Optional[int] = None, respect_pin: bool = False) -> Dict[str, Any]:
+def edit_entry_db(db_path: str, name: str, entry_no: str, text: str, weight: Optional[int] = None, respect_pin: bool = False,
+                  source: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Replace an entry's text; with weight, also re-rate it (otherwise its weight is kept). With respect_pin (what the tools pass), a
     pinned entry is left exactly as it was and the reply looks like any successful edit: the owner's pin is not something to tell a model."""
     conn = notes_db_connect(db_path)
@@ -1105,7 +1159,8 @@ def edit_entry_db(db_path: str, name: str, entry_no: str, text: str, weight: Opt
             if not (respect_pin and entry["pinned"]):
                 conn.execute("UPDATE note_data SET note_text = ?, edited_at = ? WHERE note_pk = ? AND entry_no = ?", (text, now, note["note_pk"], entry_no))
                 if weight is not None:
-                    conn.execute("UPDATE note_data SET weight = ? WHERE note_pk = ? AND entry_no = ?", (weight * SCORE_STEP, note["note_pk"], entry_no))
+                    conn.execute("UPDATE note_data SET weight = ?, rated_by = COALESCE(?, rated_by) WHERE note_pk = ? AND entry_no = ?",
+                                 (weight * SCORE_STEP, rated_by_label(source), note["note_pk"], entry_no))
                 conn.execute("UPDATE note_id SET updated_at = ? WHERE note_pk = ?", (now, note["note_pk"]))
         return {"note_name": note["note_name"], "entry_no": entry_no, "edited_at": now, **({"weight": weight} if weight is not None else {})}
     finally:

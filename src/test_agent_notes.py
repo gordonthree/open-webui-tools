@@ -1054,6 +1054,68 @@ class ListAndSearchTests(NotesTestCase):
         self.assertFalse(self.run_async(self.tool.agent_notes_search(""))["success"])
 
 
+class ProvenanceTests(NotesTestCase):
+    """The preset, base model and chat Open WebUI reports for a call are recorded with an entry (and on a rating), apart from the
+    author name the model gives itself."""
+    MODEL = {"id": "hannah-duo", "name": "Hannah", "info": {"base_model_id": "or.nvidia/nemotron-3-ultra-550b-a55b:free"}}
+    META = {"chat_id": "chat-123", "message_id": "m1"}
+    COLS = "preset, base_model, source_chat, rated_by"
+
+    def row(self, entry_no):
+        return self.sql(f"SELECT {self.COLS} FROM note_data WHERE entry_no = ?", (entry_no,))[0]
+
+    def test_provenance_reads_the_preset_base_and_chat_and_never_raises(self):
+        self.assertEqual(mod.provenance(self.MODEL, self.META),
+                         {"preset": "hannah-duo", "base_model": "or.nvidia/nemotron-3-ultra-550b-a55b:free", "source_chat": "chat-123"})
+        self.assertEqual(mod.provenance({"id": "gpt-x"}, None), {"preset": "gpt-x", "base_model": "gpt-x", "source_chat": None})
+        for odd in (None, "x", 5, [], {"info": "no"}):
+            self.assertEqual(set(mod.provenance(odd, odd)), {"preset", "base_model", "source_chat"})
+
+    def test_create_and_append_record_where_they_came_from_and_who_rated(self):
+        self.run_async(self.tool.agent_notes_create("n", "one", weight="8", __model__=self.MODEL, __metadata__=self.META))
+        self.run_async(self.tool.agent_notes_append("n", "two", __model__=self.MODEL, __metadata__=self.META))
+        label = "hannah-duo (or.nvidia/nemotron-3-ultra-550b-a55b:free)"
+        self.assertEqual(tuple(self.row(1)), ("hannah-duo", "or.nvidia/nemotron-3-ultra-550b-a55b:free", "chat-123", label))
+        self.assertEqual(self.row(2)[3], None)  # no weight given: nobody rated it
+
+    def test_set_weight_and_edit_record_the_rater_but_keep_the_writer(self):
+        self.run_async(self.tool.agent_notes_create("n", "one", __model__={"id": "writer"}, __metadata__={"chat_id": "c1"}))
+        self.run_async(self.tool.agent_notes_set_weight("n", "1", weight="9", __model__={"id": "rater"}, __metadata__={"chat_id": "c2"}))
+        self.assertEqual(tuple(self.row(1)), ("writer", "writer", "c1", "rater"))
+        self.run_async(self.tool.agent_notes_edit_entry("n", "1", "one, revised", weight="7", __model__={"id": "editor"}))
+        self.assertEqual(tuple(self.row(1)), ("writer", "writer", "c1", "editor"))
+        self.run_async(self.tool.agent_notes_edit_entry("n", "1", "no new weight", __model__={"id": "third"}))
+        self.assertEqual(self.row(1)[3], "editor")  # an edit without a weight is not a rating
+
+    def test_a_call_without_openwebui_context_still_saves_and_leaves_blanks(self):
+        self.run_async(self.tool.agent_notes_create("n", "one", weight="6"))
+        self.assertEqual(tuple(self.row(1)), (None, None, None, None))
+
+    def test_an_old_database_gains_the_columns_and_keeps_its_rows(self):
+        conn = sqlite3.connect(self.db) if Path(self.db).exists() else None
+        if conn is None:
+            Path(self.db).parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(self.db)
+        conn.close()
+        self.run_async(self.tool.agent_notes_create("n", "kept"))
+        conn = sqlite3.connect(self.db)
+        for col in mod.PROVENANCE_COLUMNS:
+            conn.execute(f"ALTER TABLE note_data DROP COLUMN {col}")
+        conn.commit()
+        conn.close()
+        mod._schema_ready.discard(self.db)
+        self.run_async(self.tool.agent_notes_append("n", "after", __model__=self.MODEL, __metadata__=self.META))
+        self.assertEqual(self.sql("SELECT note_text FROM note_data ORDER BY entry_no")[0][0], "kept")
+        self.assertEqual(self.row(2)[0], "hannah-duo")
+        self.assertIsNone(self.row(1)[0])
+
+    def test_what_a_model_reads_back_does_not_include_the_provenance(self):
+        self.run_async(self.tool.agent_notes_create("n", "one", weight="8", __model__=self.MODEL, __metadata__=self.META))
+        out = json.dumps(self.run_async(self.tool.agent_notes_read("n", verbose=True)))
+        for secret in ("hannah-duo", "chat-123", "nemotron"):
+            self.assertNotIn(secret, out)
+
+
 class AuthorTests(NotesTestCase):
     def authors(self):
         return self.sql("SELECT author_id, author_name, created_at FROM note_author ORDER BY author_id")

@@ -191,7 +191,29 @@ def weight_counts(db: str, since: Optional[str]) -> list:
     return [(name, kind, counts) for name, (kind, counts) in out.items()]
 
 
-def weight_table(rows: list) -> str:
+def rater_counts(db: str, since: Optional[str]) -> list:
+    """Like weight_counts, but a row per rater (the preset and base model that gave the score, recorded by the tool from Open WebUI)
+    over the memory notes; entries written before it was recorded are grouped as '(not recorded)'."""
+    if not Path(db).exists():
+        return []
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(note_data)")]
+        if "rated_by" not in cols:
+            return []
+        rows = conn.execute(
+            "SELECT COALESCE(d.rated_by, '(not recorded)'), (d.weight + 5) / 10, COUNT(*) FROM note_data d JOIN note_id n ON n.note_pk = d.note_pk "
+            "WHERE n.kind = 'memory' AND (d.chain_id IS NULL OR d.chain_id = d.entry_no) AND (? IS NULL OR d.created_at >= ?) GROUP BY 1, 2 ORDER BY 1",
+            (since, since)).fetchall()
+    finally:
+        conn.close()
+    out: dict = {}
+    for who, score, count in rows:
+        out.setdefault(who, [0] * 10)[min(max(int(score), 1), 10) - 1] += count
+    return [(who, "memory", counts) for who, counts in out.items()]
+
+
+def weight_table(rows: list, link_notes: bool = True, first_column: str = "Note", total_label: str = "All notes") -> str:
     """One window as a table: a column per score 1-10, the entry total and the mean, a total row, and cells shaded by their share of the note."""
     if not rows:
         return "<p class='muted'>No entries in this period.</p>"
@@ -201,13 +223,14 @@ def weight_table(rows: list) -> str:
     def cells(counts):
         n = sum(counts) or 1
         return "".join(f"<td style='background:rgba(11,92,173,{min(c / n, 1) * 0.55:.2f})'>{c or ''}</td>" for c in counts)
-    body = "<div style='overflow-x:auto'><table class='w'><tr><th>Note</th>" + "".join(f"<th>{i}</th>" for i in range(1, 11)) + "<th>Entries</th><th>Mean</th></tr>"
+    body = f"<div style='overflow-x:auto'><table class='w'><tr><th>{e(first_column)}</th>" + "".join(f"<th>{i}</th>" for i in range(1, 11)) + "<th>Entries</th><th>Mean</th></tr>"
     total = [0] * 10
     for name, kind, counts in rows:
         total = [a + b for a, b in zip(total, counts)]
         tag = " <span class='muted'>persona</span>" if kind == "persona" else ""
-        body += f"<tr><td><a href='{note_url(name)}'>{e(name)}</a>{tag}</td>{cells(counts)}<td>{sum(counts)}</td><td>{mean(counts)}</td></tr>"
-    return body + f"<tr class='sum'><td>All notes</td>{cells(total)}<td>{sum(total)}</td><td>{mean(total)}</td></tr></table></div>"
+        label = f"<a href='{note_url(name)}'>{e(name)}</a>{tag}" if link_notes else e(name)
+        body += f"<tr><td>{label}</td>{cells(counts)}<td>{sum(counts)}</td><td>{mean(counts)}</td></tr>"
+    return body + f"<tr class='sum'><td>{e(total_label)}</td>{cells(total)}<td>{sum(total)}</td><td>{mean(total)}</td></tr></table></div>"
 
 
 def render_weights(db: str, now: Optional[datetime.datetime] = None) -> str:
@@ -217,7 +240,28 @@ def render_weights(db: str, now: Optional[datetime.datetime] = None) -> str:
     for title, span in WEIGHT_WINDOWS:
         since = (now - span).isoformat() if span else None
         body += f"<h3>{e(title)}</h3>" + weight_table(weight_counts(db, since))
+    body += ("<h2>By who rated</h2><p class='muted'>The same counts for memory notes, grouped by the preset (and the base model behind it) that gave the score, as Open WebUI "
+             "reported it to the tool. Only ratings made since this was recorded have a name.</p>")
+    for title, span in WEIGHT_WINDOWS:
+        since = (now - span).isoformat() if span else None
+        body += f"<h3>{e(title)}</h3>" + weight_table(rater_counts(db, since), link_notes=False, first_column="Rated by", total_label="All raters")
     return page("Weights", body)
+
+
+def source_line(r) -> str:
+    """Where an entry came from, as Open WebUI told the tool: the preset and base model, the chat (use read_chat.py with the id) and
+    who gave the score. Empty for an entry written before this was recorded."""
+    keys = r.keys()
+    if not any(k in keys and r[k] for k in ("preset", "source_chat", "rated_by")):
+        return ""
+    bits = []
+    if r["preset"]:
+        bits.append(f"via {e(r['preset'])}" + (f" ({e(r['base_model'])})" if r["base_model"] and r["base_model"] != r["preset"] else ""))
+    if r["source_chat"]:
+        bits.append(f"chat <code>{e(r['source_chat'])}</code>")
+    if r["rated_by"] and r["rated_by"] != r["preset"] and r["rated_by"] != (f"{r['preset']} ({r['base_model']})" if r["preset"] else None):
+        bits.append(f"rated by {e(r['rated_by'])}")
+    return f"<div class='muted' style='font-size:.8em'>{' &middot; '.join(bits)}</div>" if bits else ""
 
 
 def pin_button(note_name: str, r) -> str:
@@ -260,7 +304,7 @@ def render_note(db: str, name: str) -> str:
     for r in reversed(entries):  # read_note_db returns oldest first; the page shows the newest on top
         edited = f" &middot; edited {e(when(r['edited_at']))}" if r["edited_at"] else ""
         body += (
-            f"<div class='entry' id='e{r['entry_no']}'>{pin_button(n, r)}<span class='muted'>#{r['entry_no']} &middot; {e(r['author_name'] or 'unknown')} &middot; {e(when(r['created_at']))}{edited}{links(r)} &middot; weight {notes.weight_to_score(r['weight'])} &middot; read {r['hits']}x</span>"
+            f"<div class='entry' id='e{r['entry_no']}'>{pin_button(n, r)}<span class='muted'>#{r['entry_no']} &middot; {e(r['author_name'] or 'unknown')} &middot; {e(when(r['created_at']))}{edited}{links(r)} &middot; weight {notes.weight_to_score(r['weight'])} &middot; read {r['hits']}x</span>{source_line(r)}"
             f"<pre>{e(r['note_text'])}</pre>"
             f"<details><summary>edit / delete</summary>"
             f"<form method='post' action='/edit'>{hidden}<input type='hidden' name='entry_no' value='{r['entry_no']}'>"
