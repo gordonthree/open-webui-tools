@@ -1,7 +1,7 @@
 """
 title: Agent Notes Curation
 author: Gordon
-version: 1.24.0
+version: 1.24.1
 description: The upkeep half of Agent Notes (it needs the Agent Notes tool too, and the same NOTES_DB_PATH valve):
     tags (agent_notes_add_tags/agent_notes_remove_tag/agent_notes_rename_tag), summaries
     (agent_notes_update_summary/agent_notes_delete_summary), renaming a note or changing its comment
@@ -241,13 +241,16 @@ def _migrate_provenance(conn: sqlite3.Connection) -> None:
 
 
 def provenance(model: Any, metadata: Any) -> Dict[str, Optional[str]]:
-    """Where a tool call came from, from the `__model__` and `__metadata__` Open WebUI passes to a tool: the preset the chat is using
+    """Where a tool call came from, from the `__metadata__` and `__model__` Open WebUI passes to a tool: the preset the chat is using
     (its id), the base model behind it (a preset's base_model_id; for a model used directly, the model itself), and the chat's id.
-    Anything missing is None; never raises, because recording this must not stop a note being saved."""
+    The chat's own model is `__metadata__['model']`: Open WebUI replaces `__model__` with its *task* model (the one that writes titles
+    and tags) while it prepares a chat's tools, so `__model__` is only the fallback. Anything missing is None; never raises, because
+    recording this must not stop a note being saved."""
     preset = base = chat = None
-    if isinstance(model, dict):
-        preset = str(model.get("id") or "").strip()[:120] or None
-        info = model.get("info") if isinstance(model.get("info"), dict) else {}
+    chosen = metadata.get("model") if isinstance(metadata, dict) and isinstance(metadata.get("model"), dict) else model
+    if isinstance(chosen, dict):
+        preset = str(chosen.get("id") or "").strip()[:120] or None
+        info = chosen.get("info") if isinstance(chosen.get("info"), dict) else {}
         base = str(info.get("base_model_id") or "").strip()[:120] or preset
     if isinstance(metadata, dict):
         chat = str(metadata.get("chat_id") or "").strip()[:80] or None

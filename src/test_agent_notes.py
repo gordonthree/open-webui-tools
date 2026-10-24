@@ -1071,6 +1071,15 @@ class ProvenanceTests(NotesTestCase):
         for odd in (None, "x", 5, [], {"info": "no"}):
             self.assertEqual(set(mod.provenance(odd, odd)), {"preset", "base_model", "source_chat"})
 
+    def test_the_chats_own_model_in_metadata_beats_the_task_model_openwebui_puts_in___model__(self):
+        task = {"id": "or.meta-llama/llama-3.1-8b-instruct"}
+        meta = {**self.META, "model": self.MODEL}
+        self.assertEqual(mod.provenance(task, meta)["preset"], "hannah-duo")
+        self.assertEqual(mod.provenance(task, meta)["base_model"], "or.nvidia/nemotron-3-ultra-550b-a55b:free")
+        self.assertEqual(mod.provenance(task, self.META)["preset"], "or.meta-llama/llama-3.1-8b-instruct")  # no metadata model: fall back
+        self.run_async(self.tool.agent_notes_create("n", "one", weight="8", __model__=task, __metadata__=meta))
+        self.assertEqual(self.row(1)[0], "hannah-duo")
+
     def test_create_and_append_record_where_they_came_from_and_who_rated(self):
         self.run_async(self.tool.agent_notes_create("n", "one", weight="8", __model__=self.MODEL, __metadata__=self.META))
         self.run_async(self.tool.agent_notes_append("n", "two", __model__=self.MODEL, __metadata__=self.META))
