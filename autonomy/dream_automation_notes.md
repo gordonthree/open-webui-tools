@@ -7,7 +7,10 @@ FRESH chat each run, like the tick, so nothing is carried but her notes and the 
 
 ## Settings (created by Gordon in the UI)
 
-- Name: `Dream`
+- Name: `Dream` - created 2026-10-24 through the API (id `3a925e63-b6b1-4448-9351-7dafa449adf4`), inactive, in the tick's folder.
+  Its next-run time is filled in even while inactive, but the scheduler only runs active automations. To change the prompt later
+  use the UI or the built-in `update_automation`; the REST update endpoint switches an automation ON and clears its folder
+  unless `is_active` and `folder_id` are passed explicitly.
 - Model: `medium-mara` (or a cloud preset with the same tools)
 - Folder: the same one as the tick, if you like
 - Schedule (his timezone): every 30 minutes from 23:00 to 05:30 -
