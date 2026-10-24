@@ -41,6 +41,33 @@ class HandlerTests(unittest.TestCase):
         self.post("/update", name="Facet", new_name="Facet", comment="")  # a post that doesn't mention them leaves them alone
         self.assertEqual(web.notes.read_note_db(self.db, "Facet", 5)["note"]["kind"], "persona")
 
+    def test_weights_page_counts_each_score_per_window_and_a_chain_once(self):
+        import datetime, sqlite3
+        self.post("/create", name="Mem", text="a")
+        self.post("/append", name="Mem", text="b")
+        self.post("/append", name="Mem", text="c")
+        conn = sqlite3.connect(self.db)
+        now = datetime.datetime(2026, 10, 23, 12, tzinfo=datetime.timezone.utc)
+        for no, score, age_h, chain in ((1, 9, 2, None), (2, 9, 30, None), (3, 5, 24 * 10, None)):
+            conn.execute("UPDATE note_data SET weight=?, created_at=?, chain_id=? WHERE entry_no=?",
+                         (score * 10, (now - datetime.timedelta(hours=age_h)).isoformat(), chain, no))
+        conn.execute("INSERT INTO note_data (note_pk, entry_no, note_text, created_at, weight, chain_id) SELECT note_pk, 4, 'p1', ?, 100, 4 FROM note_id", (now.isoformat(),))
+        conn.execute("INSERT INTO note_data (note_pk, entry_no, note_text, created_at, weight, chain_id) SELECT note_pk, 5, 'p2', ?, 100, 4 FROM note_id", (now.isoformat(),))
+        conn.commit()
+        conn.close()
+        day, week, overall = [web.weight_counts(self.db, (now - span).isoformat() if span else None) for _, span in web.WEIGHT_WINDOWS]
+        self.assertEqual(day, [("Mem", "memory", [0, 0, 0, 0, 0, 0, 0, 0, 1, 1])])
+        self.assertEqual(week[0][2][8:], [2, 1])
+        self.assertEqual(overall[0][2][4], 1)
+        self.assertEqual(sum(overall[0][2]), 4)  # the two-part text is one memory
+        status, _, body = self.get("/weights")
+        self.assertEqual(status, 200)
+        for title in ("Last 24 hours", "Last 7 days", "Overall", "All notes"):
+            self.assertIn(title, body)
+
+    def test_weights_page_with_no_notes(self):
+        self.assertIn("No entries in this period.", self.get("/weights")[2])
+
     def test_empty_index_has_create_form(self):
         status, _, body = self.get("/")
         self.assertEqual(status, 200)

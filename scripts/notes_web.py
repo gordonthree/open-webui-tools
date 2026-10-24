@@ -23,7 +23,9 @@ Requirements:
 """
 
 import argparse
+import datetime
 import html
+import sqlite3
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -53,6 +55,8 @@ td.act{white-space:nowrap}td.act form{display:inline;margin:0 .1rem}
 .mini{padding:0 .4rem;line-height:1.4;cursor:pointer;background:#fff;border:1px solid #bbb;border-radius:3px}
 .mini.x{color:#c00;font-weight:bold;border-color:#d99}
 details{margin:.3rem 0}summary{cursor:pointer;color:#0b5cad}
+table.w td,table.w th{text-align:right;padding:.25rem .45rem}table.w td:first-child,table.w th:first-child{text-align:left}
+table.w tr.sum td{font-weight:bold;border-top:2px solid #999}
 """
 
 
@@ -146,7 +150,7 @@ def render_index(db: str, q: str, tag: str = "") -> str:
     if in_use:
         body += "<p>" + " ".join(tag_link(n, c) for n, c in in_use[:30]) + " <a class='muted' href='/tags'>all tags</a></p>"
     shown = f" tagged {e(tag)} (<a href='/'>show all</a>)" if tag else ""
-    body += f"<p class='muted'>{total} note{'s' if total != 1 else ''}{shown}, most recently updated first.</p>"
+    body += f"<p class='muted'>{total} note{'s' if total != 1 else ''}{shown}, most recently updated first. <a href='/weights'>Weight tables</a></p>"
     if rows:
         body += "<table><tr><th>Note</th><th>Entries</th><th>Reads</th><th>Updated</th><th>Started by</th><th>Tags</th><th>Comment</th><th></th></tr>" + "".join(
             f"<tr><td><a href='{note_url(r['note_name'])}'>{e(r['note_name'])}</a></td><td>{r['entries']}</td><td>{r['hits']}</td>"
@@ -163,6 +167,57 @@ def render_index(db: str, q: str, tag: str = "") -> str:
         "<button>Create</button></form>"
     )
     return page("Agent notes", body)
+
+
+WEIGHT_WINDOWS = (("Last 24 hours", datetime.timedelta(hours=24)), ("Last 7 days", datetime.timedelta(days=7)), ("Overall", None))
+
+
+def weight_counts(db: str, since: Optional[str]) -> list:
+    """[(note name, kind, counts)] where counts[0..9] are the memories (a long text split into parts counts once) whose score is 1..10,
+    written at or after `since` (an ISO UTC timestamp; None = all of them). Read-only. Newest-active notes are not special: A-Z."""
+    if not Path(db).exists():  # nothing has been written yet
+        return []
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT n.note_name, n.kind, (d.weight + 5) / 10, COUNT(*) FROM note_data d JOIN note_id n ON n.note_pk = d.note_pk "
+            "WHERE (d.chain_id IS NULL OR d.chain_id = d.entry_no) AND (? IS NULL OR d.created_at >= ?) GROUP BY 1, 2, 3 ORDER BY LOWER(n.note_name)",
+            (since, since)).fetchall()
+    finally:
+        conn.close()
+    out: dict = {}
+    for name, kind, score, count in rows:
+        out.setdefault(name, (kind, [0] * 10))[1][min(max(int(score), 1), 10) - 1] += count
+    return [(name, kind, counts) for name, (kind, counts) in out.items()]
+
+
+def weight_table(rows: list) -> str:
+    """One window as a table: a column per score 1-10, the entry total and the mean, a total row, and cells shaded by their share of the note."""
+    if not rows:
+        return "<p class='muted'>No entries in this period.</p>"
+    def mean(counts):
+        n = sum(counts)
+        return f"{sum((i + 1) * c for i, c in enumerate(counts)) / n:.1f}" if n else ""
+    def cells(counts):
+        n = sum(counts) or 1
+        return "".join(f"<td style='background:rgba(11,92,173,{min(c / n, 1) * 0.55:.2f})'>{c or ''}</td>" for c in counts)
+    body = "<div style='overflow-x:auto'><table class='w'><tr><th>Note</th>" + "".join(f"<th>{i}</th>" for i in range(1, 11)) + "<th>Entries</th><th>Mean</th></tr>"
+    total = [0] * 10
+    for name, kind, counts in rows:
+        total = [a + b for a, b in zip(total, counts)]
+        tag = " <span class='muted'>persona</span>" if kind == "persona" else ""
+        body += f"<tr><td><a href='{note_url(name)}'>{e(name)}</a>{tag}</td>{cells(counts)}<td>{sum(counts)}</td><td>{mean(counts)}</td></tr>"
+    return body + f"<tr class='sum'><td>All notes</td>{cells(total)}<td>{sum(total)}</td><td>{mean(total)}</td></tr></table></div>"
+
+
+def render_weights(db: str, now: Optional[datetime.datetime] = None) -> str:
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    body = ("<h2>Weights</h2><p class='muted'>How many memories carry each score (1-10, 5 is neutral), by when they were written; "
+            "a long text in several parts counts once, and in a persona note the score is the strength of the trait. Darker = a bigger share of that note.</p>")
+    for title, span in WEIGHT_WINDOWS:
+        since = (now - span).isoformat() if span else None
+        body += f"<h3>{e(title)}</h3>" + weight_table(weight_counts(db, since))
+    return page("Weights", body)
 
 
 def pin_button(note_name: str, r) -> str:
@@ -250,6 +305,8 @@ def handle_get(db: str, path: str, query: Dict[str, list]) -> Response:
     try:
         if path == "/":
             return 200, {}, render_index(db, first("q"), notes.normalize_tag(first("tag")) if first("tag") else "")
+        if path == "/weights":
+            return 200, {}, render_weights(db)
         if path == "/tags":
             return 200, {}, render_tags(db)
         if path == "/note":
